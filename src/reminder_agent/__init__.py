@@ -1,2 +1,1 @@
-def main() -> None:
-    print("Hello from reminder-agent!")
+"""Memorae application package."""
