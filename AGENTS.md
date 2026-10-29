@@ -10,9 +10,9 @@ The local workflow is:
 
 - `uv sync --extra test` — install the locked project and test dependencies.
 - `docker compose up -d postgres` — start local PostgreSQL.
-- `alembic upgrade head` — apply database migrations.
-- `uvicorn reminder_agent.main:app --reload` — run the FastAPI service locally.
-- `pytest` — run the automated suite.
+- `uv run alembic upgrade head` — apply database migrations.
+- `uv run uvicorn reminder_agent.main:app --reload` — run the FastAPI service locally.
+- `uv run pytest` — run the automated suite.
 
 Keep commands and configuration documentation current as new slices add workers or provider integrations.
 
@@ -26,7 +26,7 @@ Use pytest. Cover schedule parsing and time zones, authorization and cross-user 
 
 ## Commit & Pull Request Guidelines
 
-History currently contains only `Initial commit`, so no established convention exists. Use short, imperative subjects such as `Add reminder creation service`; keep commits focused. PRs should explain the behavior changed, link the relevant plan item or issue, include tests and configuration notes, and document any webhook, migration, or API changes. Add screenshots or a short demo transcript when changing user-facing Telegram or voice behavior.
+Use Conventional Commits with a concise, imperative subject: `<type>(<scope>): <description>`. Keep commits focused and atomic; stage only files relevant to that change. PRs should explain the behavior changed, link the relevant plan item or issue, include tests and configuration notes, and document any webhook, migration, or API changes. Add screenshots or a short demo transcript when changing user-facing Telegram or voice behavior.
 
 ## Security & Configuration
 
