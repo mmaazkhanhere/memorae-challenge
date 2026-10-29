@@ -2,18 +2,19 @@
 
 ## Project Structure & Module Organization
 
-This repository is currently design-first. Read [docs/Architecture.md](docs/Architecture.md) for system behavior, data concepts, channel flows, and reliability constraints; use [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) for the vertical-slice delivery order. `README.md` is currently minimal. As implementation is added, keep the Python/FastAPI application under `app/`, tests under `tests/`, database migrations under `alembic/`, and operational files such as `docker-compose.yml` and `.env.example` at the repository root. Keep Telegram, Vapi, and other provider adapters at the channel/integration boundary; put authorization and reminder/memory business rules in shared services.
+Read [docs/Architecture.md](docs/Architecture.md) for system behavior, data concepts, channel flows, and reliability constraints; use [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) for the vertical-slice delivery order. The Python/FastAPI application lives under `src/reminder_agent/`, tests under `tests/`, and database migrations under `alembic/`. Operational files such as `docker-compose.yml` and `.env.example` live at the repository root. Keep Telegram, Vapi, and other provider adapters at the channel/integration boundary; put authorization and reminder/memory business rules in shared services.
 
 ## Build, Test, and Development Commands
 
-No build or test tooling is committed yet. The planned local workflow is:
+The local workflow is:
 
-- `docker compose up` — start the application and local PostgreSQL once Compose is added.
+- `uv sync --extra test` — install the locked project and test dependencies.
+- `docker compose up -d postgres` — start local PostgreSQL.
 - `alembic upgrade head` — apply database migrations.
-- `uvicorn app.main:app --reload` — run the FastAPI service locally.
+- `uvicorn reminder_agent.main:app --reload` — run the FastAPI service locally.
 - `pytest` — run the automated suite.
 
-Update this section when the project adopts a definitive package manager, scripts, or Make targets.
+Keep commands and configuration documentation current as new slices add workers or provider integrations.
 
 ## Coding Style & Naming Conventions
 
