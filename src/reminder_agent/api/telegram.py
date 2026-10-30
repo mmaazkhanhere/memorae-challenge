@@ -115,6 +115,16 @@ def telegram_webhook(
             default_region=request.app.state.settings.phone_default_region,
             reminder_interpreter=request.app.state.reminder_interpreter,
             now=request.app.state.clock(),
+            session_ttl_seconds=request.app.state.settings.conversation_session_ttl_seconds,
+        )
+        log_event(
+            logger,
+            logging.INFO,
+            "telegram_update_handled",
+            update_id=update.update_id,
+            reply_created=reply is not None,
+            reply_should_send=reply.should_send if reply is not None else False,
+            duplicate=reply.is_duplicate if reply is not None else False,
         )
         if reply is not None and reply.is_duplicate:
             log_event(
