@@ -8,6 +8,7 @@ Read [docs/Architecture.md](docs/Architecture.md) for system behavior, data conc
 
 The local workflow is:
 
+- Use `uv` exclusively for Python dependency installation, locking, and command execution; do not use `pip` directly.
 - `uv sync --extra test` — install the locked project and test dependencies.
 - `docker compose up -d postgres` — start local PostgreSQL.
 - `uv run alembic upgrade head` — apply database migrations.
