@@ -4,7 +4,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Literal, Protocol
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
@@ -50,16 +50,124 @@ class CreateOneTimeReminderIntent(BaseModel):
         return value
 
 
+class PendingReminder(BaseModel):
+    """Validated, serializable partial data for a one-time reminder."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    operation: Literal["CREATE_ONE_TIME_REMINDER"] = "CREATE_ONE_TIME_REMINDER"
+    task: str | None = Field(default=None, max_length=200)
+    date_local: date | None = None
+    hour: int | None = Field(default=None, ge=0, le=23)
+    minute: int = Field(default=0, ge=0, le=59)
+    meridiem: Literal["am", "pm"] | None = None
+    timezone_name: str = Field(min_length=1, max_length=150)
+    date_explicit: bool = False
+
+    @field_validator("task")
+    @classmethod
+    def task_must_not_be_blank(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = " ".join(value.split())
+        return value or None
+
+    @field_validator("timezone_name")
+    @classmethod
+    def timezone_must_be_valid(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except Exception as exc:
+            raise ValueError("timezone_name must be a valid IANA timezone") from exc
+        return value
+
+
+class PendingReminderFieldUpdate(BaseModel):
+    """Only the fields a clarification reply explicitly supplies.
+
+    This is intentionally not a partial ``PendingReminder``.  In particular it
+    contains neither an operation nor a timezone, so a model cannot turn a
+    follow-up into a complete, authoritative reminder.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    task: str | None = Field(default=None, max_length=200)
+    date_local: date | None = None
+    hour: int | None = Field(default=None, ge=0, le=23)
+    minute: int | None = Field(default=None, ge=0, le=59)
+    meridiem: Literal["am", "pm"] | None = None
+    date_explicit: bool | None = None
+
+    @field_validator("task")
+    @classmethod
+    def task_must_not_be_blank(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = " ".join(value.split())
+        return value or None
+
+    def supplied_fields(self) -> set[str]:
+        """Usable provider values, including ``false`` but never null clears."""
+        return {
+            field
+            for field in self.model_fields_set
+            if getattr(self, field) is not None
+        }
+
+
+class NeedsClarification(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    operation: Literal["CREATE_ONE_TIME_REMINDER"] = "CREATE_ONE_TIME_REMINDER"
+    pending: PendingReminder
+    question: str = Field(min_length=1, max_length=500)
+
+
 @dataclass(frozen=True)
 class Interpretation:
     intent: CreateOneTimeReminderIntent | None = None
+    intents: tuple[CreateOneTimeReminderIntent, ...] = ()
+    clarification: NeedsClarification | None = None
+    field_updates: PendingReminderFieldUpdate | None = None
     response_text: str | None = None
     fallback_allowed: bool = True
+    clear_context: bool = False
+
+    @property
+    def resolved_intents(self) -> tuple[CreateOneTimeReminderIntent, ...]:
+        """Return one or more validated commands represented by this result."""
+        if self.intents:
+            return self.intents
+        return (self.intent,) if self.intent is not None else ()
+
+
+def merge_pending_reminder_updates(
+    pending: PendingReminder, updates: PendingReminderFieldUpdate
+) -> PendingReminder:
+    """Apply explicitly supplied follow-up fields to trusted pending state.
+
+    The pending record belongs to the current locked conversation session.  A
+    provider is therefore never allowed to replace omitted fields such as the
+    task, date, or timezone.
+    """
+    values = pending.model_dump(mode="python")
+    supplied = updates.supplied_fields()
+    for field in supplied:
+        values[field] = getattr(updates, field)
+    if "date_local" in supplied and "date_explicit" not in supplied:
+        values["date_explicit"] = updates.date_local is not None
+    return PendingReminder.model_validate(values)
 
 
 class IntentInterpreter(Protocol):
     def interpret(
-        self, text: str, *, timezone_name: str, now: datetime
+        self,
+        text: str,
+        *,
+        timezone_name: str,
+        now: datetime,
+        context: PendingReminder | None = None,
     ) -> Interpretation: ...
 
 
@@ -99,7 +207,7 @@ def _normalise_now(now: datetime) -> datetime:
 
 def _task_from_remainder(remainder: str) -> str:
     task = remainder.strip(" .,:;")
-    task = re.sub(r"^(?:to|for|that|about)\s+", "", task, flags=re.IGNORECASE)
+    task = re.sub(r"^(?:(?:on|to|for|that|about)\s+)+", "", task, flags=re.IGNORECASE)
     return " ".join(task.split())
 
 
@@ -110,8 +218,184 @@ def _number(value: str) -> int | None:
         return _NUMBER_WORDS.get(value.lower())
 
 
+def _normalise_meridiem(value: str | None) -> str | None:
+    return value.lower().replace(".", "") if value else None
+
+
+def _valid_clock(hour: int | None, minute: int, meridiem: str | None) -> bool:
+    if hour is None or not 0 <= minute <= 59:
+        return False
+    if meridiem is not None:
+        return 1 <= hour <= 12
+    return 0 <= hour <= 23
+
+
+def _clock_to_24(hour: int, meridiem: str) -> int:
+    if meridiem == "pm" and hour != 12:
+        return hour + 12
+    if meridiem == "am" and hour == 12:
+        return 0
+    return hour
+
+
+def _clock_label(hour: int, minute: int) -> str:
+    return f"{hour:g}" if minute == 0 else f"{hour}:{minute:02d}"
+
+
+def _date_label(value: date, local_today: date) -> str:
+    if value == local_today:
+        return "today"
+    if value == local_today + timedelta(days=1):
+        return "tomorrow"
+    return value.strftime("%A")
+
+
+def resolve_pending_due_at(pending: PendingReminder, *, now: datetime) -> datetime:
+    """Resolve a complete pending reminder in its user's local timezone."""
+    if pending.date_local is None or pending.hour is None:
+        raise ValueError("pending reminder is missing date or time")
+    hour = pending.hour
+    if pending.meridiem:
+        hour = _clock_to_24(hour, pending.meridiem)
+    zone = ZoneInfo(pending.timezone_name)
+    return datetime.combine(
+        pending.date_local,
+        time(hour, pending.minute),
+        tzinfo=zone,
+    )
+
+
+def _date_from_day(match: re.Match[str] | None, local_now: datetime) -> date:
+    assert match is not None
+    value = match.group("day").lower()
+    if value == "today":
+        return local_now.date()
+    if value == "tomorrow":
+        return local_now.date() + timedelta(days=1)
+    target = RuleBasedIntentInterpreter._weekdays[value]
+    days_ahead = (target - local_now.weekday()) % 7
+    return local_now.date() + timedelta(days=days_ahead)
+
+
+_COMMON_TASK_VERBS = {
+    "buy",
+    "call",
+    "complete",
+    "email",
+    "finish",
+    "pay",
+    "renew",
+    "review",
+    "send",
+    "submit",
+    "text",
+    "write",
+}
+
+
+def _contains_multiple_tasks(task: str) -> bool:
+    """Detect a second action, while allowing people in one task."""
+    parts = re.split(r"\s+(?:and|then)\s+", task, maxsplit=1, flags=re.IGNORECASE)
+    if len(parts) != 2:
+        return False
+    second = re.sub(r"^(?:to|please)\s+", "", parts[1].strip(), flags=re.IGNORECASE)
+    first_word = second.split(maxsplit=1)[0].lower() if second else ""
+    return first_word in _COMMON_TASK_VERBS
+
+
+_ACKNOWLEDGEMENTS = {
+    "yes",
+    "yeah",
+    "okay",
+    "ok",
+    "sure",
+    "no",
+    "nope",
+    "thanks",
+    "thank you",
+}
+_CANCEL_FOLLOW_UPS = {"cancel", "cancel it", "never mind", "nevermind", "not now"}
+_TASK_CORRECTION = re.compile(
+    r"^\s*(?:change|update|replace)\s+(?:the\s+)?(?:task|reminder|it)\s+"
+    r"(?:to|with)\s+(?P<task>.+?)\s*$",
+    re.IGNORECASE,
+)
+_REQUIRES_INTERPRETATION = re.compile(
+    r"\b(?:after|around|before|each|every|later|monthly|next|recurring|sometime|"
+    r"this|tonight|weekly)\b",
+    re.IGNORECASE,
+)
+_COMPOUND_REQUEST = re.compile(
+    r"\b(?:and|then)\s+(?:(?:please\s+)?remind\s+me\b|(?:to\s+)?"
+    r"(?:buy|call|complete|email|finish|pay|renew|review|send|submit|text|write)\b)",
+    re.IGNORECASE,
+)
+
+
+def _same_task(left: str, right: str) -> bool:
+    return " ".join(left.lower().split()) == " ".join(right.lower().split())
+
+
+def restrict_to_explicit_field_updates(
+    text: str,
+    proposed: PendingReminderFieldUpdate,
+    *,
+    context: PendingReminder,
+    now: datetime,
+) -> PendingReminderFieldUpdate:
+    """Keep only provider updates demonstrably present in the user's reply.
+
+    A model can help recognize a follow-up, but it is not trusted to alter an
+    existing reminder field.  Time and date values must agree with deterministic
+    text extraction; a task replacement must use an explicit correction phrase.
+    """
+    raw = text.strip()
+    clock = RuleBasedIntentInterpreter._clock.search(raw)
+    if clock is None:
+        clock = RuleBasedIntentInterpreter._follow_up_clock.search(raw)
+    day = RuleBasedIntentInterpreter._day.search(raw)
+    permitted: dict[str, Any] = {}
+
+    if clock is not None:
+        expected_hour = int(clock.group("hour"))
+        expected_minute = int(clock.group("minute") or 0)
+        expected_meridiem = _normalise_meridiem(clock.group("meridiem"))
+        if proposed.hour == expected_hour:
+            permitted["hour"] = proposed.hour
+        if proposed.minute == expected_minute:
+            permitted["minute"] = proposed.minute
+        if proposed.meridiem == expected_meridiem and expected_meridiem is not None:
+            permitted["meridiem"] = proposed.meridiem
+
+    if day is not None:
+        local_now = _normalise_now(now).astimezone(ZoneInfo(context.timezone_name))
+        expected_date = _date_from_day(day, local_now)
+        if proposed.date_local == expected_date:
+            permitted["date_local"] = proposed.date_local
+            # The backend derives this flag from the verified date, rather than
+            # accepting a model-provided boolean independently.
+            permitted["date_explicit"] = True
+
+    remainder = raw
+    if clock is not None:
+        remainder = remainder.replace(clock.group(0), "", 1)
+    if day is not None:
+        remainder = remainder.replace(day.group(0), "", 1)
+    supplied_task = _task_from_remainder(remainder)
+    correction = _TASK_CORRECTION.match(supplied_task)
+    if proposed.task:
+        if context.task is None and supplied_task and _same_task(proposed.task, supplied_task):
+            permitted["task"] = proposed.task
+        elif correction is not None:
+            corrected_task = _task_from_remainder(correction.group("task"))
+            if corrected_task and _same_task(proposed.task, corrected_task):
+                permitted["task"] = proposed.task
+
+    return PendingReminderFieldUpdate.model_validate(permitted)
+
+
 class RuleBasedIntentInterpreter:
-    """Conservative parser for the relative forms required by VS-03."""
+    """Conservative parser that refuses to guess incomplete date/time requests."""
 
     _prefix = re.compile(
         r"^\s*(?:please\s+)?(?:remind\s+me|set\s+(?:a\s+)?reminder)\s+",
@@ -126,30 +410,129 @@ class RuleBasedIntentInterpreter:
         r"(?P<meridiem>a\.m\.|p\.m\.|am|pm)?\b",
         re.IGNORECASE,
     )
+    _clock = re.compile(
+        r"\bat\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*"
+        r"(?P<meridiem>a\.m\.|p\.m\.|am|pm)?\b",
+        re.IGNORECASE,
+    )
+    _follow_up_clock = re.compile(
+        r"(?<!\w)(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*"
+        r"(?P<meridiem>a\.m\.|p\.m\.|am|pm)?(?=\s|$|[,.])",
+        re.IGNORECASE,
+    )
+    _day = re.compile(
+        r"\b(?P<day>today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        re.IGNORECASE,
+    )
+    _day_part = re.compile(
+        r"\b(?:in\s+the\s+)?(?:morning|afternoon|evening|night)\b",
+        re.IGNORECASE,
+    )
+    _multiple_request_separator = re.compile(
+        r"\s+and\s+(?=(?:please\s+)?(?:remind\s+me|set\s+(?:a\s+)?reminder)\b)",
+        re.IGNORECASE,
+    )
+    _weekdays = {
+        "monday": 0,
+        "tuesday": 1,
+        "wednesday": 2,
+        "thursday": 3,
+        "friday": 4,
+        "saturday": 5,
+        "sunday": 6,
+    }
 
-    def interpret(self, text: str, *, timezone_name: str, now: datetime) -> Interpretation:
+    def interpret(
+        self,
+        text: str,
+        *,
+        timezone_name: str,
+        now: datetime,
+        context: PendingReminder | None = None,
+    ) -> Interpretation:
         raw = text.strip()
+        # An explicit new reminder command supersedes an unresolved clarification.
+        # This gives users a safe way to answer a multi-target question with one
+        # complete request instead of merging unrelated text into the old action.
+        if context is not None and self._prefix.match(raw):
+            context = None
+        if context is not None:
+            return self._interpret_follow_up(text, context=context, now=now)
+
+        # A single command containing a second action is not a safe regex
+        # parse. Let the model split it into independently validated intents.
+        if _COMPOUND_REQUEST.search(raw) and not self._multiple_request_separator.search(raw):
+            return self._multiple_target_clarification(timezone_name)
+
+        # A message may contain several explicitly separated, complete commands.
+        # Parse each command independently instead of treating the whole message
+        # as an ambiguous target.  We deliberately require the repeated reminder
+        # prefix; a plain "and" remains conservative because it may be part of a
+        # single task (for example, "call Alice and Bob").
+        commands = self._multiple_request_separator.split(raw)
+        if len(commands) > 1:
+            parsed = [
+                self.interpret(
+                    command,
+                    timezone_name=timezone_name,
+                    now=now,
+                    context=None,
+                )
+                for command in commands
+            ]
+            if all(item.intent is not None for item in parsed):
+                return Interpretation(
+                    intents=tuple(item.intent for item in parsed if item.intent is not None)
+                )
+            clarification = next(
+                (item.clarification for item in parsed if item.clarification is not None),
+                None,
+            )
+            if clarification is not None:
+                return Interpretation(
+                    clarification=clarification,
+                    fallback_allowed=False,
+                )
+            return Interpretation(
+                response_text=(
+                    "I found multiple reminder requests. Please include a complete "
+                    "future date and time for each one."
+                ),
+                fallback_allowed=False,
+            )
+
         log_event(
             logger,
-            logging.DEBUG,
+            logging.INFO,
             "reminder_intent_rules_started",
             input_length=len(raw),
             timezone=timezone_name,
         )
         prefix = self._prefix.match(raw)
         if prefix is None:
-            result = Interpretation(
-                response_text="I can help create reminders. Tell me what and when to remember."
+            # Keep bare clock answers and social acknowledgements deterministic,
+            # but allow the provider to interpret complex natural language even
+            # when it does not contain the literal word "remind".
+            simple_time = self._follow_up_clock.fullmatch(raw.strip(" .,!"))
+            simple_ack = raw.lower().strip(" .,!?") in (
+                _ACKNOWLEDGEMENTS | _CANCEL_FOLLOW_UPS
             )
-            log_event(
-                logger,
-                logging.DEBUG,
-                "reminder_intent_rules_finished",
-                matched=False,
-                fallback_allowed=result.fallback_allowed,
-                reason="not_reminder_prefix",
+            return Interpretation(
+                response_text=(
+                    "I can help create reminders. Start with what to remember and when."
+                ),
+                fallback_allowed=not (simple_time or simple_ack),
             )
-            return result
+
+        # Relative phrases, recurrence, and conversational qualifiers have
+        # too much meaning for a small regex parser.  Do not extract a partial
+        # intent that could be mistaken for a complete command; let the model
+        # return a typed proposal instead.
+        if _REQUIRES_INTERPRETATION.search(raw):
+            return Interpretation(
+                response_text="I need a little more detail to schedule that reminder.",
+                fallback_allowed=True,
+            )
 
         zone = ZoneInfo(timezone_name)
         reference = _normalise_now(now)
@@ -159,112 +542,311 @@ class RuleBasedIntentInterpreter:
         if relative is not None:
             amount = _number(relative.group("amount"))
             if amount is None or amount <= 0:
-                result = Interpretation(
+                return Interpretation(
                     response_text="Please provide a valid future reminder time.",
                     fallback_allowed=False,
                 )
-                log_event(
-                    logger,
-                    logging.WARNING,
-                    "reminder_intent_rules_rejected",
-                    schedule_kind="relative",
-                    reason="invalid_duration",
-                )
-                return result
             unit = relative.group("unit").lower()
             delta = timedelta(minutes=amount if unit.startswith("minute") else amount * 60)
-            # Accept both natural word orders:
-            #   "in five minutes to call the bank"
-            #   "to call the bank in five minutes"
             before_time = without_prefix[: relative.start()]
             after_time = without_prefix[relative.end() :]
             task = _task_from_remainder(before_time if before_time.strip() else after_time)
-            result = self._build(task, reference + delta, timezone_name)
-            log_event(
-                logger,
-                logging.INFO if result.intent is not None else logging.WARNING,
-                "reminder_intent_rules_finished",
-                matched=result.intent is not None,
-                schedule_kind="relative",
-                task_length=len(task),
-                time_position="after_task" if before_time.strip() else "before_task",
-                fallback_allowed=result.fallback_allowed,
-            )
-            return result
+            if _contains_multiple_tasks(task):
+                return self._multiple_target_clarification(timezone_name)
+            return self._build(task, reference + delta, timezone_name)
 
         tomorrow = self._tomorrow.search(without_prefix)
         if tomorrow is not None:
             hour = int(tomorrow.group("hour"))
             minute = int(tomorrow.group("minute") or 0)
-            meridiem = (tomorrow.group("meridiem") or "").lower().replace(".", "")
-            if meridiem:
-                if hour < 1 or hour > 12:
-                    result = Interpretation(
-                        response_text="Please provide a valid future reminder time.",
-                        fallback_allowed=False,
-                    )
-                    log_event(
-                        logger,
-                        logging.WARNING,
-                        "reminder_intent_rules_rejected",
-                        schedule_kind="tomorrow_at",
-                        reason="invalid_hour",
-                    )
-                    return result
-                if meridiem == "pm" and hour != 12:
-                    hour += 12
-                if meridiem == "am" and hour == 12:
-                    hour = 0
-            elif hour > 23:
-                result = Interpretation(
-                    response_text="Please provide a valid future reminder time.",
-                    fallback_allowed=False,
+            meridiem = _normalise_meridiem(tomorrow.group("meridiem"))
+            if not _valid_clock(hour, minute, meridiem):
+                return self._invalid_time()
+            local_date = reference.astimezone(zone).date() + timedelta(days=1)
+            before_time = without_prefix[: tomorrow.start()]
+            after_time = without_prefix[tomorrow.end() :]
+            task = _task_from_remainder(before_time if before_time.strip() else after_time)
+            if _contains_multiple_tasks(task):
+                return self._multiple_target_clarification(timezone_name)
+            if meridiem is None:
+                return self._pending_result(
+                    PendingReminder(
+                        task=task or None,
+                        date_local=local_date,
+                        hour=hour,
+                        minute=minute,
+                        meridiem=None,
+                        timezone_name=timezone_name,
+                        date_explicit=True,
+                    ),
+                    now=now,
                 )
-                log_event(
-                    logger,
-                    logging.WARNING,
-                    "reminder_intent_rules_rejected",
-                    schedule_kind="tomorrow_at",
-                    reason="invalid_hour",
-                )
-                return result
-            local_reference = reference.astimezone(zone)
-            local_date = local_reference.date() + timedelta(days=1)
-            due_local = datetime.combine(local_date, time(hour, minute), tzinfo=zone)
-            task = _task_from_remainder(without_prefix[tomorrow.end() :])
-            result = self._build(task, due_local.astimezone(timezone.utc), timezone_name)
-            log_event(
-                logger,
-                logging.INFO if result.intent is not None else logging.WARNING,
-                "reminder_intent_rules_finished",
-                matched=result.intent is not None,
-                schedule_kind="tomorrow_at",
-                task_length=len(task),
-                fallback_allowed=result.fallback_allowed,
+            due_local = datetime.combine(
+                local_date,
+                time(_clock_to_24(hour, meridiem), minute),
+                tzinfo=zone,
             )
-            return result
+            return self._build(task, due_local.astimezone(timezone.utc), timezone_name)
 
-        result = Interpretation(
-            response_text=(
-                "Please tell me the reminder task and a future time, such as tomorrow at 9."
+        clock = self._clock.search(without_prefix)
+        day = self._day.search(without_prefix)
+        day_part = self._day_part.search(without_prefix)
+        if clock is not None or day is not None or day_part is not None:
+            local_now = reference.astimezone(zone)
+            date_local = (
+                _date_from_day(day, local_now)
+                if day
+                else local_now.date()
+                if clock is not None
+                else None
             )
+            date_explicit = day is not None
+            hour = int(clock.group("hour")) if clock else None
+            minute = int(clock.group("minute") or 0) if clock else 0
+            meridiem = _normalise_meridiem(clock.group("meridiem")) if clock else None
+            if clock is not None and not _valid_clock(hour, minute, meridiem):
+                return self._invalid_time()
+            task_source = without_prefix
+            if day is not None:
+                task_source = task_source.replace(day.group(0), "", 1)
+            if day_part is not None:
+                task_source = task_source.replace(day_part.group(0), "", 1)
+            if clock is not None:
+                task_source = task_source.replace(clock.group(0), "", 1)
+            task = _task_from_remainder(task_source)
+            if _contains_multiple_tasks(task):
+                return self._multiple_target_clarification(timezone_name)
+            pending = PendingReminder(
+                task=task or None,
+                date_local=date_local,
+                hour=hour,
+                minute=minute,
+                meridiem=meridiem,
+                timezone_name=timezone_name,
+                date_explicit=date_explicit,
+            )
+            return self._pending_result(pending, now=now)
+
+        # A command with an ordinary task but no schedule is still useful
+        # deterministic input.  Store it as pending rather than asking a model
+        # to reconstruct the same partial reminder.
+        task = _task_from_remainder(without_prefix)
+        if _contains_multiple_tasks(task):
+            return self._multiple_target_clarification(timezone_name)
+        return self._pending_result(
+            PendingReminder(task=task or None, timezone_name=timezone_name),
+            now=now,
+            fallback_allowed=True,
         )
-        log_event(
-            logger,
-            logging.DEBUG,
-            "reminder_intent_rules_finished",
-            matched=False,
-            fallback_allowed=result.fallback_allowed,
-            reason="unsupported_schedule_shape",
+
+    def _interpret_follow_up(
+        self, text: str, *, context: PendingReminder, now: datetime
+    ) -> Interpretation:
+        raw = text.strip()
+        normalized = re.sub(r"[.!?]+$", "", raw.lower()).strip()
+        if normalized in _CANCEL_FOLLOW_UPS:
+            return Interpretation(
+                response_text="Okay, I won't create that reminder.",
+                fallback_allowed=False,
+                clear_context=True,
+            )
+        clock = self._clock.search(raw)
+        if clock is None:
+            # Accept natural follow-ups such as "6:55 pm today" and "8 a.m.".
+            clock = self._follow_up_clock.search(raw)
+        day = self._day.search(raw)
+        hour = context.hour
+        minute = context.minute
+        meridiem = context.meridiem
+        date_local = context.date_local
+        date_explicit = context.date_explicit
+        if clock is not None:
+            hour = int(clock.group("hour"))
+            minute = int(clock.group("minute") or 0)
+            meridiem = _normalise_meridiem(clock.group("meridiem"))
+            if not _valid_clock(hour, minute, meridiem):
+                return self._invalid_time()
+            if not context.date_explicit and meridiem and date_local is not None:
+                local_now = _normalise_now(now).astimezone(ZoneInfo(context.timezone_name))
+                if meridiem == "am" and date_local == local_now.date():
+                    date_local += timedelta(days=1)
+        if day is not None:
+            local_now = _normalise_now(now).astimezone(ZoneInfo(context.timezone_name))
+            date_local = _date_from_day(day, local_now)
+            date_explicit = True
+
+        task = context.task
+        remainder = raw
+        if clock is not None:
+            remainder = remainder.replace(clock.group(0), "", 1)
+        if day is not None:
+            remainder = remainder.replace(day.group(0), "", 1)
+        candidate_task = _task_from_remainder(remainder)
+        if task is None and candidate_task and candidate_task.lower() not in _ACKNOWLEDGEMENTS:
+            task = candidate_task
+
+        pending = context.model_copy(
+            update={
+                "task": task,
+                "date_local": date_local,
+                "hour": hour,
+                "minute": minute,
+                "meridiem": meridiem,
+                "date_explicit": date_explicit,
+            }
         )
-        return result
+        return self._pending_result(
+            pending,
+            now=now,
+            fallback_allowed=normalized not in _ACKNOWLEDGEMENTS,
+        )
+
+    def apply_field_updates(
+        self,
+        context: PendingReminder,
+        updates: PendingReminderFieldUpdate,
+        *,
+        now: datetime,
+    ) -> Interpretation:
+        """Merge a provider's follow-up fields, then run deterministic validation."""
+        pending = merge_pending_reminder_updates(context, updates)
+        return self._pending_result(pending, now=now, fallback_allowed=False)
+
+    def _pending_result(
+        self,
+        pending: PendingReminder,
+        *,
+        now: datetime,
+        fallback_allowed: bool = True,
+    ) -> Interpretation:
+        missing: list[str] = []
+        if not pending.task:
+            missing.append("task")
+        if pending.date_local is None:
+            missing.append("date")
+        if pending.hour is None:
+            missing.append("time")
+        elif pending.hour <= 12 and pending.meridiem is None:
+            missing.append("AM or PM")
+        if missing:
+            if missing == ["AM or PM"]:
+                assert pending.date_local is not None and pending.hour is not None
+                zone = ZoneInfo(pending.timezone_name)
+                local_now = _normalise_now(now).astimezone(zone)
+                clock = _clock_label(pending.hour, pending.minute)
+                options: list[tuple[str, date]] = []
+                for candidate_meridiem in ("am", "pm"):
+                    candidate_date = pending.date_local
+                    due_local = datetime.combine(
+                        candidate_date,
+                        time(_clock_to_24(pending.hour, candidate_meridiem), pending.minute),
+                        tzinfo=zone,
+                    )
+                    if due_local <= local_now and not pending.date_explicit:
+                        candidate_date += timedelta(days=1)
+                        due_local = datetime.combine(
+                            candidate_date,
+                            time(_clock_to_24(pending.hour, candidate_meridiem), pending.minute),
+                            tzinfo=zone,
+                        )
+                    if due_local > local_now:
+                        options.append((candidate_meridiem, candidate_date))
+                options.sort(key=lambda option: (option[1], _clock_to_24(pending.hour, option[0])))
+                if not options:
+                    future_pending = pending.model_copy(
+                        update={"date_local": None, "date_explicit": False}
+                    )
+                    return Interpretation(
+                        clarification=NeedsClarification(
+                            pending=future_pending,
+                            question="That date has passed. What future date should I use?",
+                        ),
+                        response_text="That date has passed. What future date should I use?",
+                        fallback_allowed=fallback_allowed,
+                    )
+                rendered_options = [
+                    f"{clock} {candidate_meridiem.upper()} "
+                    f"{_date_label(candidate_date, local_now.date())}"
+                    for candidate_meridiem, candidate_date in options
+                ]
+                question = "Do you mean " + " or ".join(rendered_options) + "?"
+            elif "task" in missing and "AM or PM" in missing:
+                hour = pending.hour
+                question = (
+                    f"What should I remind you about? Also, do you mean {hour:g} PM today "
+                    f"or {hour:g} AM tomorrow?"
+                )
+            elif "time" in missing and pending.date_local is not None:
+                question = f"What time should I use on {pending.date_local.strftime('%A')}?"
+            elif "task" in missing and len(missing) == 1:
+                question = "What should I remind you about?"
+            else:
+                question = "What should I remind you about, and when?"
+            return Interpretation(
+                clarification=NeedsClarification(pending=pending, question=question),
+                response_text=question,
+                fallback_allowed=fallback_allowed,
+            )
+
+        assert pending.date_local is not None and pending.hour is not None
+        due_local = resolve_pending_due_at(pending, now=now)
+        zone = ZoneInfo(pending.timezone_name)
+        if due_local <= _normalise_now(now).astimezone(zone):
+            if pending.date_explicit:
+                # The user supplied a valid clock time.  Only the selected
+                # date is invalid, so retain the task and time and ask for the
+                # one replacement field needed to make this future-facing.
+                future_pending = pending.model_copy(
+                    update={"date_local": None, "date_explicit": False}
+                )
+                question = "That date has passed. What future date should I use?"
+            else:
+                # With an implicit "today", the clock time is the expired
+                # part.  Keep the task and inferred date for a corrected time.
+                future_pending = pending.model_copy(
+                    update={"hour": None, "minute": 0, "meridiem": None}
+                )
+                question = "That time has passed. What future time should I use?"
+            return Interpretation(
+                clarification=NeedsClarification(
+                    pending=future_pending,
+                    question=question,
+                ),
+                response_text=question,
+            )
+        return self._build(pending.task or "", due_local.astimezone(timezone.utc), pending.timezone_name)
+
+    @staticmethod
+    def _invalid_time() -> Interpretation:
+        return Interpretation(
+            response_text="Please provide a valid future reminder time.",
+            fallback_allowed=False,
+        )
+
+    @staticmethod
+    def _multiple_target_clarification(timezone_name: str) -> Interpretation:
+        question = (
+            "I found more than one reminder task. Please send one task at a time, "
+            "or repeat 'remind me' for each reminder."
+        )
+        return Interpretation(
+            clarification=NeedsClarification(
+                pending=PendingReminder(timezone_name=timezone_name),
+                question=question,
+            ),
+            response_text=question,
+        )
 
     @staticmethod
     def _build(task: str, due_at: datetime, timezone_name: str) -> Interpretation:
         if not task:
+            question = "What should I remind you about?"
             return Interpretation(
-                response_text="What should I remind you about?",
-                fallback_allowed=False,
+                clarification=NeedsClarification(
+                    pending=PendingReminder(timezone_name=timezone_name),
+                    question=question,
+                ),
+                response_text=question,
             )
         try:
             return Interpretation(
@@ -292,7 +874,14 @@ class OpenAICompatibleIntentInterpreter:
         self._model = model
         self._timeout = timeout_seconds
 
-    def interpret(self, text: str, *, timezone_name: str, now: datetime) -> Interpretation:
+    def interpret(
+        self,
+        text: str,
+        *,
+        timezone_name: str,
+        now: datetime,
+        context: PendingReminder | None = None,
+    ) -> Interpretation:
         local_now = _normalise_now(now).astimezone(ZoneInfo(timezone_name))
         endpoint_host = urlsplit(self._url).hostname or "unknown"
         log_event(
@@ -305,33 +894,143 @@ class OpenAICompatibleIntentInterpreter:
             timezone=timezone_name,
         )
         prompt = (
-            "Return JSON only with exactly operation, task, and due_local. operation must be "
-            "CREATE_ONE_TIME_REMINDER. due_local must be a timezone-naive ISO-8601 local "
-            "datetime (without Z or an offset); the application applies the user's "
-            f"validated timezone {timezone_name}. "
-            f"Current local time is {local_now.isoformat()}. "
-            "If the request is not a clear one-time reminder, return operation UNKNOWN."
+            "Return JSON only. For one complete request use operation "
+            "CREATE_ONE_TIME_REMINDER with task and due_local. For multiple clearly separated "
+            "requests use CREATE_ONE_TIME_REMINDERS with an intents array of {task,due_local}; "
+            "never merge separate tasks into one task. For an incomplete or ambiguous "
+            "request use operation NEEDS_CLARIFICATION with pending fields task, date_local "
+            "(YYYY-MM-DD), hour, minute, meridiem, date_explicit, and a focused question. "
+            "For unrelated requests use operation UNKNOWN. Never guess an ambiguous hour. "
+            "When existing pending reminder context is supplied, use ONLY operation "
+            "UPDATE_PENDING_REMINDER with an updates object containing only fields explicitly "
+            "provided by the user (task, date_local, hour, minute, meridiem, date_explicit). "
+            "Do not include an existing task, date, or time unless the user explicitly corrects "
+            "that exact field in this message. Never repeat, infer, preserve, merge, or clear a "
+            "context field. Never return "
+            "CREATE_ONE_TIME_REMINDER, NEEDS_CLARIFICATION, due_local, or a question for a "
+            "follow-up; the application owns the pending reminder and will merge and validate "
+            "the update. Use UNKNOWN when the follow-up supplies no reminder field. "
+            "due_local must be a timezone-naive ISO-8601 local datetime; the application applies "
+            f"the user's validated timezone {timezone_name}. Current local time is "
+            f"{local_now.isoformat()}."
+        )
+        if context is not None:
+            prompt += f" Existing pending reminder context is {context.model_dump_json()}"
+        request_payload = {
+            "model": self._model,
+            "messages": [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": text},
+            ],
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+        }
+        log_event(
+            logger,
+            logging.INFO,
+            "reminder_intent_provider_request",
+            endpoint_host=endpoint_host,
+            model=self._model,
+            payload=request_payload,
         )
         try:
             response = httpx.post(
                 self._url,
                 headers={"Authorization": f"Bearer {self._api_key}"},
-                json={
-                    "model": self._model,
-                    "messages": [
-                        {"role": "system", "content": prompt},
-                        {"role": "user", "content": text},
-                    ],
-                    "temperature": 0,
-                    "response_format": {"type": "json_object"},
-                },
+                json=request_payload,
                 timeout=self._timeout,
             )
             response.raise_for_status()
             payload: dict[str, Any] = response.json()
             content = payload["choices"][0]["message"]["content"]
+            log_event(
+                logger,
+                logging.INFO,
+                "reminder_intent_provider_response",
+                endpoint_host=endpoint_host,
+                model=self._model,
+                generated_content=content,
+            )
             data = json.loads(content) if isinstance(content, str) else content
-            if not isinstance(data, dict) or data.get("operation") != "CREATE_ONE_TIME_REMINDER":
+            if not isinstance(data, dict):
+                raise ValueError("provider response was not an object")
+            operation = data.get("operation")
+            if context is not None:
+                if operation == "UPDATE_PENDING_REMINDER":
+                    raw_updates = data.get("updates")
+                    if not isinstance(raw_updates, dict):
+                        raise ValueError("pending update was not an object")
+                    updates = PendingReminderFieldUpdate.model_validate(raw_updates)
+                    if not updates.supplied_fields():
+                        raise ValueError("pending update had no supplied fields")
+                    return Interpretation(field_updates=updates, fallback_allowed=False)
+                if operation == "UNKNOWN":
+                    return Interpretation(
+                        response_text="I couldn't find a reminder detail in that reply.",
+                        fallback_allowed=False,
+                    )
+                # A model response must never be authoritative while a
+                # clarification is in progress.  Retain the trusted context
+                # through the caller's deterministic result instead.
+                raise ValueError("provider returned an authoritative pending reminder")
+            if operation == "NEEDS_CLARIFICATION":
+                raw_pending = data.get("pending") or {}
+                if not isinstance(raw_pending, dict):
+                    raise ValueError("pending clarification was not an object")
+                # The rule parser may already have extracted trusted fields
+                # from an incomplete command (for example, the task from
+                # "Remind me to submit my assignment").  A model
+                # clarification is only a supplement; it must not erase those
+                # fields when its pending object omits them or returns null.
+                pending_values = {}
+                if context is not None:
+                    pending_values = context.model_dump(mode="python")
+                for field in (
+                    "task",
+                    "date_local",
+                    "hour",
+                    "minute",
+                    "meridiem",
+                    "date_explicit",
+                ):
+                    if field in raw_pending and raw_pending[field] is not None:
+                        pending_values[field] = raw_pending[field]
+                pending_values["timezone_name"] = timezone_name
+                pending = PendingReminder.model_validate(
+                    pending_values
+                )
+                question = data.get("question")
+                if not isinstance(question, str) or not question.strip():
+                    raise ValueError("missing clarification question")
+                return Interpretation(
+                    clarification=NeedsClarification(pending=pending, question=question)
+                )
+            if operation == "CREATE_ONE_TIME_REMINDERS":
+                raw_intents = data.get("intents")
+                if not isinstance(raw_intents, list) or not raw_intents:
+                    raise ValueError("multiple reminder intents were not an array")
+                intents: list[CreateOneTimeReminderIntent] = []
+                for raw_intent in raw_intents:
+                    if not isinstance(raw_intent, dict):
+                        raise ValueError("multiple reminder intent was not an object")
+                    task = raw_intent.get("task")
+                    due_local_value = raw_intent.get("due_local")
+                    if not isinstance(task, str) or not isinstance(due_local_value, str):
+                        raise ValueError("multiple reminder intent is missing fields")
+                    due_local = datetime.fromisoformat(due_local_value)
+                    if due_local.tzinfo is not None and due_local.utcoffset() is not None:
+                        raise ValueError("provider returned an offset-bearing local datetime")
+                    intents.append(
+                        CreateOneTimeReminderIntent(
+                            task=task,
+                            due_at=due_local.replace(tzinfo=ZoneInfo(timezone_name)).astimezone(
+                                timezone.utc
+                            ),
+                            timezone_name=timezone_name,
+                        )
+                    )
+                return Interpretation(intents=tuple(intents))
+            if operation != "CREATE_ONE_TIME_REMINDER":
                 result = Interpretation(
                     response_text="Please tell me the reminder task and a future time."
                 )
@@ -413,9 +1112,23 @@ class ReminderIntentInterpreter:
         self._rules = RuleBasedIntentInterpreter()
         self._model = model_interpreter
 
-    def interpret(self, text: str, *, timezone_name: str, now: datetime) -> Interpretation:
-        result = self._rules.interpret(text, timezone_name=timezone_name, now=now)
-        if result.intent is not None or self._model is None or not result.fallback_allowed:
+    def interpret(
+        self,
+        text: str,
+        *,
+        timezone_name: str,
+        now: datetime,
+        context: PendingReminder | None = None,
+    ) -> Interpretation:
+        result = self._rules.interpret(
+            text, timezone_name=timezone_name, now=now, context=context
+        )
+        if (
+            result.intent is not None
+            or result.intents
+            or self._model is None
+            or not result.fallback_allowed
+        ):
             return result
         log_event(
             logger,
@@ -423,4 +1136,54 @@ class ReminderIntentInterpreter:
             "reminder_intent_provider_fallback",
             reason="rules_did_not_match",
         )
-        return self._model.interpret(text, timezone_name=timezone_name, now=now)
+        provider_result = self._model.interpret(
+            text, timezone_name=timezone_name, now=now, context=context
+        )
+        # A provider response that contains no typed action must not erase the
+        # deterministic context or replace a focused clarification with a generic
+        # error. Keep the safer rule result in that case.
+        if context is not None:
+            # During a clarification, only a typed patch (or an explicit
+            # cancellation recognized by a provider implementation) can cross
+            # the provider boundary.  A provider cannot replace the session
+            # with a completed reminder or a newly assembled pending object.
+            if provider_result.field_updates is not None or provider_result.clear_context:
+                return provider_result
+            return result
+        if (
+            provider_result.resolved_intents
+            or provider_result.clarification is not None
+            or provider_result.clear_context
+        ):
+            if (
+                context is None
+                and result.clarification is not None
+                and provider_result.clarification is not None
+            ):
+                # Keep fields deterministically extracted from the original
+                # command when the provider returns only a partial draft.
+                provider_pending = provider_result.clarification.pending
+                base_pending = result.clarification.pending
+                merged_values = base_pending.model_dump(mode="python")
+                for field in (
+                    "task",
+                    "date_local",
+                    "hour",
+                    "minute",
+                    "meridiem",
+                    "date_explicit",
+                ):
+                    value = getattr(provider_pending, field)
+                    if value is not None:
+                        merged_values[field] = value
+                merged_pending = PendingReminder.model_validate(merged_values)
+                return Interpretation(
+                    clarification=NeedsClarification(
+                        pending=merged_pending,
+                        question=provider_result.clarification.question,
+                    ),
+                    response_text=provider_result.response_text,
+                    fallback_allowed=provider_result.fallback_allowed,
+                )
+            return provider_result
+        return result
