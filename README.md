@@ -8,10 +8,23 @@ with FastAPI, SQLAlchemy, Alembic, and PostgreSQL.
 ```powershell
 uv sync --extra test
 docker compose up -d postgres
+docker compose --profile test up -d postgres-test
 $env:DATABASE_URL = "postgresql+psycopg://memorae:memorae@localhost:5433/memorae"
+$env:TEST_DATABASE_URL = "postgresql+psycopg://memorae:memorae@localhost:5434/memorae_test"
 uv run alembic upgrade head
 uv run uvicorn reminder_agent.main:app --reload
+# In a second process:
+uv run reminder-worker
 ```
+
+For a supervised two-process local deployment, copy `.env.example` to `.env`, then run:
+
+```powershell
+docker compose up -d
+```
+
+Compose runs migrations once, then supervises the API and `reminder-worker` as separate services
+with independent restart policies. The API is exposed on port 8000; the worker has no public port.
 
 Copy `.env.example` to `.env` and configure `TELEGRAM_BOT_TOKEN` and
 `TELEGRAM_WEBHOOK_SECRET`. `PHONE_DEFAULT_REGION` is only a deployment-wide
@@ -23,7 +36,9 @@ Production startup fails fast unless `DATABASE_URL` uses PostgreSQL,
 `TELEGRAM_BOT_TOKEN` is configured, and `TELEGRAM_WEBHOOK_SECRET` is a unique value of at
 least 32 characters. The sample placeholders and local SQLite defaults are intended only for
 injected test applications. `/ready` also verifies that the domain tables exist, so a stale
-`alembic_version` row cannot make an empty database appear healthy.
+`alembic_version` row cannot make an empty database appear healthy. Readiness also requires the
+current migration head (`0010_confirmation_failed_status`) and the worker/confirmation claim
+columns, so a partially migrated database is rejected before webhooks are accepted.
 The additive schema-repair migrations also rebuild missing domain tables when a
 database was reset without resetting its Alembic version row.
 
@@ -43,6 +58,22 @@ pending Telegram notification, and the Telegram update's idempotency result. The
 is sent only after commit and includes the user's local time and Telegram destination. VS-03
 does not run delivery; the pending notification is consumed by the VS-04 scheduler worker.
 
+VS-04 runs `reminder-worker` as an independent PostgreSQL-backed process. It polls due
+notifications every `WORKER_POLL_INTERVAL_SECONDS`, claims rows with PostgreSQL
+`FOR UPDATE SKIP LOCKED` and a lease, rechecks reminder/occurrence/destination eligibility,
+then sends through Telegram. Confirmed successes are stored as `SENT` with Telegram's
+provider message ID and are never retried. DNS/connect failures, connect timeouts, and pool
+timeouts use exponential backoff because the request was not transmitted. Read/write failures
+and Telegram 5xx responses are uncertain and receive at most two delayed retries. HTTP 429
+responses use Telegram's `retry_after` value. Permanent errors become `FAILED`; exhausted
+uncertain attempts become `UNKNOWN` for monitoring or manual recovery. Strict end-to-end
+exactly-once delivery cannot be guaranteed after an ambiguous provider outcome.
+
+The same worker also retries durable Telegram confirmations that failed after the inbound
+command was committed. Confirmation responses are stored with the idempotency record, retried
+after connectivity returns, and marked `SENT` only after Telegram confirms them. This prevents a
+successful reminder from being silently accompanied by a permanently missing confirmation.
+
 After a user completes timezone onboarding, the bot offers Telegram's native
 `request_contact` button. The backend accepts only a contact whose `user_id`
 matches the Telegram sender, normalizes valid numbers to E.164, and stores the
@@ -58,8 +89,34 @@ Run tests with:
 uv run pytest
 ```
 
+When running PostgreSQL integration tests, set `TEST_DATABASE_URL` to the dedicated
+`memorae_test` database on port 5434. The test fixture refuses to run destructive cleanup if
+`TEST_DATABASE_URL` is the same database as `DATABASE_URL`; the application database is never a
+test target.
+
 ## Structured logs
 
-The backend writes concise structured text lines to stdout by default. Set `LOG_FORMAT=json` for JSON output or `LOG_INCLUDE_TRACEBACK=true` when a full traceback is needed. Useful events include `http_request_completed`, `webhook_auth_failed`, `telegram_update_received`, `telegram_delivery_failed`, `telegram_response_delivery_attempt`, `telegram_response_delivery_retry`, `telegram_update_processed`, `reminder_command_started`, `reminder_intent_interpreted`, `reminder_schedule_rejected`, `reminder_created`, `reminder_persistence_failed`, and `telegram_response_delivery_succeeded`. Logs include request IDs, update IDs, status codes, durations, parser/provider path, outcome, and error type, but never tokens, secrets, prompts, reminder text, or personal data.
+The backend writes concise structured text lines to stdout by default. Set `LOG_LEVEL=DEBUG` and
+`LOG_FORMAT=json` for detailed machine-readable output, or `LOG_INCLUDE_TRACEBACK=true` when a
+full traceback is needed. Useful events include `http_request_completed`,
+`webhook_auth_failed`, `telegram_update_received`, `telegram_api_request_started`,
+`telegram_api_response_received`, `telegram_api_request_failed`, `telegram_delivery_failed`,
+`telegram_response_delivery_attempt`, `telegram_response_delivery_retry`,
+`telegram_update_processed`, `reminder_command_started`, `reminder_intent_rules_finished`,
+`reminder_intent_interpreted`, `reminder_schedule_rejected`, `reminder_created`,
+`reminder_persistence_failed`, `notification_worker_started`,
+`notification_worker_iteration_started`, `notification_claimed`,
+`notification_delivery_attempt_started`, `notification_delivered`, and
+`notification_delivery_failed`, and `notification_delivery_outcome_recorded`. Logs include request IDs, update IDs, notification IDs, status
+codes, due-time lateness, parser/provider path, outcome, exception type, and sanitized network
+cause. Confirmation events include `confirmation_claimed`, `confirmation_delivery_attempt_started`,
+`confirmation_delivery_failed`, `confirmation_delivery_outcome_recorded`, and
+`confirmation_delivered`. Logs never contain tokens, secrets, prompts, reminder text, or personal
+data.
 
-Telegram webhook updates are idempotent. Each update gets one logical outbound response with up to three attempts for transient network, rate-limit, or 5xx failures; a retry is acknowledged without sending a duplicate. Permanent Telegram failures are not retried. If delivery remains uncertain after the configured attempts, the mutation stays durable and the delivery is recorded as `UNKNOWN`; the update is acknowledged to stop Telegram replay. Inspect `telegram_delivery_failed` and `telegram_response_delivery_retry` logs for the network/provider cause.
+Telegram webhook updates are idempotent. Each update gets one logical outbound response. A
+Telegram rate-limit response (429) may be retried up to the configured limit; network timeouts,
+connection failures, and 5xx responses are never retried because Telegram may have accepted the
+message before the response was lost. Those ambiguous outcomes are recorded as `UNKNOWN`, and a
+replayed update is acknowledged without sending again. Inspect `telegram_delivery_failed` and
+`telegram_response_delivery_retry` logs for the network/provider cause.
