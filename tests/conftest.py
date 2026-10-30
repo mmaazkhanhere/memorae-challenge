@@ -15,9 +15,11 @@ from reminder_agent.settings import Settings
 class FakeTelegramClient:
     def __init__(self) -> None:
         self.messages: list[tuple[int, str]] = []
+        self.reply_markups: list[dict | None] = []
 
-    def send_message(self, chat_id: int, text: str) -> None:
+    def send_message(self, chat_id: int, text: str, *, reply_markup=None) -> None:
         self.messages.append((chat_id, text))
+        self.reply_markups.append(reply_markup)
 
 
 @pytest.fixture()
@@ -78,6 +80,7 @@ def telegram_update(
     text: str | None = "/start",
     chat_type: str = "private",
     first_name: str = "Ada",
+    contact: dict | None = None,
 ) -> dict:
     message = {
         "message_id": update_id,
@@ -86,10 +89,11 @@ def telegram_update(
     }
     if text is not None:
         message["text"] = text
+    if contact is not None:
+        message["contact"] = contact
     return {"update_id": update_id, "message": message}
 
 
 @pytest.fixture()
 def update_factory():
     return telegram_update
-

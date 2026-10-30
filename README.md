@@ -2,7 +2,8 @@
 
 ## Local development
 
-VS-01 implements Telegram onboarding with FastAPI, SQLAlchemy, Alembic, and PostgreSQL.
+VS-02 implements Telegram onboarding and verified phone linking with FastAPI, SQLAlchemy,
+Alembic, and PostgreSQL.
 
 ```powershell
 uv sync --extra test
@@ -12,7 +13,20 @@ uv run alembic upgrade head
 uv run uvicorn reminder_agent.main:app --reload
 ```
 
-Configure `TELEGRAM_BOT_TOKEN` and `TELEGRAM_WEBHOOK_SECRET` using `.env.example`. Set the Telegram webhook to `POST /webhook/telegram` with the same secret token.
+Copy `.env.example` to `.env` and configure `TELEGRAM_BOT_TOKEN` and
+`TELEGRAM_WEBHOOK_SECRET`. `PHONE_DEFAULT_REGION` is only a deployment-wide
+fallback; in a multi-country deployment, users with local-format contacts can
+set their own region with `/phone_region XX`. Set the Telegram webhook to
+`POST /webhook/telegram` with the same secret token.
+
+After a user completes timezone onboarding, the bot offers Telegram's native
+`request_contact` button. The backend accepts only a contact whose `user_id`
+matches the Telegram sender, normalizes valid numbers to E.164, and stores the
+phone as a linked channel identity. Active phone numbers are database-unique, so
+concurrent link attempts cannot authorize the same number for two users. Users may
+choose `Skip for now` and continue using Telegram; `/link_phone` reopens the prompt.
+If Telegram supplies a national-format number, the bot asks for a two-letter
+country code such as `/phone_region PK` and then links the verified contact.
 
 Run tests with:
 

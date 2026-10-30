@@ -22,6 +22,13 @@ class TelegramChat(BaseModel):
     type: str
 
 
+class TelegramContact(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    phone_number: str
+    user_id: int | None = None
+
+
 class TelegramMessage(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
@@ -29,6 +36,7 @@ class TelegramMessage(BaseModel):
     from_user: TelegramUser = Field(alias="from")
     chat: TelegramChat
     text: str | None = None
+    contact: TelegramContact | None = None
 
 
 class TelegramUpdate(BaseModel):
@@ -39,8 +47,9 @@ class TelegramUpdate(BaseModel):
 
 
 class TelegramClient(Protocol):
-    def send_message(self, chat_id: int, text: str) -> None:
-        ...
+    def send_message(
+        self, chat_id: int, text: str, *, reply_markup: dict[str, Any] | None = None
+    ) -> None: ...
 
 
 class TelegramAPIError(RuntimeError):
@@ -69,11 +78,16 @@ class HttpTelegramClient:
         self._url = f"https://api.telegram.org/bot{token}/sendMessage"
         self._timeout = timeout_seconds
 
-    def send_message(self, chat_id: int, text: str) -> None:
+    def send_message(
+        self, chat_id: int, text: str, *, reply_markup: dict[str, Any] | None = None
+    ) -> None:
         try:
+            payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
+            if reply_markup is not None:
+                payload["reply_markup"] = reply_markup
             response = httpx.post(
                 self._url,
-                json={"chat_id": chat_id, "text": text},
+                json=payload,
                 timeout=self._timeout,
             )
         except httpx.TimeoutException as exc:

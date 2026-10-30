@@ -12,6 +12,7 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     Uuid,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -36,6 +37,7 @@ class User(Base):
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
     name: Mapped[str] = mapped_column(String(150), nullable=False)
     timezone: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    phone_region: Mapped[str | None] = mapped_column(String(2), nullable=True)
     onboarding_status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="PENDING", server_default="PENDING"
     )
@@ -53,7 +55,21 @@ class ChannelIdentity(Base):
         CheckConstraint("channel_type IN ('TELEGRAM', 'PHONE')", name="ck_identity_channel_type"),
         CheckConstraint("status IN ('PENDING', 'LINKED', 'UNLINKED')", name="ck_identity_status"),
         Index("ix_channel_identities_user_id", "user_id"),
-        UniqueConstraint("channel_type", "external_id", name="uq_identity_channel_external"),
+        Index(
+            "uq_channel_identities_active_external",
+            "channel_type",
+            "external_id",
+            unique=True,
+            postgresql_where=text("status = 'LINKED'"),
+            sqlite_where=text("status = 'LINKED'"),
+        ),
+        Index(
+            "uq_channel_identities_active_phone_user",
+            "user_id",
+            unique=True,
+            postgresql_where=text("channel_type = 'PHONE' AND status = 'LINKED'"),
+            sqlite_where=text("channel_type = 'PHONE' AND status = 'LINKED'"),
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
