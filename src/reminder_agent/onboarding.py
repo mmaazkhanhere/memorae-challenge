@@ -307,8 +307,53 @@ def _handle_start(db: Session, update: TelegramUpdate) -> OnboardingReply:
         )
 
 
-def _handle_message(db: Session, update: TelegramUpdate) -> OnboardingReply:
+def _handle_message(
+    db: Session,
+    update: TelegramUpdate,
+    *,
+    reminder_interpreter=None,
+    now: datetime | None = None,
+) -> OnboardingReply:
     assert update.message is not None
+    # Keep model calls outside a database transaction. Onboarding messages still use
+    # the existing transactional path below; active users are handed to the shared
+    # reminder service after the read transaction is closed.
+    db.rollback()
+    existing = _existing_record(db, update)
+    if existing is not None:
+        db.rollback()
+        return _reply_from_record(existing)
+
+    identity = _find_identity(db, update)
+    if identity is None:
+        db.rollback()
+        with db.begin():
+            return _store_result(
+                db,
+                update=update,
+                user_id=None,
+                operation="ONBOARDING_UNKNOWN_SENDER",
+                text="Please send /start to begin onboarding.",
+            )
+
+    user = db.get(User, identity.user_id)
+    assert user is not None
+    if user.onboarding_status == ACTIVE:
+        db.rollback()
+        from reminder_agent.intent import ReminderIntentInterpreter
+        from reminder_agent.reminders import handle_reminder_text
+
+        return handle_reminder_text(
+            db,
+            update,
+            user_id=user.id,
+            identity_id=identity.id,
+            telegram_user_id=update.message.from_user.id,
+            interpreter=reminder_interpreter or ReminderIntentInterpreter(),
+            now=now or datetime.now(timezone.utc),
+        )
+
+    db.rollback()
     with db.begin():
         existing = _existing_record(db, update)
         if existing is not None:
@@ -326,15 +371,6 @@ def _handle_message(db: Session, update: TelegramUpdate) -> OnboardingReply:
 
         user = db.get(User, identity.user_id)
         assert user is not None
-        if user.onboarding_status == ACTIVE:
-            return _store_result(
-                db,
-                update=update,
-                user_id=user.id,
-                operation="ONBOARDING_ALREADY_ACTIVE",
-                text=f"You're already onboarded, {user.name}.",
-            )
-
         raw_timezone = (update.message.text or "").strip()
         try:
             timezone_name = validate_timezone(raw_timezone)
@@ -763,6 +799,8 @@ def handle_update(
     update: TelegramUpdate,
     *,
     default_region: str | None = None,
+    reminder_interpreter=None,
+    now: datetime | None = None,
 ) -> OnboardingReply | None:
     """Apply one Telegram update and return the committed response, if any."""
     if update.message is None or update.message.chat.type != "private":
@@ -778,7 +816,12 @@ def handle_update(
     phone_region = _phone_region_from_text(update)
     if phone_region is not None:
         return _handle_phone_region(db, update, phone_region)
-    return _handle_message(db, update)
+    return _handle_message(
+        db,
+        update,
+        reminder_interpreter=reminder_interpreter,
+        now=now,
+    )
 
 
 def claim_delivery(db: Session, idempotency_key: str) -> bool:

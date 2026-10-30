@@ -2,19 +2,31 @@ from __future__ import annotations
 
 import logging
 import time
+from contextlib import asynccontextmanager
 from collections.abc import Callable, Generator
+from datetime import datetime, timezone
 from typing import Awaitable, Callable as TypingCallable
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 
 from reminder_agent.api.telegram import router as telegram_router
 from reminder_agent.db.session import get_db
+from reminder_agent.intent import OpenAICompatibleIntentInterpreter, ReminderIntentInterpreter
 from reminder_agent.observability import configure_logging, log_event, request_id
-from reminder_agent.settings import Settings, get_settings
+from reminder_agent.settings import Settings, get_settings, validate_runtime_settings
 from reminder_agent.telegram import TelegramClient
+
+REQUIRED_SCHEMA_TABLES = (
+    "users",
+    "channel_identities",
+    "idempotency_records",
+    "reminders",
+    "reminder_occurrences",
+    "notifications",
+)
 
 
 def create_app(
@@ -22,15 +34,40 @@ def create_app(
     *,
     telegram_client: TelegramClient | None = None,
     session_factory: Callable[[], Session] | None = None,
+    reminder_interpreter=None,
+    clock: Callable[[], datetime] | None = None,
 ) -> FastAPI:
-    app = FastAPI(title="Memorae")
-    app.state.settings = settings or get_settings()
-    app.state.telegram_client = telegram_client
+    runtime_settings = settings or get_settings()
     logger = configure_logging(
-        app.state.settings.log_level,
-        app.state.settings.log_format,
-        app.state.settings.log_include_traceback,
+        runtime_settings.log_level,
+        runtime_settings.log_format,
+        runtime_settings.log_include_traceback,
     )
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        validate_runtime_settings(
+            runtime_settings,
+            allow_local_database=session_factory is not None,
+        )
+        log_event(logger, logging.INFO, "runtime_configuration_validated")
+        yield
+
+    app = FastAPI(title="Memorae", lifespan=lifespan)
+    app.state.settings = runtime_settings
+    app.state.telegram_client = telegram_client
+    model_interpreter = None
+    if app.state.settings.llm_base_url and app.state.settings.llm_api_key:
+        model_interpreter = OpenAICompatibleIntentInterpreter(
+            app.state.settings.llm_base_url,
+            app.state.settings.llm_api_key,
+            app.state.settings.llm_model,
+            app.state.settings.llm_timeout_seconds,
+        )
+    app.state.reminder_interpreter = reminder_interpreter or ReminderIntentInterpreter(
+        model_interpreter
+    )
+    app.state.clock = clock or (lambda: datetime.now(timezone.utc))
 
     @app.middleware("http")
     async def request_logging(request: Request, call_next: TypingCallable[[Request], Awaitable[Response]]):
@@ -90,8 +127,18 @@ def create_app(
     def ready(db: Session = Depends(get_db)) -> dict[str, str]:
         try:
             db.execute(text("SELECT 1"))
+            existing_tables = set(inspect(db.get_bind()).get_table_names())
         except Exception as exc:
             raise HTTPException(status_code=503, detail="Database is unavailable") from exc
+        missing_tables = sorted(set(REQUIRED_SCHEMA_TABLES) - existing_tables)
+        if missing_tables:
+            log_event(
+                logger,
+                logging.ERROR,
+                "database_schema_incomplete",
+                missing_table_count=len(missing_tables),
+            )
+            raise HTTPException(status_code=503, detail="Database schema is incomplete")
         return {"status": "ready"}
 
     app.include_router(telegram_router)
