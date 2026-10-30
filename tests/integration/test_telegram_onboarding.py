@@ -175,7 +175,7 @@ def test_database_failure_does_not_send_false_success(
     assert telegram_client.messages == []
 
 
-def test_telegram_delivery_failure_is_acknowledged_without_retrying_response(
+def test_telegram_delivery_failure_is_acknowledged_after_bounded_retries(
     session_factory, update_factory
 ) -> None:
     from fastapi.testclient import TestClient
@@ -203,7 +203,7 @@ def test_telegram_delivery_failure_is_acknowledged_without_retrying_response(
 
     assert first.status_code == 200
     assert retry.status_code == 200
-    assert failing_client.attempts == 1
+    assert failing_client.attempts == 3
 
 
 def test_health_and_readiness(api_client) -> None:

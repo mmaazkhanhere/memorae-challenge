@@ -1,4 +1,5 @@
 from collections.abc import Iterator
+from datetime import datetime, timezone
 import os
 
 import pytest
@@ -20,6 +21,11 @@ class FakeTelegramClient:
     def send_message(self, chat_id: int, text: str, *, reply_markup=None) -> None:
         self.messages.append((chat_id, text))
         self.reply_markups.append(reply_markup)
+
+
+@pytest.fixture()
+def fixed_now() -> datetime:
+    return datetime(2026, 10, 30, 12, 0, tzinfo=timezone.utc)
 
 
 @pytest.fixture()
@@ -48,7 +54,7 @@ def telegram_client() -> FakeTelegramClient:
 
 
 @pytest.fixture()
-def api_client(session_factory, telegram_client) -> Iterator[TestClient]:
+def api_client(session_factory, telegram_client, fixed_now) -> Iterator[TestClient]:
     settings = Settings(
         database_url="sqlite://",
         telegram_bot_token="test-token",
@@ -58,6 +64,7 @@ def api_client(session_factory, telegram_client) -> Iterator[TestClient]:
         settings,
         telegram_client=telegram_client,
         session_factory=session_factory,
+        clock=lambda: fixed_now,
     )
     with TestClient(app, raise_server_exceptions=False) as client:
         yield client
