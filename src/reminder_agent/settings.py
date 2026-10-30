@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_webhook_secret: str = Field(default="change-me", min_length=1)
     telegram_api_timeout_seconds: float = Field(default=10.0, gt=0)
+    phone_default_region: str | None = None
     log_level: str = "INFO"
     log_format: str = "text"
     log_include_traceback: bool = False

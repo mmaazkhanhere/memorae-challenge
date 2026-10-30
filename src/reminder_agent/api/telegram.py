@@ -9,13 +9,13 @@ from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from reminder_agent.db.session import get_db
+from reminder_agent.observability import get_logger, log_event
 from reminder_agent.onboarding import (
     IdempotencyConflict,
     claim_delivery,
     handle_update,
     record_delivery_outcome,
 )
-from reminder_agent.observability import get_logger, log_event
 from reminder_agent.telegram import HttpTelegramClient, TelegramAPIError, TelegramUpdate
 
 router = APIRouter()
@@ -47,10 +47,20 @@ def telegram_webhook(
         update_id=update.update_id,
         has_message=update.message is not None,
         chat_type=update.message.chat.type if update.message is not None else None,
+        has_contact=update.message is not None and update.message.contact is not None,
+        contact_owner_present=(
+            update.message is not None
+            and update.message.contact is not None
+            and update.message.contact.user_id is not None
+        ),
     )
 
     try:
-        reply = handle_update(db, update)
+        reply = handle_update(
+            db,
+            update,
+            default_region=request.app.state.settings.phone_default_region,
+        )
         if reply is not None and reply.is_duplicate:
             log_event(
                 logger,
@@ -73,7 +83,14 @@ def telegram_webhook(
                     request.app.state.settings.telegram_bot_token,
                     request.app.state.settings.telegram_api_timeout_seconds,
                 )
-                client.send_message(reply.chat_id, reply.text)
+                if reply.reply_markup is None:
+                    client.send_message(reply.chat_id, reply.text)
+                else:
+                    client.send_message(
+                        reply.chat_id,
+                        reply.text,
+                        reply_markup=reply.reply_markup,
+                    )
             except TelegramAPIError as exc:
                 record_delivery_outcome(db, reply.idempotency_key, sent=False)
                 log_event(
