@@ -27,6 +27,22 @@ REQUIRED_SCHEMA_TABLES = (
     "reminder_occurrences",
     "notifications",
 )
+REQUIRED_SCHEMA_VERSION = "0010_confirmation_failed_status"
+REQUIRED_SCHEMA_COLUMNS = {
+    "notifications": {
+        "claimed_by",
+        "claimed_until",
+        "last_attempt_at",
+        "last_error_kind",
+    },
+    "idempotency_records": {
+        "delivery_attempt_count",
+        "delivery_next_attempt_at",
+        "delivery_claimed_by",
+        "delivery_claimed_until",
+        "delivery_last_error_kind",
+    },
+}
 
 
 def create_app(
@@ -127,7 +143,8 @@ def create_app(
     def ready(db: Session = Depends(get_db)) -> dict[str, str]:
         try:
             db.execute(text("SELECT 1"))
-            existing_tables = set(inspect(db.get_bind()).get_table_names())
+            inspector = inspect(db.get_bind())
+            existing_tables = set(inspector.get_table_names())
         except Exception as exc:
             raise HTTPException(status_code=503, detail="Database is unavailable") from exc
         missing_tables = sorted(set(REQUIRED_SCHEMA_TABLES) - existing_tables)
@@ -139,6 +156,41 @@ def create_app(
                 missing_table_count=len(missing_tables),
             )
             raise HTTPException(status_code=503, detail="Database schema is incomplete")
+        try:
+            versions = db.execute(text("SELECT version_num FROM alembic_version")).scalars().all()
+        except Exception as exc:
+            log_event(
+                logger,
+                logging.ERROR,
+                "database_migration_version_unavailable",
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=503, detail="Database migration state is unavailable"
+            ) from exc
+        if versions != [REQUIRED_SCHEMA_VERSION]:
+            log_event(
+                logger,
+                logging.ERROR,
+                "database_migration_incomplete",
+                expected_version=REQUIRED_SCHEMA_VERSION,
+                actual_versions=versions,
+            )
+            raise HTTPException(status_code=503, detail="Database migrations are incomplete")
+        missing_columns = {
+            table: sorted(columns - {column["name"] for column in inspector.get_columns(table)})
+            for table, columns in REQUIRED_SCHEMA_COLUMNS.items()
+        }
+        missing_columns = {table: columns for table, columns in missing_columns.items() if columns}
+        if missing_columns:
+            log_event(
+                logger,
+                logging.ERROR,
+                "database_schema_columns_incomplete",
+                missing_column_table_count=len(missing_columns),
+                missing_column_count=sum(len(columns) for columns in missing_columns.values()),
+            )
+            raise HTTPException(status_code=503, detail="Database schema columns are incomplete")
         return {"status": "ready"}
 
     app.include_router(telegram_router)
