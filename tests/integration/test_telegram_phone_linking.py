@@ -174,22 +174,23 @@ def test_local_contact_can_use_user_selected_region(
         db.scalar(
             select(func.count())
             .select_from(ChannelIdentity)
-            .where(ChannelIdentity.channel_type == "PHONE")
+            .where(
+                ChannelIdentity.channel_type == "PHONE",
+                ChannelIdentity.status == "PENDING",
+            )
         )
-        == 0
+        == 1
     )
 
     assert post_update(api_client, update_factory(103, text="/phone_region PK")).status_code == 200
-    assert "Saved phone country PK" in telegram_client.messages[-1][1]
-    assert (
-        post_update(
-            api_client,
-            contact_update(update_factory, 104, phone_number="03001234567"),
-        ).status_code
-        == 200
-    )
+    assert "now linked" in telegram_client.messages[-1][1]
 
-    identity = db.scalar(select(ChannelIdentity).where(ChannelIdentity.channel_type == "PHONE"))
+    identity = db.scalar(
+        select(ChannelIdentity).where(
+            ChannelIdentity.channel_type == "PHONE",
+            ChannelIdentity.status == "LINKED",
+        )
+    )
     assert identity is not None
     assert identity.external_id == "+923001234567"
     assert db.scalar(select(User).where(User.phone_region == "PK")) is not None

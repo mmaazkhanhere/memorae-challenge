@@ -240,6 +240,18 @@ def _find_phone_identity(
     return db.scalar(select(ChannelIdentity).where(*filters))
 
 
+def _find_pending_phone_identity(db: Session, *, user_id) -> ChannelIdentity | None:
+    return db.scalar(
+        select(ChannelIdentity)
+        .where(
+            ChannelIdentity.user_id == user_id,
+            ChannelIdentity.channel_type == PHONE,
+            ChannelIdentity.status == PENDING,
+        )
+        .order_by(ChannelIdentity.created_at.desc())
+    )
+
+
 def _handle_start(db: Session, update: TelegramUpdate) -> OnboardingReply:
     assert update.message is not None
     with db.begin():
@@ -485,13 +497,36 @@ def _handle_phone_region(db: Session, update: TelegramUpdate, raw_region: str) -
             update_id=update.update_id,
             region=region,
         )
-        return _store_result(
+        pending = _find_pending_phone_identity(db, user_id=user.id)
+        if pending is None:
+            return _store_result(
+                db,
+                update=update,
+                user_id=user.id,
+                operation="PHONE_REGION_SAVED",
+                text=f"Saved phone country {region}. Please tap Share my phone number.",
+                reply_markup=PHONE_KEYBOARD,
+            )
+        try:
+            normalized = normalize_phone_number(pending.external_id, default_region=region)
+        except InvalidPhoneNumber:
+            return _store_result(
+                db,
+                update=update,
+                user_id=user.id,
+                operation="PHONE_LINK_INVALID",
+                text=(
+                    f"I couldn't validate the phone number with country {region}. "
+                    "Try another country code or share your phone number again."
+                ),
+                reply_markup=PHONE_KEYBOARD,
+            )
+        return _link_verified_phone(
             db,
             update=update,
-            user_id=user.id,
-            operation="PHONE_REGION_SAVED",
-            text=f"Saved phone country {region}. Please tap Share my phone number again.",
-            reply_markup=PHONE_KEYBOARD,
+            user=user,
+            normalized=normalized,
+            pending=pending,
         )
 
 
@@ -570,10 +605,25 @@ def _handle_contact(
                 region_configured=region is not None,
             )
             if exc.reason == "missing_region":
+                for pending in db.scalars(
+                    select(ChannelIdentity).where(
+                        ChannelIdentity.user_id == user.id,
+                        ChannelIdentity.channel_type == PHONE,
+                        ChannelIdentity.status == PENDING,
+                    )
+                ):
+                    pending.status = UNLINKED
+                db.add(
+                    ChannelIdentity(
+                        user_id=user.id,
+                        channel_type=PHONE,
+                        external_id=contact.phone_number,
+                        status=PENDING,
+                    )
+                )
                 text = (
                     "Telegram sent a local-format number. Reply with /phone_region followed "
-                    "by your two-letter country code (for example /phone_region PK), then tap "
-                    "Share my phone number again."
+                    "by your two-letter country code (for example /phone_region PK)."
                 )
             else:
                 text = "I couldn't validate that phone number. Please try sharing it again."
@@ -586,51 +636,67 @@ def _handle_contact(
                 reply_markup=PHONE_KEYBOARD,
             )
 
-        other_owner = db.scalar(
-            select(ChannelIdentity).where(
-                ChannelIdentity.channel_type == PHONE,
-                ChannelIdentity.external_id == normalized,
-                ChannelIdentity.status == LINKED,
-            )
+        return _link_verified_phone(db, update=update, user=user, normalized=normalized)
+
+
+def _link_verified_phone(
+    db: Session,
+    *,
+    update: TelegramUpdate,
+    user: User,
+    normalized: str,
+    pending: ChannelIdentity | None = None,
+) -> OnboardingReply:
+    other_owner = db.scalar(
+        select(ChannelIdentity).where(
+            ChannelIdentity.channel_type == PHONE,
+            ChannelIdentity.external_id == normalized,
+            ChannelIdentity.status == LINKED,
         )
-        if other_owner is not None and other_owner.user_id != user.id:
-            log_event(
-                logger,
-                logging.WARNING,
-                "phone_link_rejected",
-                update_id=update.update_id,
-                reason="active_number_conflict",
-            )
-            return _store_result(
-                db,
-                update=update,
-                user_id=user.id,
-                operation="PHONE_LINK_CONFLICT",
-                text="That phone number is already linked to another account.",
-                reply_markup=PHONE_KEYBOARD,
-            )
+    )
+    if other_owner is not None and other_owner.user_id != user.id:
+        log_event(
+            logger,
+            logging.WARNING,
+            "phone_link_rejected",
+            update_id=update.update_id,
+            reason="active_number_conflict",
+        )
+        return _store_result(
+            db,
+            update=update,
+            user_id=user.id,
+            operation="PHONE_LINK_CONFLICT",
+            text="That phone number is already linked to another account.",
+            reply_markup=PHONE_KEYBOARD,
+        )
 
-        current = _find_phone_identity(db, user_id=user.id)
-        if current is not None and current.external_id == normalized:
-            log_event(
-                logger,
-                logging.INFO,
-                "phone_link_reused",
-                update_id=update.update_id,
-            )
-            return _store_result(
-                db,
-                update=update,
-                user_id=user.id,
-                operation="PHONE_LINK_ALREADY_LINKED",
-                text="Your phone number is already linked.",
-                reply_markup=REMOVE_KEYBOARD,
-            )
+    current = _find_phone_identity(db, user_id=user.id)
+    if current is not None and current.external_id == normalized:
+        log_event(
+            logger,
+            logging.INFO,
+            "phone_link_reused",
+            update_id=update.update_id,
+        )
+        return _store_result(
+            db,
+            update=update,
+            user_id=user.id,
+            operation="PHONE_LINK_ALREADY_LINKED",
+            text="Your phone number is already linked.",
+            reply_markup=REMOVE_KEYBOARD,
+        )
 
-        try:
-            with db.begin_nested():
-                if current is not None:
-                    current.status = UNLINKED
+    try:
+        with db.begin_nested():
+            if current is not None:
+                current.status = UNLINKED
+            if pending is not None:
+                pending.external_id = normalized
+                pending.status = LINKED
+                pending.verified_at = datetime.now(timezone.utc)
+            else:
                 db.add(
                     ChannelIdentity(
                         user_id=user.id,
@@ -640,39 +706,39 @@ def _handle_contact(
                         verified_at=datetime.now(timezone.utc),
                     )
                 )
-                db.flush()
-        except IntegrityError:
-            log_event(
-                logger,
-                logging.WARNING,
-                "phone_link_rejected",
-                update_id=update.update_id,
-                reason="database_uniqueness_conflict",
-            )
-            return _store_result(
-                db,
-                update=update,
-                user_id=user.id,
-                operation="PHONE_LINK_CONFLICT",
-                text="That phone number is already linked to another account.",
-                reply_markup=PHONE_KEYBOARD,
-            )
-
+            db.flush()
+    except IntegrityError:
         log_event(
             logger,
-            logging.INFO,
-            "phone_link_succeeded",
+            logging.WARNING,
+            "phone_link_rejected",
             update_id=update.update_id,
-            replaced_existing=current is not None,
+            reason="database_uniqueness_conflict",
         )
         return _store_result(
             db,
             update=update,
             user_id=user.id,
-            operation="PHONE_LINKED",
-            text="Your phone number is now linked. You can call the assistant using this number.",
-            reply_markup=REMOVE_KEYBOARD,
+            operation="PHONE_LINK_CONFLICT",
+            text="That phone number is already linked to another account.",
+            reply_markup=PHONE_KEYBOARD,
         )
+
+    log_event(
+        logger,
+        logging.INFO,
+        "phone_link_succeeded",
+        update_id=update.update_id,
+        replaced_existing=current is not None,
+    )
+    return _store_result(
+        db,
+        update=update,
+        user_id=user.id,
+        operation="PHONE_LINKED",
+        text="Your phone number is now linked. You can call the assistant using this number.",
+        reply_markup=REMOVE_KEYBOARD,
+    )
 
 
 def handle_update(

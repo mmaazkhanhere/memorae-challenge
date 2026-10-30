@@ -26,7 +26,7 @@ phone as a linked channel identity. Active phone numbers are database-unique, so
 concurrent link attempts cannot authorize the same number for two users. Users may
 choose `Skip for now` and continue using Telegram; `/link_phone` reopens the prompt.
 If Telegram supplies a national-format number, the bot asks for a two-letter
-country code such as `/phone_region PK` before retrying the native contact share.
+country code such as `/phone_region PK` and then links the verified contact.
 
 Run tests with:
 
