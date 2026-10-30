@@ -25,9 +25,11 @@ class Settings(BaseSettings):
     llm_api_key: str | None = None
     llm_model: str = "gpt-6-luna"
     llm_timeout_seconds: float = Field(default=10.0, gt=0)
+    conversation_session_ttl_seconds: int = Field(default=900, ge=60, le=86400)
     phone_default_region: str | None = None
     log_level: str = "INFO"
     log_format: str = "text"
+    log_color: bool = True
     log_include_traceback: bool = False
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)

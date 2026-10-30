@@ -81,6 +81,8 @@ def api_client(session_factory, telegram_client, fixed_now) -> Iterator[TestClie
         database_url="sqlite://",
         telegram_bot_token="test-token",
         telegram_webhook_secret="test-secret",
+        # Tests must not inherit a developer's live provider key from .env.
+        llm_api_key=None,
     )
     app = create_app(
         settings,
