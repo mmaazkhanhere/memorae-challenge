@@ -313,6 +313,7 @@ def _handle_message(
     *,
     reminder_interpreter=None,
     now: datetime | None = None,
+    session_ttl_seconds: int = 900,
 ) -> OnboardingReply:
     assert update.message is not None
     # Keep model calls outside a database transaction. Onboarding messages still use
@@ -351,6 +352,7 @@ def _handle_message(
             telegram_user_id=update.message.from_user.id,
             interpreter=reminder_interpreter or ReminderIntentInterpreter(),
             now=now or datetime.now(timezone.utc),
+            session_ttl_seconds=session_ttl_seconds,
         )
 
     db.rollback()
@@ -801,6 +803,7 @@ def handle_update(
     default_region: str | None = None,
     reminder_interpreter=None,
     now: datetime | None = None,
+    session_ttl_seconds: int = 900,
 ) -> OnboardingReply | None:
     """Apply one Telegram update and return the committed response, if any."""
     if update.message is None or update.message.chat.type != "private":
@@ -821,6 +824,7 @@ def handle_update(
         update,
         reminder_interpreter=reminder_interpreter,
         now=now,
+        session_ttl_seconds=session_ttl_seconds,
     )
 
 

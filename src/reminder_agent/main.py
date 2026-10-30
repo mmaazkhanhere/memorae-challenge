@@ -26,8 +26,9 @@ REQUIRED_SCHEMA_TABLES = (
     "reminders",
     "reminder_occurrences",
     "notifications",
+    "conversation_sessions",
 )
-REQUIRED_SCHEMA_VERSION = "0010_confirmation_failed_status"
+REQUIRED_SCHEMA_VERSION = "0012_conversation_session_version"
 REQUIRED_SCHEMA_COLUMNS = {
     "notifications": {
         "claimed_by",
@@ -41,6 +42,15 @@ REQUIRED_SCHEMA_COLUMNS = {
         "delivery_claimed_by",
         "delivery_claimed_until",
         "delivery_last_error_kind",
+    },
+    "conversation_sessions": {
+        "user_id",
+        "channel_type",
+        "external_session_id",
+        "pending_clarification",
+        "status",
+        "version",
+        "updated_at",
     },
 }
 
@@ -58,6 +68,7 @@ def create_app(
         runtime_settings.log_level,
         runtime_settings.log_format,
         runtime_settings.log_include_traceback,
+        runtime_settings.log_color,
     )
 
     @asynccontextmanager
