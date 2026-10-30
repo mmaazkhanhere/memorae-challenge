@@ -175,7 +175,7 @@ def test_database_failure_does_not_send_false_success(
     assert telegram_client.messages == []
 
 
-def test_telegram_delivery_failure_is_acknowledged_after_bounded_retries(
+def test_telegram_502_is_acknowledged_without_duplicate_retry(
     session_factory, update_factory
 ) -> None:
     from fastapi.testclient import TestClient
@@ -185,10 +185,13 @@ def test_telegram_delivery_failure_is_acknowledged_after_bounded_retries(
 
     class FailingTelegramClient:
         attempts = 0
+        delivered = 0
 
         def send_message(self, chat_id: int, text: str) -> None:
             self.attempts += 1
-            raise TelegramAPIError("timed out", failure_kind="network_timeout")
+            # Model Telegram accepting the message before a gateway returns 502.
+            self.delivered += 1
+            raise TelegramAPIError("bad gateway", status_code=502, failure_kind="http_error")
 
     failing_client = FailingTelegramClient()
     app = create_app(
@@ -203,7 +206,17 @@ def test_telegram_delivery_failure_is_acknowledged_after_bounded_retries(
 
     assert first.status_code == 200
     assert retry.status_code == 200
-    assert failing_client.attempts == 3
+    assert failing_client.attempts == 1
+    assert failing_client.delivered == 1
+    with session_factory() as db:
+        delivery = db.scalar(
+            select(IdempotencyRecord).where(
+                IdempotencyRecord.source == "TELEGRAM",
+                IdempotencyRecord.idempotency_key == "90",
+            )
+        )
+        assert delivery is not None
+        assert delivery.delivery_status == "UNKNOWN"
 
 
 def test_health_and_readiness(api_client) -> None:

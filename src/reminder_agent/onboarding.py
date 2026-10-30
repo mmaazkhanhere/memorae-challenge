@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, available_timezones
 
 import phonenumbers
@@ -837,10 +837,21 @@ def claim_delivery(db: Session, idempotency_key: str) -> bool:
             return False
         record.delivery_status = "ATTEMPTED"
         record.delivery_attempted_at = datetime.now(timezone.utc)
+        record.delivery_attempt_count += 1
+        record.delivery_claimed_by = f"webhook:{idempotency_key}"
+        record.delivery_claimed_until = datetime.now(timezone.utc) + timedelta(minutes=2)
         return True
 
 
-def record_delivery_outcome(db: Session, idempotency_key: str, *, sent: bool) -> None:
+def record_delivery_outcome(
+    db: Session,
+    idempotency_key: str,
+    *,
+    sent: bool,
+    error_kind: str | None = None,
+    status_code: int | None = None,
+    next_attempt_at: datetime | None = None,
+) -> None:
     with db.begin():
         record = db.scalar(
             select(IdempotencyRecord).where(
@@ -849,4 +860,13 @@ def record_delivery_outcome(db: Session, idempotency_key: str, *, sent: bool) ->
             )
         )
         if record is not None:
-            record.delivery_status = "SENT" if sent else "UNKNOWN"
+            permanent_failure = status_code in {400, 401, 403, 404}
+            record.delivery_status = "SENT" if sent else (
+                "FAILED" if permanent_failure else "UNKNOWN"
+            )
+            record.delivery_claimed_by = None
+            record.delivery_claimed_until = None
+            record.delivery_last_error_kind = None if sent else error_kind
+            record.delivery_next_attempt_at = (
+                None if sent or permanent_failure else next_attempt_at
+            )

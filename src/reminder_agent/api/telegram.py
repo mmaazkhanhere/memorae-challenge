@@ -3,6 +3,7 @@ from __future__ import annotations
 import hmac
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -24,13 +25,10 @@ logger = get_logger()
 
 
 def _telegram_error_is_retryable(error: TelegramAPIError) -> bool:
-    return error.failure_kind in {"network", "network_timeout"} or error.status_code in {
-        429,
-        500,
-        502,
-        503,
-        504,
-    }
+    # Network failures and 5xx responses are ambiguous: Telegram may have accepted
+    # the message before the response was lost. Retrying can create a duplicate.
+    # A 429 explicitly means Telegram did not accept this request, so it is safe.
+    return error.status_code == 429
 
 
 def _send_reply_with_retry(
@@ -156,7 +154,18 @@ def telegram_webhook(
                     ),
                 )
             except TelegramAPIError as exc:
-                record_delivery_outcome(db, reply.idempotency_key, sent=False)
+                retry_after = exc.retry_after_seconds or 0
+                retry_delay = retry_after or (
+                    request.app.state.settings.telegram_confirmation_background_retry_base_delay_seconds
+                )
+                record_delivery_outcome(
+                    db,
+                    reply.idempotency_key,
+                    sent=False,
+                    error_kind=exc.failure_kind,
+                    status_code=exc.status_code,
+                    next_attempt_at=datetime.now(timezone.utc) + timedelta(seconds=retry_delay),
+                )
                 log_event(
                     logger,
                     logging.ERROR,

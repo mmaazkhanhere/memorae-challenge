@@ -12,6 +12,15 @@ class Settings(BaseSettings):
     telegram_api_timeout_seconds: float = Field(default=10.0, gt=0)
     telegram_confirmation_max_attempts: int = Field(default=3, ge=1, le=5)
     telegram_confirmation_retry_delay_seconds: float = Field(default=0.25, ge=0, le=5)
+    telegram_confirmation_background_max_attempts: int = Field(default=3, ge=1, le=3)
+    telegram_confirmation_background_retry_base_delay_seconds: float = Field(
+        default=30.0, gt=0, le=3600
+    )
+    worker_poll_interval_seconds: float = Field(default=5.0, gt=0, le=60)
+    worker_claim_lease_seconds: float = Field(default=60.0, gt=10, le=600)
+    notification_retry_max_attempts: int = Field(default=3, ge=1, le=10)
+    notification_uncertain_max_retries: int = Field(default=2, ge=0, le=2)
+    notification_retry_base_delay_seconds: float = Field(default=30.0, gt=0, le=3600)
     llm_base_url: str = "https://api.openai.com/v1"
     llm_api_key: str | None = None
     llm_model: str = "gpt-6-luna"

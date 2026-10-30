@@ -119,7 +119,9 @@ def test_transient_confirmation_failure_retries_and_records_sent(
         def send_message(self, chat_id: int, text: str, *, reply_markup=None) -> None:
             self.attempts += 1
             if self.attempts == 3:
-                raise TelegramAPIError("temporary timeout", failure_kind="network_timeout")
+                raise TelegramAPIError(
+                    "rate limited", status_code=429, failure_kind="http_error"
+                )
             self.messages.append((chat_id, text))
 
     telegram_client = FailOnceTelegramClient()

@@ -168,6 +168,7 @@ class Notification(Base):
         CheckConstraint("sequence >= 1", name="ck_notifications_sequence"),
         UniqueConstraint("occurrence_id", "sequence", name="uq_notification_occurrence_sequence"),
         Index("ix_notifications_due_status", "due_at", "status"),
+        Index("ix_notifications_claimable", "status", "due_at", "claimed_until"),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
@@ -188,6 +189,10 @@ class Notification(Base):
     )
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     provider_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    claimed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    claimed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error_kind: Mapped[str | None] = mapped_column(String(80), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
@@ -205,10 +210,16 @@ class IdempotencyRecord(Base):
             name="ck_idempotency_status",
         ),
         CheckConstraint(
-            "delivery_status IN ('PENDING', 'ATTEMPTED', 'SENT', 'UNKNOWN')",
+            "delivery_status IN ('PENDING', 'ATTEMPTED', 'SENT', 'FAILED', 'UNKNOWN')",
             name="ck_idempotency_delivery_status",
         ),
         Index("ix_idempotency_user_id", "user_id"),
+        Index(
+            "ix_idempotency_delivery_retry",
+            "source",
+            "delivery_status",
+            "delivery_next_attempt_at",
+        ),
         UniqueConstraint("source", "idempotency_key", name="uq_idempotency_source_key"),
     )
 
@@ -229,6 +240,17 @@ class IdempotencyRecord(Base):
     delivery_attempted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    delivery_attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    delivery_next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    delivery_claimed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    delivery_claimed_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    delivery_last_error_kind: Mapped[str | None] = mapped_column(String(80), nullable=True)
     response: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
