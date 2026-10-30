@@ -1,14 +1,16 @@
 from collections.abc import Iterator
+from datetime import datetime, timezone
 import os
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from reminder_agent.db.models import Base
-from reminder_agent.main import create_app
+from reminder_agent.main import REQUIRED_SCHEMA_VERSION, create_app
 from reminder_agent.settings import Settings
 
 
@@ -23,8 +25,22 @@ class FakeTelegramClient:
 
 
 @pytest.fixture()
+def fixed_now() -> datetime:
+    return datetime(2026, 10, 30, 12, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture()
 def session_factory() -> Iterator[sessionmaker[Session]]:
     database_url = os.getenv("TEST_DATABASE_URL", "sqlite://")
+    application_database_url = os.getenv("DATABASE_URL")
+    if application_database_url and database_url != "sqlite://":
+        if make_url(database_url).render_as_string(hide_password=True) == make_url(
+            application_database_url
+        ).render_as_string(hide_password=True):
+            raise RuntimeError(
+                "TEST_DATABASE_URL must be a separate database from DATABASE_URL; "
+                "refusing to drop the application database"
+            )
     if database_url.startswith("sqlite"):
         engine = create_engine(
             database_url,
@@ -34,6 +50,18 @@ def session_factory() -> Iterator[sessionmaker[Session]]:
     else:
         engine = create_engine(database_url, pool_pre_ping=True)
     Base.metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS alembic_version "
+                "(version_num VARCHAR(32) NOT NULL)"
+            )
+        )
+        connection.execute(text("DELETE FROM alembic_version"))
+        connection.execute(
+            text("INSERT INTO alembic_version (version_num) VALUES (:version)"),
+            {"version": REQUIRED_SCHEMA_VERSION},
+        )
     factory = sessionmaker(bind=engine, expire_on_commit=False)
     try:
         yield factory
@@ -48,7 +76,7 @@ def telegram_client() -> FakeTelegramClient:
 
 
 @pytest.fixture()
-def api_client(session_factory, telegram_client) -> Iterator[TestClient]:
+def api_client(session_factory, telegram_client, fixed_now) -> Iterator[TestClient]:
     settings = Settings(
         database_url="sqlite://",
         telegram_bot_token="test-token",
@@ -58,6 +86,7 @@ def api_client(session_factory, telegram_client) -> Iterator[TestClient]:
         settings,
         telegram_client=telegram_client,
         session_factory=session_factory,
+        clock=lambda: fixed_now,
     )
     with TestClient(app, raise_server_exceptions=False) as client:
         yield client

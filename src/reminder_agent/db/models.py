@@ -9,7 +9,9 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     String,
+    Text,
     UniqueConstraint,
     Uuid,
     text,
@@ -88,6 +90,117 @@ class ChannelIdentity(Base):
     )
 
 
+class Reminder(Base):
+    __tablename__ = "reminders"
+    __table_args__ = (
+        CheckConstraint(
+            "schedule_type IN ('ONE_TIME', 'RECURRING')", name="ck_reminders_schedule_type"
+        ),
+        CheckConstraint(
+            "status IN ('ACTIVE', 'COMPLETED', 'CANCELED')", name="ck_reminders_status"
+        ),
+        CheckConstraint("version >= 1", name="ck_reminders_version"),
+        CheckConstraint(
+            "(schedule_type = 'RECURRING' AND recurrence_rule IS NOT NULL) "
+            "OR (schedule_type = 'ONE_TIME' AND recurrence_rule IS NULL)",
+            name="ck_reminders_recurrence_rule",
+        ),
+        Index("ix_reminders_user_status", "user_id", "status"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    user_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    task: Mapped[str] = mapped_column(Text, nullable=False)
+    schedule_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    start_local: Mapped[str] = mapped_column(String(64), nullable=False)
+    timezone: Mapped[str] = mapped_column(String(150), nullable=False)
+    recurrence_rule: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="ACTIVE", server_default="ACTIVE"
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class ReminderOccurrence(Base):
+    __tablename__ = "reminder_occurrences"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('PENDING', 'NOTIFIED', 'COMPLETED', 'CANCELED')",
+            name="ck_occurrences_status",
+        ),
+        UniqueConstraint("reminder_id", "scheduled_at", name="uq_occurrence_reminder_scheduled"),
+        Index("ix_occurrences_due_status", "next_due_at", "status"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    reminder_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("reminders.id", ondelete="CASCADE"), nullable=False
+    )
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    next_due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="PENDING", server_default="PENDING"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class Notification(Base):
+    __tablename__ = "notifications"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('PENDING', 'SENDING', 'SENT', 'FAILED', 'UNKNOWN', 'CANCELED')",
+            name="ck_notifications_status",
+        ),
+        CheckConstraint("attempt_count >= 0", name="ck_notifications_attempt_count"),
+        CheckConstraint("sequence >= 1", name="ck_notifications_sequence"),
+        UniqueConstraint("occurrence_id", "sequence", name="uq_notification_occurrence_sequence"),
+        Index("ix_notifications_due_status", "due_at", "status"),
+        Index("ix_notifications_claimable", "status", "due_at", "claimed_until"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    occurrence_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("reminder_occurrences.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    destination_identity_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("channel_identities.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="PENDING", server_default="PENDING"
+    )
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    provider_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    claimed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    claimed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error_kind: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+
+
 class IdempotencyRecord(Base):
     __tablename__ = "idempotency_records"
     __table_args__ = (
@@ -97,10 +210,16 @@ class IdempotencyRecord(Base):
             name="ck_idempotency_status",
         ),
         CheckConstraint(
-            "delivery_status IN ('PENDING', 'ATTEMPTED', 'SENT', 'UNKNOWN')",
+            "delivery_status IN ('PENDING', 'ATTEMPTED', 'SENT', 'FAILED', 'UNKNOWN')",
             name="ck_idempotency_delivery_status",
         ),
         Index("ix_idempotency_user_id", "user_id"),
+        Index(
+            "ix_idempotency_delivery_retry",
+            "source",
+            "delivery_status",
+            "delivery_next_attempt_at",
+        ),
         UniqueConstraint("source", "idempotency_key", name="uq_idempotency_source_key"),
     )
 
@@ -121,6 +240,17 @@ class IdempotencyRecord(Base):
     delivery_attempted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    delivery_attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    delivery_next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    delivery_claimed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    delivery_claimed_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    delivery_last_error_kind: Mapped[str | None] = mapped_column(String(80), nullable=True)
     response: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False

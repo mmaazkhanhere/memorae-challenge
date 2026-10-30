@@ -32,3 +32,10 @@ Use Conventional Commits with a concise, imperative subject: `<type>(<scope>): <
 ## Security & Configuration
 
 Never commit secrets, personal data, or real provider credentials. Use environment variables documented in `.env.example`; keep `.env` local. Enforce verified user/channel ownership in services rather than trusting LLM or tool arguments, and avoid logging saved facts, tokens, phone numbers, or webhook secrets.
+
+## Operational Notes
+
+The application and worker run as separate processes. Use `uv run reminder-worker` for the
+local worker, or `docker compose up -d` to run migrations and supervise both services.
+PostgreSQL integration tests must use the dedicated `TEST_DATABASE_URL` database, started with
+`docker compose --profile test up -d postgres-test`; never point it at `DATABASE_URL`.

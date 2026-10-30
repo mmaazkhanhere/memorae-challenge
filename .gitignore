@@ -2,8 +2,9 @@
 __pycache__/
 *.py[codz]
 *$py.class
+docs/IMPLEMENTATION_PLAN.md
+docs/maaz-voice-agent-challenge.html
 
-docs/
 
 # C extensions
 *.so

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hmac
 import logging
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -20,6 +22,57 @@ from reminder_agent.telegram import HttpTelegramClient, TelegramAPIError, Telegr
 
 router = APIRouter()
 logger = get_logger()
+
+
+def _telegram_error_is_retryable(error: TelegramAPIError) -> bool:
+    # Network failures and 5xx responses are ambiguous: Telegram may have accepted
+    # the message before the response was lost. Retrying can create a duplicate.
+    # A 429 explicitly means Telegram did not accept this request, so it is safe.
+    return error.status_code == 429
+
+
+def _send_reply_with_retry(
+    client,
+    reply,
+    *,
+    update_id: int,
+    max_attempts: int,
+    retry_delay_seconds: float,
+) -> None:
+    for attempt in range(1, max_attempts + 1):
+        log_event(
+            logger,
+            logging.DEBUG,
+            "telegram_response_delivery_attempt",
+            update_id=update_id,
+            attempt=attempt,
+            max_attempts=max_attempts,
+        )
+        try:
+            if reply.reply_markup is None:
+                client.send_message(reply.chat_id, reply.text)
+            else:
+                client.send_message(
+                    reply.chat_id,
+                    reply.text,
+                    reply_markup=reply.reply_markup,
+                )
+            return
+        except TelegramAPIError as exc:
+            retryable = _telegram_error_is_retryable(exc)
+            if not retryable or attempt >= max_attempts:
+                raise
+            log_event(
+                logger,
+                logging.WARNING,
+                "telegram_response_delivery_retry",
+                update_id=update_id,
+                attempt=attempt,
+                failure_kind=exc.failure_kind,
+                provider_status_code=exc.status_code,
+            )
+            if retry_delay_seconds:
+                time.sleep(retry_delay_seconds)
 
 
 @router.post("/webhook/telegram")
@@ -60,6 +113,8 @@ def telegram_webhook(
             db,
             update,
             default_region=request.app.state.settings.phone_default_region,
+            reminder_interpreter=request.app.state.reminder_interpreter,
+            now=request.app.state.clock(),
         )
         if reply is not None and reply.is_duplicate:
             log_event(
@@ -78,21 +133,39 @@ def telegram_webhook(
                     reason="already_attempted",
                 )
                 return {"ok": True}
+            log_event(
+                logger,
+                logging.DEBUG,
+                "telegram_response_delivery_started",
+                update_id=update.update_id,
+            )
             try:
                 client = request.app.state.telegram_client or HttpTelegramClient(
                     request.app.state.settings.telegram_bot_token,
                     request.app.state.settings.telegram_api_timeout_seconds,
                 )
-                if reply.reply_markup is None:
-                    client.send_message(reply.chat_id, reply.text)
-                else:
-                    client.send_message(
-                        reply.chat_id,
-                        reply.text,
-                        reply_markup=reply.reply_markup,
-                    )
+                _send_reply_with_retry(
+                    client,
+                    reply,
+                    update_id=update.update_id,
+                    max_attempts=request.app.state.settings.telegram_confirmation_max_attempts,
+                    retry_delay_seconds=(
+                        request.app.state.settings.telegram_confirmation_retry_delay_seconds
+                    ),
+                )
             except TelegramAPIError as exc:
-                record_delivery_outcome(db, reply.idempotency_key, sent=False)
+                retry_after = exc.retry_after_seconds or 0
+                retry_delay = retry_after or (
+                    request.app.state.settings.telegram_confirmation_background_retry_base_delay_seconds
+                )
+                record_delivery_outcome(
+                    db,
+                    reply.idempotency_key,
+                    sent=False,
+                    error_kind=exc.failure_kind,
+                    status_code=exc.status_code,
+                    next_attempt_at=datetime.now(timezone.utc) + timedelta(seconds=retry_delay),
+                )
                 log_event(
                     logger,
                     logging.ERROR,
@@ -108,6 +181,12 @@ def telegram_webhook(
                 # the inbound update and creating a duplicate response.
                 return {"ok": True}
             record_delivery_outcome(db, reply.idempotency_key, sent=True)
+            log_event(
+                logger,
+                logging.INFO,
+                "telegram_response_delivery_succeeded",
+                update_id=update.update_id,
+            )
     except IdempotencyConflict as exc:
         log_event(
             logger,

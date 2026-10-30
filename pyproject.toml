@@ -36,3 +36,4 @@ target-version = "py312"
 
 [project.scripts]
 reminder-agent = "reminder_agent.main:run"
+reminder-worker = "reminder_agent.worker:run"
