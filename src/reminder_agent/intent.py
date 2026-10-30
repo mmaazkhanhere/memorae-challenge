@@ -173,7 +173,12 @@ class RuleBasedIntentInterpreter:
                 return result
             unit = relative.group("unit").lower()
             delta = timedelta(minutes=amount if unit.startswith("minute") else amount * 60)
-            task = _task_from_remainder(without_prefix[relative.end() :])
+            # Accept both natural word orders:
+            #   "in five minutes to call the bank"
+            #   "to call the bank in five minutes"
+            before_time = without_prefix[: relative.start()]
+            after_time = without_prefix[relative.end() :]
+            task = _task_from_remainder(before_time if before_time.strip() else after_time)
             result = self._build(task, reference + delta, timezone_name)
             log_event(
                 logger,
@@ -182,6 +187,7 @@ class RuleBasedIntentInterpreter:
                 matched=result.intent is not None,
                 schedule_kind="relative",
                 task_length=len(task),
+                time_position="after_task" if before_time.strip() else "before_task",
                 fallback_allowed=result.fallback_allowed,
             )
             return result

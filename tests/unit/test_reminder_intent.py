@@ -32,6 +32,18 @@ def test_relative_minutes_are_resolved_from_one_reference_time() -> None:
     assert result.intent.due_at == datetime(2026, 10, 30, 12, 5, tzinfo=timezone.utc)
 
 
+def test_relative_minutes_support_task_before_time() -> None:
+    result = RuleBasedIntentInterpreter().interpret(
+        "Remind me to call Alice in two minutes.",
+        timezone_name="Asia/Karachi",
+        now=NOW,
+    )
+
+    assert result.intent is not None
+    assert result.intent.task == "call Alice"
+    assert result.intent.due_at == datetime(2026, 10, 30, 12, 2, tzinfo=timezone.utc)
+
+
 def test_tomorrow_at_nine_respects_user_local_timezone() -> None:
     result = RuleBasedIntentInterpreter().interpret(
         "Remind me tomorrow at 9 to renew the domain.",
