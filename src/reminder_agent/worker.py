@@ -18,7 +18,7 @@ from reminder_agent.db.models import (
     ReminderOccurrence,
 )
 from reminder_agent.db.session import build_engine
-from reminder_agent.observability import get_logger, log_event
+from reminder_agent.observability import configure_logging, get_logger, log_event
 from reminder_agent.settings import get_settings, validate_runtime_settings
 from reminder_agent.telegram import HttpTelegramClient, TelegramAPIError, TelegramClient
 
@@ -525,7 +525,7 @@ class NotificationWorker:
         notification, task, chat_id = loaded
         log_event(
             logger,
-            logging.DEBUG,
+            logging.INFO,
             "notification_delivery_attempt_started",
             worker_id=self.worker_id,
             notification_id=str(claim.notification_id),
@@ -563,6 +563,7 @@ class NotificationWorker:
             worker_id=self.worker_id,
             notification_id=str(claim.notification_id),
             outcome=outcome,
+            provider_message_id=provider_message_id,
         )
         return outcome
 
@@ -607,6 +608,12 @@ class NotificationWorker:
 
 def run() -> None:
     settings = get_settings()
+    configure_logging(
+        settings.log_level,
+        settings.log_format,
+        settings.log_include_traceback,
+        settings.log_color,
+    )
     validate_runtime_settings(settings)
     engine = build_engine(settings.database_url)
     from sqlalchemy.orm import sessionmaker
@@ -643,4 +650,5 @@ def run() -> None:
     try:
         worker.run_forever(confirmation_worker)
     finally:
+        log_event(logger, logging.INFO, "notification_worker_stopped", worker_id=worker.worker_id)
         engine.dispose()
