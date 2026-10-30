@@ -211,8 +211,8 @@ def _is_skip_phone(update: TelegramUpdate) -> bool:
 def _phone_region_from_text(update: TelegramUpdate) -> str | None:
     assert update.message is not None
     parts = (update.message.text or "").strip().split()
-    if len(parts) == 2 and parts[0].lower() in {"/phone_region", "phone region"}:
-        return parts[1]
+    if parts and parts[0].lower() in {"/phone_region", "phone region"}:
+        return parts[1] if len(parts) == 2 else ""
     return None
 
 
@@ -353,7 +353,10 @@ def _handle_message(db: Session, update: TelegramUpdate) -> OnboardingReply:
 
         user.timezone = timezone_name
         user.onboarding_status = ACTIVE
-        text = f"You're all set, {user.name}! Your time zone is {timezone_name}."
+        text = (
+            f"You're all set, {user.name}! Your time zone is {timezone_name}. "
+            "To enable voice-call access, share your own phone number using the button below."
+        )
         return _store_result(
             db,
             update=update,
@@ -406,7 +409,10 @@ def _handle_link_phone(db: Session, update: TelegramUpdate) -> OnboardingReply:
             update=update,
             user_id=user.id,
             operation="PHONE_LINK_PROMPT",
-            text="Please use the button to share your own phone number, or choose Skip for now.",
+            text=(
+                "To enable voice-call access, share your own phone number using the button, "
+                "or choose Skip for now."
+            ),
             reply_markup=PHONE_KEYBOARD,
         )
 
@@ -471,6 +477,17 @@ def _handle_phone_region(db: Session, update: TelegramUpdate, raw_region: str) -
                 user_id=user.id,
                 operation="PHONE_REGION_REQUIRES_ONBOARDING",
                 text="Please finish Telegram onboarding by sharing your time zone first.",
+            )
+        if not raw_region:
+            return _store_result(
+                db,
+                update=update,
+                user_id=user.id,
+                operation="PHONE_REGION_MISSING",
+                text=(
+                    "Please include your two-letter country code, for example "
+                    "/phone_region PK."
+                ),
             )
         try:
             region = validate_phone_region(raw_region)

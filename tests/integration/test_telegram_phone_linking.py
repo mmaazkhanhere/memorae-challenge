@@ -78,6 +78,19 @@ def test_timezone_completion_offers_native_contact_keyboard(
     assert markup is not None
     assert markup["keyboard"][0][0]["request_contact"] is True
     assert markup["keyboard"][1][0]["text"] == "Skip for now"
+    assert "voice-call access" in telegram_client.messages[-1][1]
+
+
+def test_phone_region_without_country_code_explains_required_format(
+    api_client, telegram_client, update_factory
+) -> None:
+    onboard_user(api_client, update_factory)
+
+    response = post_update(api_client, update_factory(102, text="/phone_region"))
+
+    assert response.status_code == 200
+    assert "/phone_region PK" in telegram_client.messages[-1][1]
+    assert "already onboarded" not in telegram_client.messages[-1][1]
 
 
 def test_valid_self_contact_links_normalized_phone(
