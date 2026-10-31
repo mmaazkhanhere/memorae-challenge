@@ -77,7 +77,10 @@ def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecisio
     raw = text.strip()
     normalized = re.sub(r"[.!?]+$", "", raw.lower()).strip()
 
-    if normalized in _ACKNOWLEDGEMENTS or normalized in _GREETINGS:
+    # An acknowledgement is conversational only when there is no active
+    # clarification.  With pending context it must be interpreted as an answer
+    # to the outstanding question, or preserve that state and ask again.
+    if pending is None and (normalized in _ACKNOWLEDGEMENTS or normalized in _GREETINGS):
         return RouteDecision(ConversationRoute.SOCIAL)
 
     if pending is None:
@@ -89,16 +92,17 @@ def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecisio
 
     if normalized in _CANCELLATIONS:
         return RouteDecision(ConversationRoute.CANCELLATION)
+    if normalized in _ACKNOWLEDGEMENTS:
+        return RouteDecision(ConversationRoute.CLARIFICATION_REPLY)
     if _NEW_REMINDER.match(raw):
         # A complete new command intentionally supersedes a stale draft rather
         # than being parsed as an edit to its task or schedule.
         return RouteDecision(ConversationRoute.NEW_REQUEST)
-    if (
-        _CLOCK_WITH_AT.search(raw)
-        or _BARE_CLOCK.fullmatch(raw)
-        or _DAY.search(raw)
-        or _TASK_CORRECTION.match(raw)
-    ):
+    # Only explicit new-reminder commands are classified before considering
+    # the active conversation.  A message containing a date/time may still be
+    # a new reminder, an answer to the pending question, or something else;
+    # preserve context and let the interpreter decide semantically.
+    if _TASK_CORRECTION.match(raw):
         return RouteDecision(ConversationRoute.CLARIFICATION_REPLY)
 
     if pending.task is None and raw and not _QUESTION.match(raw):

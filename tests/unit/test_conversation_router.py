@@ -20,9 +20,10 @@ def test_router_classifies_pending_conversation_before_parsing() -> None:
     assert route_message("Remind me to email Sam tomorrow at 9", pending=pending).route is (
         ConversationRoute.NEW_REQUEST
     )
-    assert route_message("8 AM", pending=pending).route is ConversationRoute.CLARIFICATION_REPLY
+    assert route_message("8 AM", pending=pending).route is ConversationRoute.MODEL_FALLBACK
     assert route_message("Never mind", pending=pending).route is ConversationRoute.CANCELLATION
-    assert route_message("thanks", pending=pending).route is ConversationRoute.SOCIAL
+    assert route_message("yes", pending=pending).route is ConversationRoute.CLARIFICATION_REPLY
+    assert route_message("thanks", pending=pending).route is ConversationRoute.CLARIFICATION_REPLY
 
 
 def test_router_does_not_start_a_reminder_from_unrelated_text() -> None:

@@ -1,6 +1,7 @@
 from datetime import date, datetime, timezone
 
 import httpx
+import pytest
 
 from reminder_agent.intent import (
     CreateOneTimeReminderIntent,
@@ -18,6 +19,16 @@ from reminder_agent.settings import Settings
 
 
 NOW = datetime(2026, 10, 30, 12, 0, tzinfo=timezone.utc)
+
+
+def test_pending_update_normalises_meridiem_case() -> None:
+    assert PendingReminderFieldUpdate(meridiem="PM").meridiem == "pm"
+    assert PendingReminderFieldUpdate(meridiem="AM").meridiem == "am"
+
+
+def test_pending_update_rejects_invalid_meridiem() -> None:
+    with pytest.raises(ValueError):
+        PendingReminderFieldUpdate(meridiem="evening")
 
 
 def test_default_llm_configuration_targets_openai_compatible_api() -> None:

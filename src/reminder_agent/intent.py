@@ -99,6 +99,13 @@ class PendingReminderFieldUpdate(BaseModel):
     meridiem: Literal["am", "pm"] | None = None
     date_explicit: bool | None = None
 
+    @field_validator("meridiem", mode="before")
+    @classmethod
+    def normalise_meridiem(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.lower()
+        return value
+
     @field_validator("task")
     @classmethod
     def task_must_not_be_blank(cls, value: str | None) -> str | None:
@@ -382,7 +389,10 @@ def restrict_to_explicit_field_updates(
     if day is not None:
         remainder = remainder.replace(day.group(0), "", 1)
     supplied_task = _task_from_remainder(remainder)
-    correction = _TASK_CORRECTION.match(supplied_task)
+    # Detect the correction instruction in the original message.  The task
+    # captured by the correction expression is the replacement value and
+    # should be validated separately; it does not contain correction language.
+    correction = _TASK_CORRECTION.match(remainder)
     if proposed.task:
         if context.task is None and supplied_task and _same_task(proposed.task, supplied_task):
             permitted["task"] = proposed.task
