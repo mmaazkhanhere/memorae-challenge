@@ -639,9 +639,11 @@ def test_classifier_selected_clear_date_typo_completes_pending_reminder(
                     hour=8,
                     minute=0,
                     meridiem="PM",
+                    date_explicit=True,
                     certainty="CLEAR",
                     evidence={
                         "date_local": typo,
+                        "date_explicit": typo,
                         "hour": "8 PM",
                         "minute": "8 PM",
                         "meridiem": "8 PM",

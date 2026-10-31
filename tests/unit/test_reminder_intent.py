@@ -1,3 +1,4 @@
+import json
 from datetime import date, datetime, timezone
 
 import httpx
@@ -38,16 +39,26 @@ def test_intent_router_classifies_only_the_operation_and_limits_history(monkeypa
     suggestion = OpenAICompatibleIntentRouter(
         "https://api.groq.example/openai/v1", "secret", "openai/gpt-oss-20b"
     ).classify(
-        "remind me to call Bilal tomorrow",
-        pending=None,
-        recent_messages=[f"message {index}" for index in range(40)],
+        "tommorow",
+        pending=PendingReminder(task="call Bilal", hour=4, meridiem="pm", timezone_name="UTC"),
+        recent_messages=[
+            *(f"message {index}" for index in range(35)),
+            "assistant: What date should I use?",
+            "user: unrelated earlier reply",
+            "assistant: Please clarify the date.",
+            "user: another earlier reply",
+            "assistant: What date should I use?",
+        ],
     )
 
     assert suggestion.operation is IntentRoute.NEW_REQUEST
-    context = captured["messages"][1]["content"]
-    assert "message 5" not in context
-    assert "message 6" in context
-    assert "call Bilal" in context
+    context = json.loads(captured["messages"][1]["content"])
+    assert context["active_pending"]["task"] == "call Bilal"
+    assert context["missing_fields"] == ["date"]
+    assert context["last_clarification_question"] == "What date should I use?"
+    assert len(context["recent_messages"]) == 6
+    assert "message 33" not in context["recent_messages"]
+    assert "message 34" in context["recent_messages"]
 
 
 def test_pending_update_normalises_meridiem_case() -> None:
@@ -58,6 +69,17 @@ def test_pending_update_normalises_meridiem_case() -> None:
 def test_pending_update_rejects_invalid_meridiem() -> None:
     with pytest.raises(ValueError):
         PendingReminderFieldUpdate(meridiem="evening")
+
+
+def test_pending_update_accepts_evidence_for_every_allowed_update_field() -> None:
+    update = PendingReminderFieldUpdate(
+        date_explicit=True,
+        certainty="clear",
+        evidence={"date_explicit": "tommorow"},
+    )
+
+    assert update.certainty == "CLEAR"
+    assert update.evidence == {"date_explicit": "tommorow"}
 
 
 def test_default_llm_configuration_targets_openai_compatible_api() -> None:
@@ -562,6 +584,26 @@ def test_semantic_update_requires_clear_grounded_evidence() -> None:
     )
 
     assert verified.date_local is None
+
+
+def test_clarification_question_mentions_only_the_missing_date() -> None:
+    pending = PendingReminder(
+        task="prepare slides",
+        hour=4,
+        meridiem="pm",
+        timezone_name="UTC",
+    )
+
+    result = RuleBasedIntentInterpreter().apply_field_updates(
+        pending, PendingReminderFieldUpdate(), now=NOW
+    )
+
+    assert result.clarification is not None
+    assert result.clarification.pending.task == "prepare slides"
+    assert result.clarification.pending.hour == 4
+    assert result.clarification.pending.meridiem == "pm"
+    assert result.clarification.pending.date_local is None
+    assert result.clarification.question == "What date should I use?"
 
 
 def test_complex_follow_up_uses_model_fallback_with_pending_context() -> None:

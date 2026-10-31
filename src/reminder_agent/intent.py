@@ -61,20 +61,22 @@ class OpenAICompatibleIntentRouter:
         pending: "PendingReminder | None",
         recent_messages: Sequence[str],
     ) -> IntentRouteSuggestion:
+        relevant_history = list(recent_messages)[-6:]
         log_event(
             logger,
             logging.INFO,
             "intent_classification_started",
             model=self._model,
             has_pending=pending is not None,
-            recent_message_count=min(len(recent_messages), 34),
+            recent_message_count=len(relevant_history),
         )
         prompt = (
             "Return JSON only: {\"operation\": one of NEW_REQUEST, UPDATE_PENDING, "
             "CANCEL_PENDING, SOCIAL, UNRELATED, UNCERTAIN}. Classify intent only; do not "
             "extract reminder fields, suggest values, or execute anything. NEW_REQUEST is an "
             "independent reminder; UPDATE_PENDING changes the supplied draft. If the message "
-            "could reasonably mean either, return UNCERTAIN."
+            "could reasonably mean either, return UNCERTAIN. Use active_pending, missing_fields, "
+            "and last_clarification_question to classify a reply to an active clarification."
         )
         payload = {
             "model": self._model,
@@ -85,8 +87,12 @@ class OpenAICompatibleIntentRouter:
                     "content": json.dumps(
                         {
                             "latest_message": text,
-                            "pending": pending.model_dump(mode="json") if pending else None,
-                            "recent_messages": list(recent_messages)[-34:],
+                            "active_pending": pending.model_dump(mode="json") if pending else None,
+                            "missing_fields": _missing_pending_fields(pending),
+                            "last_clarification_question": _last_clarification_question(
+                                recent_messages
+                            ),
+                            "recent_messages": relevant_history,
                         }
                     ),
                 },
@@ -213,9 +219,16 @@ class PendingReminderFieldUpdate(BaseModel):
     meridiem: Literal["am", "pm"] | None = None
     date_explicit: bool | None = None
     certainty: Literal["CLEAR"] | None = None
-    evidence: dict[Literal["task", "date_local", "hour", "minute", "meridiem"], str] = Field(
-        default_factory=dict, exclude=True
-    )
+    evidence: dict[
+        Literal["task", "date_local", "hour", "minute", "meridiem", "date_explicit"], str
+    ] = Field(default_factory=dict, exclude=True)
+
+    @field_validator("certainty", mode="before")
+    @classmethod
+    def normalise_certainty(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.upper()
+        return value
 
     @field_validator("meridiem", mode="before")
     @classmethod
@@ -247,6 +260,28 @@ class NeedsClarification(BaseModel):
     operation: Literal["CREATE_ONE_TIME_REMINDER"] = "CREATE_ONE_TIME_REMINDER"
     pending: PendingReminder
     question: str = Field(min_length=1, max_length=500)
+
+
+def _missing_pending_fields(pending: PendingReminder | None) -> list[str]:
+    if pending is None:
+        return []
+    missing: list[str] = []
+    if pending.task is None:
+        missing.append("task")
+    if pending.date_local is None:
+        missing.append("date")
+    if pending.hour is None:
+        missing.append("time")
+    elif pending.hour <= 12 and pending.meridiem is None:
+        missing.append("meridiem")
+    return missing
+
+
+def _last_clarification_question(recent_messages: Sequence[str]) -> str | None:
+    for message in reversed(recent_messages):
+        if message.startswith("assistant: ") and "?" in message:
+            return message.removeprefix("assistant: ")
+    return None
 
 
 @dataclass(frozen=True)
@@ -969,6 +1004,8 @@ class RuleBasedIntentInterpreter:
                 )
             elif "time" in missing and pending.date_local is not None:
                 question = f"What time should I use on {pending.date_local.strftime('%A')}?"
+            elif missing == ["date"]:
+                question = "What date should I use?"
             elif "task" in missing and len(missing) == 1:
                 question = "What should I remind you about?"
             else:
