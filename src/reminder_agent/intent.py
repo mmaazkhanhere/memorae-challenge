@@ -693,7 +693,7 @@ class RuleBasedIntentInterpreter:
     """Conservative parser that refuses to guess incomplete date/time requests."""
 
     _prefix = re.compile(
-        r"^\s*(?:please\s+)?(?:remind\s+me|set\s+(?:a\s+)?reminder)\s+",
+        r"^\s*(?:please\s+)?(?:remind\s+me|set\s+(?:a\s+)?reminder)(?:\s+|$)",
         re.IGNORECASE,
     )
     _relative = re.compile(
@@ -820,7 +820,7 @@ class RuleBasedIntentInterpreter:
             )
             return Interpretation(
                 response_text=(
-                    "I can help create reminders. Start with what to remember and when."
+                    "Please tell me the reminder task and a future time."
                 ),
                 fallback_allowed=not (simple_time or simple_ack),
             )
