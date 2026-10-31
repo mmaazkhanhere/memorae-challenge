@@ -892,7 +892,7 @@ def test_multiple_people_in_one_task_create_one_reminder(
     assert "call Alice and Bob" in telegram_client.messages[-1][1]
 
 
-def test_multiple_tasks_without_repeated_prefix_wait_for_clarification(
+def test_multiple_tasks_with_one_schedule_create_one_reminder(
     api_client, telegram_client, db, update_factory
 ) -> None:
     onboard(api_client, update_factory)
@@ -901,21 +901,8 @@ def test_multiple_tasks_without_repeated_prefix_wait_for_clarification(
         update_factory(132, text="Remind me to call Alice and email Bob tomorrow at 9 AM"),
     )
 
-    assert db.scalar(select(func.count()).select_from(Reminder)) == 0
-    session = db.scalar(select(ConversationSession))
-    assert session is not None
-    assert session.status == "AWAITING_CLARIFICATION"
-    assert "more than one" in telegram_client.messages[-1][1]
-
-    response = post_update(
-        api_client,
-        update_factory(139, text="Remind me to call Alice tomorrow at 9 AM"),
-    )
-
-    assert response.status_code == 200
     assert db.scalar(select(func.count()).select_from(Reminder)) == 1
-    db.refresh(session)
-    assert session.status == "ENDED"
+    assert "call Alice and email Bob" in telegram_client.messages[-1][1]
 
 
 def test_explicit_multiple_reminder_requests_create_two_reminders(

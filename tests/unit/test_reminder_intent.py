@@ -724,17 +724,28 @@ def test_multiple_people_in_one_task_are_not_split_into_multiple_reminders() -> 
     assert result.intent.task == "call Alice and Bob"
 
 
-def test_multiple_tasks_without_repeated_reminder_prefix_are_clarified() -> None:
+def test_multiple_tasks_with_one_schedule_are_one_reminder() -> None:
     result = RuleBasedIntentInterpreter().interpret(
         "Remind me to call Alice and email Bob tomorrow at 9 AM",
         timezone_name="UTC",
         now=NOW,
     )
 
-    assert result.intent is None
-    assert result.clarification is not None
-    assert result.clarification.pending.task is None
-    assert "more than one" in result.clarification.question
+    assert result.clarification is None
+    assert result.intent is not None
+    assert result.intent.task == "call Alice and email Bob"
+
+
+def test_multiple_tasks_with_one_schedule_inherit_the_same_time() -> None:
+    result = RuleBasedIntentInterpreter().interpret(
+        "Remind me to call Ali tomorrow at 9 AM and to pay the bill",
+        timezone_name="UTC",
+        now=NOW,
+    )
+
+    assert result.intent is not None
+    assert result.intent.task == "call Ali and to pay the bill"
+    assert result.intent.due_at == datetime(2026, 10, 31, 9, 0, tzinfo=timezone.utc)
 
 
 def test_explicit_multiple_reminder_requests_are_parsed_independently() -> None:
@@ -754,6 +765,23 @@ def test_explicit_multiple_reminder_requests_are_parsed_independently() -> None:
     assert [intent.due_at for intent in result.resolved_intents] == [
         datetime(2026, 10, 31, 9, 0, tzinfo=timezone.utc),
         datetime(2026, 10, 31, 10, 0, tzinfo=timezone.utc),
+    ]
+
+
+def test_shared_date_multiple_times_are_parsed_independently() -> None:
+    result = RuleBasedIntentInterpreter().interpret(
+        "Remind me tomorrow at 9 AM to pay rent and at 6 PM to call Sara",
+        timezone_name="UTC",
+        now=datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert [intent.task for intent in result.resolved_intents] == [
+        "pay rent",
+        "call Sara",
+    ]
+    assert [intent.due_at for intent in result.resolved_intents] == [
+        datetime(2026, 11, 1, 9, 0, tzinfo=timezone.utc),
+        datetime(2026, 11, 1, 18, 0, tzinfo=timezone.utc),
     ]
 
 
@@ -797,17 +825,9 @@ def test_complete_single_command_supersedes_multi_target_clarification() -> None
         now=NOW,
     )
 
-    assert initial.clarification is not None
-    follow_up = interpreter.interpret(
-        "Remind me to call Alice tomorrow at 9 AM",
-        timezone_name="UTC",
-        now=NOW,
-        context=initial.clarification.pending,
-    )
-
-    assert follow_up.clarification is None
-    assert follow_up.intent is not None
-    assert follow_up.intent.task == "call Alice"
+    assert initial.clarification is None
+    assert initial.intent is not None
+    assert initial.intent.task == "call Alice and email Bob"
 
 
 def test_follow_up_accepts_minute_and_day_phrasing() -> None:

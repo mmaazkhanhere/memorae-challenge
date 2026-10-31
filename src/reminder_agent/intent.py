@@ -753,10 +753,16 @@ class RuleBasedIntentInterpreter:
         if context is not None:
             return self._interpret_follow_up(text, context=context, now=now)
 
-        # A single command containing a second action is not a safe regex
-        # parse. Let the model split it into independently validated intents.
-        if _COMPOUND_REQUEST.search(raw) and not self._multiple_request_separator.search(raw):
-            return self._multiple_target_clarification(timezone_name)
+        # Split independently timed clauses such as "tomorrow at 9 AM to pay
+        # rent and at 6 PM to call Sara".  The date before the first clock is
+        # shared by every clause; each clause owns the clock and task that
+        # follow it.  If any clause is incomplete, keep the result eligible for
+        # the structured provider fallback instead of merging task text.
+        multiple_times = self._interpret_multiple_time_clauses(
+            raw, timezone_name=timezone_name, now=now
+        )
+        if multiple_times is not None:
+            return multiple_times
 
         # A message may contain several explicitly separated, complete commands.
         # Parse each command independently instead of treating the whole message
@@ -844,13 +850,19 @@ class RuleBasedIntentInterpreter:
             delta = timedelta(minutes=amount if unit.startswith("minute") else amount * 60)
             before_time = without_prefix[: relative.start()]
             after_time = without_prefix[relative.end() :]
-            task = _task_from_remainder(before_time if before_time.strip() else after_time)
-            if _contains_multiple_tasks(task):
-                return self._multiple_target_clarification(timezone_name)
+            task = _task_from_remainder(
+                f"{before_time} {after_time}" if before_time.strip() and after_time.strip()
+                else before_time if before_time.strip() else after_time
+            )
             return self._build(task, reference + delta, timezone_name)
 
         tomorrow = self._tomorrow.search(without_prefix)
         if tomorrow is not None:
+            if len(list(self._clock.finditer(without_prefix))) > 1:
+                return Interpretation(
+                    response_text="I found multiple reminder times. Please provide a complete task and time for each.",
+                    fallback_allowed=True,
+                )
             hour = int(tomorrow.group("hour"))
             minute = int(tomorrow.group("minute") or 0)
             meridiem = _normalise_meridiem(tomorrow.group("meridiem"))
@@ -859,9 +871,10 @@ class RuleBasedIntentInterpreter:
             local_date = reference.astimezone(zone).date() + timedelta(days=1)
             before_time = without_prefix[: tomorrow.start()]
             after_time = without_prefix[tomorrow.end() :]
-            task = _task_from_remainder(before_time if before_time.strip() else after_time)
-            if _contains_multiple_tasks(task):
-                return self._multiple_target_clarification(timezone_name)
+            task = _task_from_remainder(
+                f"{before_time} {after_time}" if before_time.strip() and after_time.strip()
+                else before_time if before_time.strip() else after_time
+            )
             if meridiem is None:
                 return self._pending_result(
                     PendingReminder(
@@ -886,6 +899,11 @@ class RuleBasedIntentInterpreter:
         day = self._day.search(without_prefix)
         day_part = self._day_part.search(without_prefix)
         if clock is not None or day is not None or day_part is not None:
+            if len(list(self._clock.finditer(without_prefix))) > 1:
+                return Interpretation(
+                    response_text="I found multiple reminder times. Please provide a complete task and time for each.",
+                    fallback_allowed=True,
+                )
             local_now = reference.astimezone(zone)
             date_local = (
                 _date_from_day(day, local_now)
@@ -908,8 +926,6 @@ class RuleBasedIntentInterpreter:
             if clock is not None:
                 task_source = task_source.replace(clock.group(0), "", 1)
             task = _task_from_remainder(task_source)
-            if _contains_multiple_tasks(task):
-                return self._multiple_target_clarification(timezone_name)
             pending = PendingReminder(
                 task=task or None,
                 date_local=date_local,
@@ -1117,6 +1133,55 @@ class RuleBasedIntentInterpreter:
         return Interpretation(
             response_text="Please provide a valid future reminder time.",
             fallback_allowed=False,
+        )
+
+    def _interpret_multiple_time_clauses(
+        self, raw: str, *, timezone_name: str, now: datetime
+    ) -> Interpretation | None:
+        prefix = self._prefix.match(raw)
+        if prefix is None:
+            return None
+        body = raw[prefix.end() :]
+        clocks = list(self._clock.finditer(body))
+        if len(clocks) < 2:
+            return None
+
+        shared = body[: clocks[0].start()].strip(" ,;:")
+        shared_day = self._day.search(shared)
+        if shared_day is None:
+            # Without a shared date, let the model resolve whether each time
+            # belongs to today, tomorrow, or another date.
+            return Interpretation(
+                response_text="I need a little more detail to schedule those reminders.",
+                fallback_allowed=True,
+            )
+        shared_before_day = shared[: shared_day.start()].strip()
+        shared_after_day = shared[shared_day.end() :].strip()
+        if shared_before_day or shared_after_day:
+            # The first task may precede its date ("call Alice tomorrow at
+            # 9 AM"). That is handled by the normal repeated-prefix splitter;
+            # this helper is only for a date shared by clock-led clauses.
+            return None
+        shared_date = shared[shared_day.start() : shared_day.end()]
+        commands: list[str] = []
+        for index, clock in enumerate(clocks):
+            end = clocks[index + 1].start() if index + 1 < len(clocks) else len(body)
+            clause = body[clock.start() : end].strip(" ,;:")
+            clause = re.sub(r"\s+and\s*$", "", clause, flags=re.IGNORECASE)
+            commands.append(f"Remind me {shared_date} {clause}")
+
+        parsed = [
+            self.interpret(command, timezone_name=timezone_name, now=now)
+            for command in commands
+        ]
+        if all(item.intent is not None for item in parsed):
+            return Interpretation(
+                intents=tuple(item.intent for item in parsed if item.intent is not None),
+                fallback_allowed=False,
+            )
+        return Interpretation(
+            response_text="I found multiple reminder times. Please provide a complete task and time for each.",
+            fallback_allowed=True,
         )
 
     @staticmethod
