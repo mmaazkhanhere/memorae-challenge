@@ -19,6 +19,7 @@ from reminder_agent.intent import (
     resolve_pending_due_at,
 )
 from reminder_agent.settings import Settings
+from reminder_agent.request_policy import OUT_OF_SCOPE_RESPONSE
 
 
 NOW = datetime(2026, 10, 30, 12, 0, tzinfo=timezone.utc)
@@ -1168,4 +1169,4 @@ def test_openai_compatible_interpreter_rejects_unknown_operation(monkeypatch) ->
     ).interpret("delete my reminders", timezone_name="UTC", now=NOW)
 
     assert result.intent is None
-    assert result.response_text
+    assert result.response_text == OUT_OF_SCOPE_RESPONSE
