@@ -212,6 +212,10 @@ class PendingReminderFieldUpdate(BaseModel):
     minute: int | None = Field(default=None, ge=0, le=59)
     meridiem: Literal["am", "pm"] | None = None
     date_explicit: bool | None = None
+    certainty: Literal["CLEAR"] | None = None
+    evidence: dict[Literal["task", "date_local", "hour", "minute", "meridiem"], str] = Field(
+        default_factory=dict, exclude=True
+    )
 
     @field_validator("meridiem", mode="before")
     @classmethod
@@ -233,7 +237,7 @@ class PendingReminderFieldUpdate(BaseModel):
         return {
             field
             for field in self.model_fields_set
-            if getattr(self, field) is not None
+            if field not in {"certainty", "evidence"} and getattr(self, field) is not None
         }
 
 
@@ -289,6 +293,7 @@ class IntentInterpreter(Protocol):
         timezone_name: str,
         now: datetime,
         context: PendingReminder | None = None,
+        recent_messages: Sequence[str] = (),
     ) -> Interpretation: ...
 
 
@@ -457,6 +462,15 @@ def _same_task(left: str, right: str) -> bool:
     return " ".join(left.lower().split()) == " ".join(right.lower().split())
 
 
+def _evidence_is_grounded(evidence: str | None, text: str) -> bool:
+    """Require semantic model patches to cite an exact fragment of this turn."""
+    if not isinstance(evidence, str):
+        return False
+    normalized_evidence = " ".join(evidence.lower().split())
+    normalized_text = " ".join(text.lower().split())
+    return bool(normalized_evidence) and normalized_evidence in normalized_text
+
+
 def restrict_to_explicit_field_updates(
     text: str,
     proposed: PendingReminderFieldUpdate,
@@ -511,16 +525,35 @@ def restrict_to_explicit_field_updates(
     # contains a clear typo (for example, "tomorow").  The model is instructed
     # to return NEEDS_CLARIFICATION instead of guessing when alternatives are
     # plausible; the backend still owns schema, target, and schedule checks.
-    if allow_semantic_field_updates:
-        if proposed.date_local is not None and "date_local" not in permitted:
+    semantic_updates_are_grounded = (
+        allow_semantic_field_updates and proposed.certainty == "CLEAR"
+    )
+    if semantic_updates_are_grounded:
+        if (
+            proposed.date_local is not None
+            and "date_local" not in permitted
+            and _evidence_is_grounded(proposed.evidence.get("date_local"), raw)
+        ):
             permitted["date_local"] = proposed.date_local
             permitted["date_explicit"] = True
-        if proposed.hour is not None and "hour" not in permitted:
+        if (
+            proposed.hour is not None
+            and "hour" not in permitted
+            and _evidence_is_grounded(proposed.evidence.get("hour"), raw)
+        ):
             if proposed.meridiem is None or 1 <= proposed.hour <= 12:
                 permitted["hour"] = proposed.hour
-        if proposed.minute is not None and "minute" not in permitted:
+        if (
+            proposed.minute is not None
+            and "minute" not in permitted
+            and _evidence_is_grounded(proposed.evidence.get("minute"), raw)
+        ):
             permitted["minute"] = proposed.minute
-        if proposed.meridiem is not None and "meridiem" not in permitted:
+        if (
+            proposed.meridiem is not None
+            and "meridiem" not in permitted
+            and _evidence_is_grounded(proposed.evidence.get("meridiem"), raw)
+        ):
             permitted["meridiem"] = proposed.meridiem
 
     remainder = raw
@@ -544,7 +577,9 @@ def restrict_to_explicit_field_updates(
         # the classifier has identified this turn as UPDATE_PENDING.  In that
         # case a nonblank, schema-validated task patch is an explicit
         # replacement; do not require a particular natural-language phrase.
-        elif allow_task_replacement:
+        elif allow_task_replacement and semantic_updates_are_grounded and _evidence_is_grounded(
+            proposed.evidence.get("task"), raw
+        ):
             permitted["task"] = proposed.task
 
     return PendingReminderFieldUpdate.model_validate(permitted)
@@ -1037,6 +1072,7 @@ class OpenAICompatibleIntentInterpreter:
         timezone_name: str,
         now: datetime,
         context: PendingReminder | None = None,
+        recent_messages: Sequence[str] = (),
     ) -> Interpretation:
         local_now = _normalise_now(now).astimezone(ZoneInfo(timezone_name))
         endpoint_host = urlsplit(self._url).hostname or "unknown"
@@ -1060,7 +1096,9 @@ class OpenAICompatibleIntentInterpreter:
             "For unrelated requests use operation UNKNOWN. Never guess an ambiguous hour. "
             "When existing pending reminder context is supplied, use UPDATE_PENDING_REMINDER "
             "with an updates object containing only fields explicitly "
-            "provided by the user (task, date_local, hour, minute, meridiem, date_explicit). "
+            "provided by the user (task, date_local, hour, minute, meridiem, date_explicit), "
+            "plus certainty=\"CLEAR\" and evidence mapping each updated field to an exact "
+            "fragment of the latest user message. "
             "Correct a typo only when it has one clear interpretation. If a date, time, task, "
             "or target is ambiguous, use NEEDS_CLARIFICATION with a focused question and no "
             "updates. "
@@ -1075,6 +1113,11 @@ class OpenAICompatibleIntentInterpreter:
         )
         if context is not None:
             prompt += f" Existing pending reminder context is {context.model_dump_json()}"
+        if recent_messages:
+            prompt += (
+                " Relevant recent conversation messages are "
+                f"{json.dumps(list(recent_messages)[-34:])}."
+            )
         request_payload = {
             "model": self._model,
             "messages": [
@@ -1322,6 +1365,7 @@ class ReminderIntentInterpreter:
         timezone_name: str,
         now: datetime,
         context: PendingReminder | None = None,
+        recent_messages: Sequence[str] = (),
     ) -> Interpretation:
         result = self._rules.interpret(
             text, timezone_name=timezone_name, now=now, context=context
@@ -1339,9 +1383,18 @@ class ReminderIntentInterpreter:
             "reminder_intent_provider_fallback",
             reason="rules_did_not_match",
         )
-        provider_result = self._model.interpret(
-            text, timezone_name=timezone_name, now=now, context=context
-        )
+        if isinstance(self._model, OpenAICompatibleIntentInterpreter):
+            provider_result = self._model.interpret(
+                text,
+                timezone_name=timezone_name,
+                now=now,
+                context=context,
+                recent_messages=recent_messages,
+            )
+        else:
+            provider_result = self._model.interpret(
+                text, timezone_name=timezone_name, now=now, context=context
+            )
         # A provider response that contains no typed action must not erase the
         # deterministic context or replace a focused clarification with a generic
         # error. Keep the safer rule result in that case.
@@ -1350,7 +1403,11 @@ class ReminderIntentInterpreter:
             # cancellation recognized by a provider implementation) can cross
             # the provider boundary.  A provider cannot replace the session
             # with a completed reminder or a newly assembled pending object.
-            if provider_result.field_updates is not None or provider_result.clear_context:
+            if (
+                provider_result.field_updates is not None
+                or provider_result.clear_context
+                or provider_result.clarification is not None
+            ):
                 return provider_result
             return result
         if (

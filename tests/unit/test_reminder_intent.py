@@ -494,10 +494,13 @@ def test_classifier_selected_update_can_replace_pending_task() -> None:
     )
     verified = restrict_to_explicit_field_updates(
         "email Bilal",
-        PendingReminderFieldUpdate(task="email Bilal"),
+        PendingReminderFieldUpdate(
+            task="email Bilal", certainty="CLEAR", evidence={"task": "email Bilal"}
+        ),
         context=context,
         now=NOW,
         allow_task_replacement=True,
+            allow_semantic_field_updates=True,
     )
 
     assert verified.task == "email Bilal"
@@ -512,7 +515,17 @@ def test_semantic_update_accepts_clear_date_typo_from_extractor(typo: str) -> No
     verified = restrict_to_explicit_field_updates(
         f"{typo} at 8 PM",
         PendingReminderFieldUpdate(
-            date_local=date(2026, 10, 31), hour=8, minute=0, meridiem="PM"
+            date_local=date(2026, 10, 31),
+            hour=8,
+            minute=0,
+            meridiem="PM",
+            certainty="CLEAR",
+            evidence={
+                "date_local": typo,
+                "hour": "8 PM",
+                "minute": "8 PM",
+                "meridiem": "8 PM",
+            },
         ),
         context=context,
         now=NOW,
@@ -531,6 +544,21 @@ def test_semantic_update_does_not_accept_typo_without_classifier_authorization()
         PendingReminderFieldUpdate(date_local=date(2026, 10, 31)),
         context=context,
         now=NOW,
+    )
+
+    assert verified.date_local is None
+
+
+def test_semantic_update_requires_clear_grounded_evidence() -> None:
+    context = PendingReminder(task="call Ayesha", timezone_name="UTC")
+    verified = restrict_to_explicit_field_updates(
+        "tomorow",
+        PendingReminderFieldUpdate(
+            date_local=date(2026, 10, 31), certainty="CLEAR", evidence={"date_local": "today"}
+        ),
+        context=context,
+        now=NOW,
+        allow_semantic_field_updates=True,
     )
 
     assert verified.date_local is None

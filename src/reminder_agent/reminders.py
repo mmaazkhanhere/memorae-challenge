@@ -43,6 +43,7 @@ from reminder_agent.intent import (
     IntentInterpreter,
     Interpretation,
     PendingReminder,
+    ReminderIntentInterpreter,
     RuleBasedIntentInterpreter,
     restrict_to_explicit_field_updates,
 )
@@ -203,8 +204,17 @@ def _interpret(
     timezone_name: str,
     now: datetime,
     context: PendingReminder | None,
+    recent_messages: list[str],
 ):
     """Always pass the pending context when one exists."""
+    if isinstance(interpreter, ReminderIntentInterpreter):
+        return interpreter.interpret(
+            text,
+            timezone_name=timezone_name,
+            now=now,
+            context=context,
+            recent_messages=recent_messages,
+        )
     if context is None:
         return interpreter.interpret(text, timezone_name=timezone_name, now=now)
     return interpreter.interpret(text, timezone_name=timezone_name, now=now, context=context)
@@ -326,6 +336,7 @@ def _route_and_interpret(
                 in {ConversationRoute.CLARIFICATION_REPLY, ConversationRoute.MODEL_FALLBACK}
                 else None
             ),
+            recent_messages=recent_messages or [],
         )
     if interpretation.field_updates is not None:
         if pending is None:

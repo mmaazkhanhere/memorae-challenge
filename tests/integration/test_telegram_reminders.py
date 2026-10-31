@@ -556,7 +556,13 @@ def test_classifier_selected_task_update_replaces_pending_task_without_phrase_ma
         def interpret(self, text, *, timezone_name, now, context=None):
             assert context is not None
             if text == correction_text:
-                return Interpretation(field_updates=PendingReminderFieldUpdate(task=replacement_task))
+                return Interpretation(
+                    field_updates=PendingReminderFieldUpdate(
+                        task=replacement_task,
+                        certainty="CLEAR",
+                        evidence={"task": correction_text},
+                    )
+                )
             return Interpretation(
                 field_updates=PendingReminderFieldUpdate(
                     hour=8, minute=0, meridiem="PM"
@@ -629,7 +635,17 @@ def test_classifier_selected_clear_date_typo_completes_pending_reminder(
             assert text == f"{typo} at 8 PM"
             return Interpretation(
                 field_updates=PendingReminderFieldUpdate(
-                    date_local=date(2026, 10, 31), hour=8, minute=0, meridiem="PM"
+                    date_local=date(2026, 10, 31),
+                    hour=8,
+                    minute=0,
+                    meridiem="PM",
+                    certainty="CLEAR",
+                    evidence={
+                        "date_local": typo,
+                        "hour": "8 PM",
+                        "minute": "8 PM",
+                        "meridiem": "8 PM",
+                    },
                 )
             )
 
