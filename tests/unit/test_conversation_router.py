@@ -23,7 +23,7 @@ def test_router_classifies_pending_conversation_before_parsing() -> None:
     assert route_message("8 AM", pending=pending).route is ConversationRoute.MODEL_FALLBACK
     assert route_message("Never mind", pending=pending).route is ConversationRoute.CANCELLATION
     assert route_message("yes", pending=pending).route is ConversationRoute.CLARIFICATION_REPLY
-    assert route_message("thanks", pending=pending).route is ConversationRoute.CLARIFICATION_REPLY
+    assert route_message("thanks", pending=pending).route is ConversationRoute.SOCIAL
 
 
 def test_router_does_not_start_a_reminder_from_unrelated_text() -> None:
@@ -37,7 +37,7 @@ def test_router_allows_free_text_only_when_the_task_is_missing() -> None:
     pending_without_task = _pending(task=None)
 
     assert route_message("call the doctor", pending=pending_without_task).route is (
-        ConversationRoute.CLARIFICATION_REPLY
+        ConversationRoute.MODEL_FALLBACK
     )
     assert route_message("what time is it?", pending=pending_without_task).route is (
         ConversationRoute.MODEL_FALLBACK

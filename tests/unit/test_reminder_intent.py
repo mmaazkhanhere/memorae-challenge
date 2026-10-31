@@ -5,6 +5,8 @@ import pytest
 
 from reminder_agent.intent import (
     CreateOneTimeReminderIntent,
+    IntentRoute,
+    OpenAICompatibleIntentRouter,
     Interpretation,
     NeedsClarification,
     OpenAICompatibleIntentInterpreter,
@@ -21,6 +23,33 @@ from reminder_agent.settings import Settings
 NOW = datetime(2026, 10, 30, 12, 0, tzinfo=timezone.utc)
 
 
+def test_intent_router_classifies_only_the_operation_and_limits_history(monkeypatch) -> None:
+    captured: dict = {}
+
+    def fake_post(*args, **kwargs):
+        captured.update(kwargs["json"])
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={"choices": [{"message": {"content": '{"operation":"NEW_REQUEST"}'}}]},
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    suggestion = OpenAICompatibleIntentRouter(
+        "https://api.groq.example/openai/v1", "secret", "openai/gpt-oss-20b"
+    ).classify(
+        "remind me to call Bilal tomorrow",
+        pending=None,
+        recent_messages=[f"message {index}" for index in range(40)],
+    )
+
+    assert suggestion.operation is IntentRoute.NEW_REQUEST
+    context = captured["messages"][1]["content"]
+    assert "message 5" not in context
+    assert "message 6" in context
+    assert "call Bilal" in context
+
+
 def test_pending_update_normalises_meridiem_case() -> None:
     assert PendingReminderFieldUpdate(meridiem="PM").meridiem == "pm"
     assert PendingReminderFieldUpdate(meridiem="AM").meridiem == "am"
@@ -35,7 +64,8 @@ def test_default_llm_configuration_targets_openai_compatible_api() -> None:
     settings = Settings(_env_file=None)
 
     assert settings.llm_base_url == "https://api.openai.com/v1"
-    assert settings.llm_model == "gpt-6-luna"
+    assert settings.llm_extract_model == "gpt-5.4-mini-2026-03-17"
+    assert settings.llm_intent_model == "openai/gpt-oss-20b"
 
 
 def test_relative_minutes_are_resolved_from_one_reference_time() -> None:
@@ -435,6 +465,42 @@ def test_provider_task_update_requires_an_explicit_correction() -> None:
     assert verified.task == "call the doctor"
     assert verified.hour == 8
     assert verified.meridiem == "am"
+
+
+def test_standalone_meridiem_is_accepted_for_pending_time_clarification() -> None:
+    context = PendingReminder(
+        task="visit the dentist",
+        date_local=date(2026, 10, 31),
+        hour=8,
+        timezone_name="UTC",
+    )
+    verified = restrict_to_explicit_field_updates(
+        "PM",
+        PendingReminderFieldUpdate(meridiem="PM"),
+        context=context,
+        now=NOW,
+    )
+
+    assert verified.meridiem == "pm"
+
+
+def test_classifier_selected_update_can_replace_pending_task() -> None:
+    context = PendingReminder(
+        task="email Hassan",
+        date_local=date(2026, 10, 31),
+        hour=8,
+        meridiem="pm",
+        timezone_name="UTC",
+    )
+    verified = restrict_to_explicit_field_updates(
+        "email Bilal",
+        PendingReminderFieldUpdate(task="email Bilal"),
+        context=context,
+        now=NOW,
+        allow_task_replacement=True,
+    )
+
+    assert verified.task == "email Bilal"
 
 
 def test_complex_follow_up_uses_model_fallback_with_pending_context() -> None:

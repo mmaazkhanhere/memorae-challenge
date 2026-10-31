@@ -1,6 +1,7 @@
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 
+import pytest
 from sqlalchemy import func, select
 
 from reminder_agent.db.models import (
@@ -14,11 +15,14 @@ from reminder_agent.db.models import (
 )
 from reminder_agent.intent import (
     CreateOneTimeReminderIntent,
+    IntentRoute,
+    IntentRouteSuggestion,
     Interpretation,
     NeedsClarification,
     PendingReminderFieldUpdate,
 )
 from reminder_agent.main import create_app
+from reminder_agent import reminders as reminder_service
 from reminder_agent.reminders import handle_reminder_text
 from reminder_agent.settings import Settings
 from reminder_agent.telegram import TelegramUpdate
@@ -467,6 +471,133 @@ def test_clarification_follow_up_creates_one_reminder_and_ends_session(
     assert db.scalar(select(func.count()).select_from(Notification)) == 1
     session = db.scalar(select(ConversationSession))
     assert session is not None
+    assert session.status == "ENDED"
+    assert session.pending_clarification is None
+
+
+def test_standalone_meridiem_completes_dentist_reminder(
+    api_client, db, fixed_now, update_factory
+) -> None:
+    onboard(api_client, update_factory)
+    assert post_update(
+        api_client,
+        update_factory(160, text="Remind me tomorrow at 8 to visit the dentist"),
+    ).status_code == 200
+
+    user = db.scalar(select(User).where(User.name == "Ada"))
+    identity = db.scalar(select(ChannelIdentity).where(ChannelIdentity.external_id == "1001"))
+    assert user is not None and identity is not None
+
+    class UpdateRouter:
+        def classify(self, *args, **kwargs):
+            return IntentRouteSuggestion(operation=IntentRoute.UPDATE_PENDING)
+
+    class MeridiemExtractor:
+        def interpret(self, text, *, timezone_name, now, context=None):
+            assert context is not None
+            return Interpretation(field_updates=PendingReminderFieldUpdate(meridiem="PM"))
+
+    handle_reminder_text(
+        db,
+        TelegramUpdate.model_validate(update_factory(161, text="PM")),
+        user_id=user.id,
+        identity_id=identity.id,
+        telegram_user_id=1001,
+        interpreter=MeridiemExtractor(),
+        intent_router=UpdateRouter(),
+        now=fixed_now,
+    )
+
+    reminder = db.scalar(select(Reminder))
+    occurrence = db.scalar(select(ReminderOccurrence))
+    session = db.scalar(select(ConversationSession))
+    assert reminder is not None and occurrence is not None and session is not None
+    assert reminder.task == "visit the dentist"
+    assert utc_timestamp(occurrence.scheduled_at) == datetime(2026, 10, 31, 15, 0, tzinfo=timezone.utc)
+    assert session.status == "ENDED"
+    assert session.pending_clarification is None
+
+
+@pytest.mark.parametrize(
+    ("correction_text", "replacement_task"),
+    [
+        ("Actually, make that email Bilal tomorrow.", "email Bilal"),
+        ("Please use send the proposal tomorrow instead.", "send the proposal"),
+    ],
+)
+def test_classifier_selected_task_update_replaces_pending_task_without_phrase_matching(
+    api_client, db, fixed_now, monkeypatch, update_factory, correction_text, replacement_task
+) -> None:
+    onboard(api_client, update_factory)
+    assert post_update(
+        api_client,
+        update_factory(162, text="Remind me tomorrow to email Nadia"),
+    ).status_code == 200
+
+    user = db.scalar(select(User).where(User.name == "Ada"))
+    identity = db.scalar(select(ChannelIdentity).where(ChannelIdentity.external_id == "1001"))
+    assert user is not None and identity is not None
+    task_trace: list[tuple[str | None, str | None]] = []
+    original_restrict = reminder_service.restrict_to_explicit_field_updates
+
+    def capture_task_update(*args, **kwargs):
+        proposed = args[1]
+        accepted = original_restrict(*args, **kwargs)
+        task_trace.append((proposed.task, accepted.task))
+        return accepted
+
+    monkeypatch.setattr(reminder_service, "restrict_to_explicit_field_updates", capture_task_update)
+
+    class UpdateRouter:
+        def classify(self, *args, **kwargs):
+            return IntentRouteSuggestion(operation=IntentRoute.UPDATE_PENDING)
+
+    class TaskAndTimeExtractor:
+        def interpret(self, text, *, timezone_name, now, context=None):
+            assert context is not None
+            if text == correction_text:
+                return Interpretation(field_updates=PendingReminderFieldUpdate(task=replacement_task))
+            return Interpretation(
+                field_updates=PendingReminderFieldUpdate(
+                    hour=8, minute=0, meridiem="PM"
+                )
+            )
+
+    handle_reminder_text(
+        db,
+        TelegramUpdate.model_validate(update_factory(163, text=correction_text)),
+        user_id=user.id,
+        identity_id=identity.id,
+        telegram_user_id=1001,
+        interpreter=TaskAndTimeExtractor(),
+        intent_router=UpdateRouter(),
+        now=fixed_now,
+    )
+
+    # LLM extraction -> accepted update -> merged and persisted pending draft.
+    assert task_trace == [(replacement_task, replacement_task)]
+    pending_session = db.scalar(select(ConversationSession))
+    assert pending_session is not None
+    assert pending_session.status == "AWAITING_CLARIFICATION"
+    assert pending_session.pending_clarification["task"] == replacement_task
+
+    handle_reminder_text(
+        db,
+        TelegramUpdate.model_validate(update_factory(164, text="at 8 PM")),
+        user_id=user.id,
+        identity_id=identity.id,
+        telegram_user_id=1001,
+        interpreter=TaskAndTimeExtractor(),
+        intent_router=UpdateRouter(),
+        now=fixed_now,
+    )
+
+    reminder = db.scalar(select(Reminder))
+    occurrence = db.scalar(select(ReminderOccurrence))
+    session = db.scalar(select(ConversationSession))
+    assert reminder is not None and occurrence is not None and session is not None
+    assert reminder.task == replacement_task
+    assert utc_timestamp(occurrence.scheduled_at) == datetime(2026, 10, 31, 15, 0, tzinfo=timezone.utc)
     assert session.status == "ENDED"
     assert session.pending_clarification is None
 
