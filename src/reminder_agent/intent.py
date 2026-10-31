@@ -498,12 +498,80 @@ def _same_task(left: str, right: str) -> bool:
 
 
 def _evidence_is_grounded(evidence: str | None, text: str) -> bool:
-    """Require semantic model patches to cite an exact fragment of this turn."""
+    """Verify an evidence fragment with bounded, typo-tolerant matching."""
     if not isinstance(evidence, str):
         return False
     normalized_evidence = " ".join(evidence.lower().split())
     normalized_text = " ".join(text.lower().split())
-    return bool(normalized_evidence) and normalized_evidence in normalized_text
+    if not normalized_evidence:
+        return False
+    if normalized_evidence in normalized_text:
+        return True
+
+    evidence_tokens = re.findall(r"[a-z0-9]+", normalized_evidence)
+    message_tokens = re.findall(r"[a-z0-9]+", normalized_text)
+    if not evidence_tokens or len(evidence_tokens) > len(message_tokens):
+        return False
+
+    temporal_words = {
+        "today",
+        "tomorrow",
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+    }
+
+    def close_enough(left: str, right: str) -> bool:
+        if left == right:
+            return True
+        if left in temporal_words and right in temporal_words:
+            return False
+        # Permit only small insertion/deletion/substitution errors.  This is
+        # intentionally conservative so unrelated words cannot become evidence.
+        limit = max(1, (max(len(left), len(right)) + 3) // 4)
+        previous = list(range(len(right) + 1))
+        for left_index, left_char in enumerate(left, start=1):
+            current = [left_index]
+            for right_index, right_char in enumerate(right, start=1):
+                current.append(
+                    min(
+                        previous[right_index] + 1,
+                        current[right_index - 1] + 1,
+                        previous[right_index - 1] + (left_char != right_char),
+                    )
+                )
+            previous = current
+        return previous[-1] <= limit
+
+    for start in range(len(message_tokens) - len(evidence_tokens) + 1):
+        candidate = message_tokens[start : start + len(evidence_tokens)]
+        if all(close_enough(left, right) for left, right in zip(evidence_tokens, candidate)):
+            return True
+        # The same small set of supported words may arrive in a different
+        # order (for example, "at 8 PM tomorrow").  Permit this only when
+        # each token still has a bounded match in the same local window.
+        remaining = list(candidate)
+        unordered_match = True
+        for token in evidence_tokens:
+            match_index = next(
+                (
+                    index
+                    for index, candidate_token in enumerate(remaining)
+                    if close_enough(token, candidate_token)
+                ),
+                None,
+            )
+            if match_index is None:
+                unordered_match = False
+                break
+            remaining.pop(match_index)
+        if unordered_match:
+            return True
+    return False
 
 
 def restrict_to_explicit_field_updates(
@@ -1135,7 +1203,8 @@ class OpenAICompatibleIntentInterpreter:
             "with an updates object containing only fields explicitly "
             "provided by the user (task, date_local, hour, minute, meridiem, date_explicit), "
             "plus certainty=\"CLEAR\" and evidence mapping each updated field to an exact "
-            "fragment of the latest user message. "
+            "fragment of the latest user message; preserve the user's spelling in evidence when "
+            "possible. "
             "Correct a typo only when it has one clear interpretation. If a date, time, task, "
             "or target is ambiguous, use NEEDS_CLARIFICATION with a focused question and no "
             "updates. "

@@ -528,14 +528,23 @@ def test_classifier_selected_update_can_replace_pending_task() -> None:
     assert verified.task == "email Bilal"
 
 
-@pytest.mark.parametrize("typo", ["tomorow", "tmorrow", "tommorow"])
-def test_semantic_update_accepts_clear_date_typo_from_extractor(typo: str) -> None:
+@pytest.mark.parametrize(
+    ("message", "date_evidence"),
+    [
+        ("tomorow at 8 PM", "tomorrow"),
+        ("tmorrow at 8 PM", "tomorrow"),
+        ("at 8 PM tommorow", "tomorrow at 8 PM"),
+    ],
+)
+def test_semantic_update_accepts_grounded_typo_or_word_order(
+    message: str, date_evidence: str
+) -> None:
     context = PendingReminder(
         task="call Ayesha",
         timezone_name="UTC",
     )
     verified = restrict_to_explicit_field_updates(
-        f"{typo} at 8 PM",
+        message,
         PendingReminderFieldUpdate(
             date_local=date(2026, 10, 31),
             hour=8,
@@ -543,10 +552,10 @@ def test_semantic_update_accepts_clear_date_typo_from_extractor(typo: str) -> No
             meridiem="PM",
             certainty="CLEAR",
             evidence={
-                "date_local": typo,
-                "hour": "8 PM",
-                "minute": "8 PM",
-                "meridiem": "8 PM",
+                "date_local": date_evidence,
+                "hour": date_evidence,
+                "minute": date_evidence,
+                "meridiem": date_evidence,
             },
         ),
         context=context,
@@ -584,6 +593,37 @@ def test_semantic_update_requires_clear_grounded_evidence() -> None:
     )
 
     assert verified.date_local is None
+
+
+def test_semantic_update_rejects_a_different_temporal_word_as_evidence() -> None:
+    context = PendingReminder(task="call Ayesha", timezone_name="UTC")
+    verified = restrict_to_explicit_field_updates(
+        "Sunday",
+        PendingReminderFieldUpdate(
+            date_local=date(2026, 11, 2), certainty="CLEAR", evidence={"date_local": "Monday"}
+        ),
+        context=context,
+        now=NOW,
+        allow_semantic_field_updates=True,
+    )
+
+    assert verified.date_local is None
+
+
+def test_semantic_task_update_accepts_a_grounded_spelling_variation() -> None:
+    context = PendingReminder(task="email Hassan", timezone_name="UTC")
+    verified = restrict_to_explicit_field_updates(
+        "emial Bilal",
+        PendingReminderFieldUpdate(
+            task="email Bilal", certainty="CLEAR", evidence={"task": "email Bilal"}
+        ),
+        context=context,
+        now=NOW,
+        allow_task_replacement=True,
+        allow_semantic_field_updates=True,
+    )
+
+    assert verified.task == "email Bilal"
 
 
 def test_clarification_question_mentions_only_the_missing_date() -> None:

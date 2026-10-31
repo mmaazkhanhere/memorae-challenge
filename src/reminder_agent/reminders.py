@@ -359,12 +359,14 @@ def _route_and_interpret(
                 verified_updates,
                 now=now,
             )
+            accepted_fields = verified_updates.supplied_fields()
             log_event(
                 logger,
                 logging.INFO,
                 "pending_update_applied",
-                proposed_field_count=len(proposed_fields),
-                accepted_field_count=len(verified_updates.supplied_fields()),
+                proposed_fields=sorted(proposed_fields),
+                accepted_fields=sorted(accepted_fields),
+                rejected_fields=sorted(proposed_fields - accepted_fields),
                 completed=interpretation.intent is not None,
                 needs_clarification=interpretation.clarification is not None,
             )

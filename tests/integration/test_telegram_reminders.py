@@ -642,8 +642,8 @@ def test_classifier_selected_clear_date_typo_completes_pending_reminder(
                     date_explicit=True,
                     certainty="CLEAR",
                     evidence={
-                        "date_local": typo,
-                        "date_explicit": typo,
+                        "date_local": "tomorrow",
+                        "date_explicit": "tomorrow",
                         "hour": "8 PM",
                         "minute": "8 PM",
                         "meridiem": "8 PM",
