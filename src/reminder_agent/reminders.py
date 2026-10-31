@@ -592,7 +592,22 @@ def handle_reminder_text(
         recent_message_count=len(recent_messages),
     )
     observed_session_version = None if session_is_expired or session is None else session.version
-    if session_is_expired:
+    policy = assess_request(text, has_pending=pending is not None)
+    if policy.is_rejected:
+        log_event(
+            logger,
+            logging.WARNING,
+            "reminder_request_rejected_by_policy",
+            update_id=update.update_id,
+            reason=policy.reason,
+        )
+        # Policy rejections are deliberately stateless. In particular, do not
+        # create an IdempotencyRecord merely to remember a limitation response.
+        # The webhook sends this reply directly and supported state-changing
+        # requests continue to use durable idempotency below.
+        db.rollback()
+        return ReminderReply(update.message.chat.id, OUT_OF_SCOPE_RESPONSE)
+    elif session_is_expired:
         interpretation = None
     else:
         route, interpretation = _route_and_interpret(
