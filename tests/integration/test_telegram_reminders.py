@@ -479,6 +479,11 @@ def test_provider_field_update_is_merged_with_the_locked_pending_session(
         api_client,
         update_factory(141, text="Remind me tomorrow to call the bank"),
     ).status_code == 200
+    pending_session = db.scalar(select(ConversationSession))
+    assert pending_session is not None
+    assert pending_session.pending_clarification["task"] == "call the bank"
+    assert pending_session.pending_clarification["date_local"] == "2026-10-31"
+    assert pending_session.pending_clarification["hour"] is None
     user = db.scalar(select(User).where(User.name == "Ada"))
     identity = db.scalar(select(ChannelIdentity).where(ChannelIdentity.external_id == "1001"))
     assert user is not None and identity is not None
@@ -495,7 +500,7 @@ def test_provider_field_update_is_merged_with_the_locked_pending_session(
                     date_local=date(2026, 11, 1),
                     hour=8,
                     minute=0,
-                    meridiem="am",
+                    meridiem="AM",
                 )
             )
 
@@ -518,6 +523,7 @@ def test_provider_field_update_is_merged_with_the_locked_pending_session(
     assert utc_timestamp(occurrence.scheduled_at) == datetime(
         2026, 10, 31, 3, 0, tzinfo=timezone.utc
     )
+    assert db.scalar(select(ConversationSession)).pending_clarification is None
 
 
 def test_stale_clarification_interpretation_is_retried_with_latest_session_version(

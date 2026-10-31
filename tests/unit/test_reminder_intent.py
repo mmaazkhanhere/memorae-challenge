@@ -178,6 +178,33 @@ def test_provider_clarification_does_not_erase_rule_extracted_task() -> None:
     assert result.clarification.pending.date_local == date(2026, 10, 31)
 
 
+def test_provider_clarification_normalises_uppercase_meridiem() -> None:
+    class UppercaseProvider:
+        def interpret(self, text, *, timezone_name, now, context=None):
+            return Interpretation(
+                clarification=NeedsClarification(
+                    pending=PendingReminder(
+                        date_local=date(2026, 10, 31),
+                        hour=4,
+                        meridiem="PM",
+                        timezone_name=timezone_name,
+                    ),
+                    question="What should I remind you about?",
+                )
+            )
+
+    result = ReminderIntentInterpreter(UppercaseProvider()).interpret(
+        "Remind me tomorrow at 4 PM",
+        timezone_name="Asia/Karachi",
+        now=NOW,
+    )
+
+    assert result.clarification is not None
+    assert result.clarification.pending.date_local == date(2026, 10, 31)
+    assert result.clarification.pending.hour == 4
+    assert result.clarification.pending.meridiem == "pm"
+
+
 def test_weekday_schedule_with_explicit_meridiem_is_parsed_deterministically() -> None:
     result = RuleBasedIntentInterpreter().interpret(
         "Remind me on Friday at 6 PM to go to the gym",
@@ -754,7 +781,7 @@ def test_openai_compatible_interpreter_returns_only_provider_field_updates_for_c
                         "message": {
                             "content": (
                                 '{"operation":"UPDATE_PENDING_REMINDER",'
-                                '"updates":{"meridiem":"pm"}}'
+                                '"updates":{"meridiem":"PM"}}'
                             )
                         }
                     }

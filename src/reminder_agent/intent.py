@@ -64,6 +64,13 @@ class PendingReminder(BaseModel):
     timezone_name: str = Field(min_length=1, max_length=150)
     date_explicit: bool = False
 
+    @field_validator("meridiem", mode="before")
+    @classmethod
+    def normalise_meridiem(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.lower()
+        return value
+
     @field_validator("task")
     @classmethod
     def task_must_not_be_blank(cls, value: str | None) -> str | None:
