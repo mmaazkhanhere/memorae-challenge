@@ -73,6 +73,31 @@ class ReminderReply:
     reply_markup: dict | None = None
 
 
+def list_owned_reminders(
+    db: Session,
+    *,
+    user_id: UUID,
+    status: str | None = None,
+) -> list[Reminder]:
+    """Read reminders owned by ``user_id`` and never another account.
+
+    This is intentionally a small application-service primitive rather than a
+    conversational list feature. Callers must provide the canonical user ID
+    resolved by their authenticated channel context.
+    """
+
+    filters = [Reminder.user_id == user_id]
+    if status is not None:
+        filters.append(Reminder.status == status)
+    return list(
+        db.scalars(
+            select(Reminder)
+            .where(*filters)
+            .order_by(Reminder.created_at.asc(), Reminder.id.asc())
+        ).all()
+    )
+
+
 def _request_hash(update: TelegramUpdate) -> str:
     canonical = update.model_dump_json(by_alias=True, exclude_none=True)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
