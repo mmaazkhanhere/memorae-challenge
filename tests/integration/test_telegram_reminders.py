@@ -602,6 +602,58 @@ def test_classifier_selected_task_update_replaces_pending_task_without_phrase_ma
     assert session.pending_clarification is None
 
 
+@pytest.mark.parametrize("typo", ["tomorow", "tmorrow", "tommorow"])
+def test_classifier_selected_clear_date_typo_completes_pending_reminder(
+    api_client, db, fixed_now, update_factory, typo
+) -> None:
+    onboard(api_client, update_factory)
+    assert post_update(
+        api_client,
+        update_factory(165, text="Remind me to call Ayesha"),
+    ).status_code == 200
+
+    user = db.scalar(select(User).where(User.name == "Ada"))
+    identity = db.scalar(select(ChannelIdentity).where(ChannelIdentity.external_id == "1001"))
+    session = db.scalar(select(ConversationSession))
+    assert user is not None and identity is not None and session is not None
+    assert session.pending_clarification["task"] == "call Ayesha"
+    assert session.pending_clarification["date_local"] is None
+
+    class UpdateRouter:
+        def classify(self, *args, **kwargs):
+            return IntentRouteSuggestion(operation=IntentRoute.UPDATE_PENDING)
+
+    class TypoAwareExtractor:
+        def interpret(self, text, *, timezone_name, now, context=None):
+            assert context is not None
+            assert text == f"{typo} at 8 PM"
+            return Interpretation(
+                field_updates=PendingReminderFieldUpdate(
+                    date_local=date(2026, 10, 31), hour=8, minute=0, meridiem="PM"
+                )
+            )
+
+    handle_reminder_text(
+        db,
+        TelegramUpdate.model_validate(update_factory(166, text=f"{typo} at 8 PM")),
+        user_id=user.id,
+        identity_id=identity.id,
+        telegram_user_id=1001,
+        interpreter=TypoAwareExtractor(),
+        intent_router=UpdateRouter(),
+        now=fixed_now,
+    )
+
+    reminder = db.scalar(select(Reminder))
+    occurrence = db.scalar(select(ReminderOccurrence))
+    session = db.scalar(select(ConversationSession))
+    assert reminder is not None and occurrence is not None and session is not None
+    assert reminder.task == "call Ayesha"
+    assert utc_timestamp(occurrence.scheduled_at) == datetime(2026, 10, 31, 15, 0, tzinfo=timezone.utc)
+    assert session.status == "ENDED"
+    assert session.pending_clarification is None
+
+
 def test_provider_field_update_is_merged_with_the_locked_pending_session(
     api_client, db, fixed_now, update_factory
 ) -> None:

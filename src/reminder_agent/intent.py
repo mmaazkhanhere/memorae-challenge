@@ -464,6 +464,7 @@ def restrict_to_explicit_field_updates(
     context: PendingReminder,
     now: datetime,
     allow_task_replacement: bool = False,
+    allow_semantic_field_updates: bool = False,
 ) -> PendingReminderFieldUpdate:
     """Keep only provider updates demonstrably present in the user's reply.
 
@@ -503,6 +504,24 @@ def restrict_to_explicit_field_updates(
             # The backend derives this flag from the verified date, rather than
             # accepting a model-provided boolean independently.
             permitted["date_explicit"] = True
+
+    # Exact deterministic extraction remains the preferred verifier.  When
+    # the intent classifier has selected this locked draft as an update, OSS
+    # extraction may also supply a structurally valid field whose source text
+    # contains a clear typo (for example, "tomorow").  The model is instructed
+    # to return NEEDS_CLARIFICATION instead of guessing when alternatives are
+    # plausible; the backend still owns schema, target, and schedule checks.
+    if allow_semantic_field_updates:
+        if proposed.date_local is not None and "date_local" not in permitted:
+            permitted["date_local"] = proposed.date_local
+            permitted["date_explicit"] = True
+        if proposed.hour is not None and "hour" not in permitted:
+            if proposed.meridiem is None or 1 <= proposed.hour <= 12:
+                permitted["hour"] = proposed.hour
+        if proposed.minute is not None and "minute" not in permitted:
+            permitted["minute"] = proposed.minute
+        if proposed.meridiem is not None and "meridiem" not in permitted:
+            permitted["meridiem"] = proposed.meridiem
 
     remainder = raw
     if clock is not None:
@@ -1039,15 +1058,17 @@ class OpenAICompatibleIntentInterpreter:
             "request use operation NEEDS_CLARIFICATION with pending fields task, date_local "
             "(YYYY-MM-DD), hour, minute, meridiem, date_explicit, and a focused question. "
             "For unrelated requests use operation UNKNOWN. Never guess an ambiguous hour. "
-            "When existing pending reminder context is supplied, use ONLY operation "
-            "UPDATE_PENDING_REMINDER with an updates object containing only fields explicitly "
+            "When existing pending reminder context is supplied, use UPDATE_PENDING_REMINDER "
+            "with an updates object containing only fields explicitly "
             "provided by the user (task, date_local, hour, minute, meridiem, date_explicit). "
+            "Correct a typo only when it has one clear interpretation. If a date, time, task, "
+            "or target is ambiguous, use NEEDS_CLARIFICATION with a focused question and no "
+            "updates. "
             "Do not include an existing task, date, or time unless the user explicitly corrects "
             "that exact field in this message. Never repeat, infer, preserve, merge, or clear a "
-            "context field. Never return "
-            "CREATE_ONE_TIME_REMINDER, NEEDS_CLARIFICATION, due_local, or a question for a "
-            "follow-up; the application owns the pending reminder and will merge and validate "
-            "the update. Use UNKNOWN when the follow-up supplies no reminder field. "
+            "context field. Never return CREATE_ONE_TIME_REMINDER or due_local for a follow-up; "
+            "the application owns the pending reminder and will merge and validate the update. "
+            "Use UNKNOWN when the follow-up supplies no reminder field. "
             "due_local must be a timezone-naive ISO-8601 local datetime; the application applies "
             f"the user's validated timezone {timezone_name}. Current local time is "
             f"{local_now.isoformat()}."
@@ -1111,6 +1132,17 @@ class OpenAICompatibleIntentInterpreter:
                         has_pending_context=True,
                     )
                     return Interpretation(field_updates=updates, fallback_allowed=False)
+                if operation == "NEEDS_CLARIFICATION":
+                    question = data.get("question")
+                    if not isinstance(question, str) or not question.strip():
+                        raise ValueError("missing clarification question")
+                    # Preserve the application-owned draft.  The extraction
+                    # model may request clarification, but cannot replace or
+                    # clear trusted pending fields.
+                    return Interpretation(
+                        clarification=NeedsClarification(pending=context, question=question.strip()),
+                        fallback_allowed=False,
+                    )
                 if operation == "UNKNOWN":
                     return Interpretation(
                         response_text="I couldn't find a reminder detail in that reply.",

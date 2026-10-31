@@ -341,6 +341,7 @@ def _route_and_interpret(
                 context=pending,
                 now=now,
                 allow_task_replacement=classifier_selected_update,
+                allow_semantic_field_updates=classifier_selected_update,
             )
             interpretation = RuleBasedIntentInterpreter().apply_field_updates(
                 pending,

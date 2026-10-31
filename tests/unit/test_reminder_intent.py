@@ -503,6 +503,39 @@ def test_classifier_selected_update_can_replace_pending_task() -> None:
     assert verified.task == "email Bilal"
 
 
+@pytest.mark.parametrize("typo", ["tomorow", "tmorrow", "tommorow"])
+def test_semantic_update_accepts_clear_date_typo_from_extractor(typo: str) -> None:
+    context = PendingReminder(
+        task="call Ayesha",
+        timezone_name="UTC",
+    )
+    verified = restrict_to_explicit_field_updates(
+        f"{typo} at 8 PM",
+        PendingReminderFieldUpdate(
+            date_local=date(2026, 10, 31), hour=8, minute=0, meridiem="PM"
+        ),
+        context=context,
+        now=NOW,
+        allow_semantic_field_updates=True,
+    )
+
+    assert verified.date_local == date(2026, 10, 31)
+    assert verified.hour == 8
+    assert verified.meridiem == "pm"
+
+
+def test_semantic_update_does_not_accept_typo_without_classifier_authorization() -> None:
+    context = PendingReminder(task="call Ayesha", timezone_name="UTC")
+    verified = restrict_to_explicit_field_updates(
+        "tomorow",
+        PendingReminderFieldUpdate(date_local=date(2026, 10, 31)),
+        context=context,
+        now=NOW,
+    )
+
+    assert verified.date_local is None
+
+
 def test_complex_follow_up_uses_model_fallback_with_pending_context() -> None:
     class RecordingModel:
         def __init__(self) -> None:
@@ -878,6 +911,45 @@ def test_openai_compatible_interpreter_returns_only_provider_field_updates_for_c
     assert completed.intent is not None
     assert completed.intent.task == "call the bank"
     assert completed.intent.due_at == datetime(2026, 10, 30, 19, 0, tzinfo=timezone.utc)
+
+
+def test_openai_compatible_interpreter_preserves_pending_on_ambiguous_update(monkeypatch) -> None:
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda *args, **kwargs: httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"operation":"NEEDS_CLARIFICATION",'
+                                '"question":"Which Friday do you mean?"}'
+                            )
+                        }
+                    }
+                ]
+            },
+        ),
+    )
+    context = PendingReminder(
+        task="call Ayesha",
+        date_local=date(2026, 10, 31),
+        hour=8,
+        meridiem="pm",
+        timezone_name="UTC",
+    )
+
+    result = OpenAICompatibleIntentInterpreter(
+        "https://llm.example/v1", "secret", "provider-model"
+    ).interpret("next Friday", timezone_name="UTC", now=NOW, context=context)
+
+    assert result.field_updates is None
+    assert result.clarification is not None
+    assert result.clarification.question == "Which Friday do you mean?"
+    assert result.clarification.pending == context
 
 
 def test_openai_compatible_interpreter_rejects_completed_reminder_during_clarification(
