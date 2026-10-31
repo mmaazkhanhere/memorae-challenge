@@ -37,16 +37,19 @@ Production startup fails fast unless `DATABASE_URL` uses PostgreSQL,
 least 32 characters. The sample placeholders and local SQLite defaults are intended only for
 injected test applications. `/ready` also verifies that the domain tables exist, so a stale
 `alembic_version` row cannot make an empty database appear healthy. Readiness also requires the
-current migration head (`0010_confirmation_failed_status`) and the worker/confirmation claim
+current migration head (`0012_conversation_session_version`) and the worker/confirmation claim
 columns, so a partially migrated database is rejected before webhooks are accepted.
 The additive schema-repair migrations also rebuild missing domain tables when a
 database was reset without resetting its Alembic version row.
 
-One-time reminder text is interpreted through a strict typed boundary. The built-in parser
-handles relative requests such as `Remind me in five minutes to call the bank` and
-`Remind me tomorrow at 9 to renew the domain`. By default, a configured API key uses
+One-time reminder text uses a confidence-first, strict typed boundary. The built-in parser
+only handles short greetings and thanks plus unambiguous one-time reminders such as
+`Remind me in five minutes to call the bank`, `Remind me tomorrow at 9 AM to check my email`,
+`Remind me on Friday at 6 PM to go to the gym`, and `Remind me to pay the bill at 8 PM today`.
+Anything requiring context, a clarification, recurrence, or conversational interpretation falls
+back to the configured model. By default, a configured API key uses
 OpenAI's `https://api.openai.com/v1` endpoint and the `gpt-6-luna` model. `LLM_BASE_URL`,
-`LLM_API_KEY`, and `LLM_MODEL` can instead target any OpenAI-compatible `/chat/completions`
+`LLM_API_KEY`, `LLM_INTENT_MODEL`, and `LLM_EXTRACT_MODEL` can instead target any OpenAI-compatible `/chat/completions`
 endpoint, including a Groq or Gemini-compatible gateway, without coupling reminder business
 rules to a provider. The model can only propose a task and time; the authenticated Telegram
 sender, ownership checks, user-timezone attachment, future time validation, and database
@@ -96,15 +99,19 @@ test target.
 
 ## Structured logs
 
-The backend writes concise structured text lines to stdout by default. Set `LOG_LEVEL=DEBUG` and
-`LOG_FORMAT=json` for detailed machine-readable output, or `LOG_INCLUDE_TRACEBACK=true` when a
-full traceback is needed. Useful events include `http_request_completed`,
+The API and worker write concise Colorama-coloured text lines to stdout by default. Set
+`LOG_COLOR=false` for plain text, `LOG_LEVEL=DEBUG` for lower-level diagnostics, or
+`LOG_FORMAT=json` for machine-readable output (JSON never contains ANSI colour codes).
+Set `LOG_INCLUDE_TRACEBACK=true` when a full traceback is needed. Useful events include
+`http_request_completed`,
 `webhook_auth_failed`, `telegram_update_received`, `telegram_api_request_started`,
 `telegram_api_response_received`, `telegram_api_request_failed`, `telegram_delivery_failed`,
 `telegram_response_delivery_attempt`, `telegram_response_delivery_retry`,
-`telegram_update_processed`, `reminder_command_started`, `reminder_intent_rules_finished`,
+`telegram_update_handled`, `telegram_update_processed`, `reminder_command_started`,
+`reminder_intent_rules_finished`,
 `reminder_intent_interpreted`, `reminder_schedule_rejected`, `reminder_created`,
-`reminder_persistence_failed`, `notification_worker_started`,
+`clarification_session_saved`, `reminder_notification_scheduled`,
+`reminder_confirmation_staged`, `reminder_persistence_failed`, `notification_worker_started`,
 `notification_worker_iteration_started`, `notification_claimed`,
 `notification_delivery_attempt_started`, `notification_delivered`, and
 `notification_delivery_failed`, and `notification_delivery_outcome_recorded`. Logs include request IDs, update IDs, notification IDs, status

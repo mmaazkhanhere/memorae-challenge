@@ -4,22 +4,49 @@ import hashlib
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from uuid import UUID
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from reminder_agent.db.models import (
     ChannelIdentity,
+    ConversationSession,
     IdempotencyRecord,
     Notification,
     Reminder,
     ReminderOccurrence,
     User,
 )
-from reminder_agent.intent import IntentInterpreter
+from reminder_agent.conversations import (
+    AWAITING_CLARIFICATION,
+    end_session,
+    load_session,
+    pending_from_session,
+    session_expired,
+    telegram_session_id,
+)
+from reminder_agent.conversation_router import (
+    ConversationRoute,
+    route_message,
+    social_response,
+    unrelated_response,
+)
+from reminder_agent.intent import (
+    CreateOneTimeReminderIntent,
+    IntentRoute,
+    IntentRouter,
+    IntentInterpreter,
+    Interpretation,
+    PendingReminder,
+    ReminderIntentInterpreter,
+    RuleBasedIntentInterpreter,
+    restrict_to_explicit_field_updates,
+)
 from reminder_agent.observability import get_logger, log_event
 from reminder_agent.telegram import TelegramUpdate
 
@@ -112,7 +139,14 @@ def _store_response(
             request_hash=_request_hash(update),
             status="SUCCEEDED",
             delivery_status="PENDING",
-            response={"chat_id": reply.chat_id, "text": reply.text, "reply_markup": None},
+            response={
+                "chat_id": reply.chat_id,
+                "text": reply.text,
+                "reply_markup": None,
+                # Kept only in the durable idempotency record so the intent
+                # classifier can receive the last 34 turns; never log it.
+                "request_text": update.message.text or "",
+            },
             created_at=now,
             updated_at=now,
         )
@@ -163,6 +197,249 @@ def _recover_from_idempotency_race(
     return _reply_from_record(record)
 
 
+def _interpret(
+    interpreter: IntentInterpreter,
+    text: str,
+    *,
+    timezone_name: str,
+    now: datetime,
+    context: PendingReminder | None,
+    recent_messages: list[str],
+):
+    """Always pass the pending context when one exists."""
+    if isinstance(interpreter, ReminderIntentInterpreter):
+        return interpreter.interpret(
+            text,
+            timezone_name=timezone_name,
+            now=now,
+            context=context,
+            recent_messages=recent_messages,
+        )
+    if context is None:
+        return interpreter.interpret(text, timezone_name=timezone_name, now=now)
+    return interpreter.interpret(text, timezone_name=timezone_name, now=now, context=context)
+
+
+def _recent_messages(db: Session, *, user_id: UUID) -> list[str]:
+    records = db.scalars(
+        select(IdempotencyRecord)
+        .where(
+            IdempotencyRecord.source == TELEGRAM,
+            IdempotencyRecord.user_id == user_id,
+        )
+        .order_by(IdempotencyRecord.created_at.desc())
+        .limit(34)
+    ).all()
+    messages: list[str] = []
+    for record in reversed(records):
+        if not isinstance(record.response, dict):
+            continue
+        request_text = record.response.get("request_text")
+        response_text = record.response.get("text")
+        if isinstance(request_text, str):
+            messages.append(f"user: {request_text}")
+        if isinstance(response_text, str):
+            messages.append(f"assistant: {response_text}")
+    return messages[-34:]
+
+
+def _route_and_interpret(
+    interpreter: IntentInterpreter,
+    text: str,
+    *,
+    timezone_name: str,
+    now: datetime,
+    pending: PendingReminder | None,
+    user_name: str | None,
+    intent_router: IntentRouter | None = None,
+    recent_messages: list[str] | None = None,
+) -> tuple[ConversationRoute, Interpretation]:
+    """Route first, then interpret only the route that permits it."""
+    route = route_message(text, pending=pending).route
+    classifier_selected_update = False
+    log_event(
+        logger,
+        logging.INFO,
+        "reminder_route_deterministic",
+        route=route,
+        has_pending=pending is not None,
+    )
+    if route is ConversationRoute.MODEL_FALLBACK and intent_router is not None:
+        log_event(
+            logger,
+            logging.INFO,
+            "reminder_route_classifier_requested",
+            has_pending=pending is not None,
+            recent_message_count=min(len(recent_messages or []), 34),
+        )
+        suggestion = intent_router.classify(
+            text,
+            pending=pending,
+            recent_messages=recent_messages or [],
+        ).operation
+        log_event(
+            logger,
+            logging.INFO,
+            "reminder_route_classifier_selected",
+            operation=suggestion,
+        )
+        if suggestion is IntentRoute.NEW_REQUEST:
+            route = ConversationRoute.NEW_REQUEST
+        elif suggestion is IntentRoute.UPDATE_PENDING and pending is not None:
+            route = ConversationRoute.CLARIFICATION_REPLY
+            classifier_selected_update = True
+        elif suggestion is IntentRoute.CANCEL_PENDING and pending is not None:
+            route = ConversationRoute.CANCELLATION
+        elif suggestion is IntentRoute.SOCIAL:
+            route = ConversationRoute.SOCIAL
+        elif suggestion is IntentRoute.UNRELATED:
+            route = ConversationRoute.UNRELATED
+        else:
+            log_event(
+                logger,
+                logging.INFO,
+                "reminder_route_uncertain",
+                has_pending=pending is not None,
+            )
+            return ConversationRoute.UNRELATED, Interpretation(
+                response_text=(
+                    "I’m not sure whether you want a new reminder or to update your unfinished "
+                    "one. Please say which reminder you mean."
+                ),
+                fallback_allowed=False,
+            )
+    if route is ConversationRoute.CANCELLATION:
+        interpretation = Interpretation(
+            response_text="Okay, I won't create that reminder.",
+            fallback_allowed=False,
+            clear_context=True,
+        )
+    elif route is ConversationRoute.SOCIAL:
+        interpretation = Interpretation(
+            response_text=social_response(text, user_name=user_name),
+            fallback_allowed=False,
+        )
+    elif route is ConversationRoute.UNRELATED:
+        interpretation = Interpretation(
+            response_text=unrelated_response(text, pending=pending),
+            fallback_allowed=False,
+        )
+    else:
+        interpretation = _interpret(
+            interpreter,
+            text,
+            timezone_name=timezone_name,
+            now=now,
+            context=(
+                pending
+                if route
+                in {ConversationRoute.CLARIFICATION_REPLY, ConversationRoute.MODEL_FALLBACK}
+                else None
+            ),
+            recent_messages=recent_messages or [],
+        )
+    if interpretation.field_updates is not None:
+        if pending is None:
+            interpretation = Interpretation(
+                response_text="Please tell me the reminder task and a future time.",
+                fallback_allowed=False,
+            )
+        else:
+            proposed_fields = interpretation.field_updates.supplied_fields()
+            verified_updates = restrict_to_explicit_field_updates(
+                text,
+                interpretation.field_updates,
+                context=pending,
+                now=now,
+                allow_task_replacement=classifier_selected_update,
+                allow_semantic_field_updates=classifier_selected_update,
+            )
+            interpretation = RuleBasedIntentInterpreter().apply_field_updates(
+                pending,
+                verified_updates,
+                now=now,
+            )
+            accepted_fields = verified_updates.supplied_fields()
+            log_event(
+                logger,
+                logging.INFO,
+                "pending_update_applied",
+                proposed_fields=sorted(proposed_fields),
+                accepted_fields=sorted(accepted_fields),
+                rejected_fields=sorted(proposed_fields - accepted_fields),
+                completed=interpretation.intent is not None,
+                needs_clarification=interpretation.clarification is not None,
+            )
+    return route, interpretation
+
+
+def _upsert_clarification_session(
+    db: Session,
+    *,
+    user_id: UUID,
+    external_session_id: str,
+    pending: PendingReminder,
+    now: datetime,
+) -> ConversationSession:
+    values = {
+        "id": uuid4(),
+        "user_id": user_id,
+        "channel_type": TELEGRAM,
+        "external_session_id": external_session_id,
+        "active_reminder_id": None,
+        "pending_clarification": pending.model_dump(mode="json"),
+        "status": AWAITING_CLARIFICATION,
+        "version": 1,
+        "updated_at": _now_utc(now),
+    }
+    dialect = db.get_bind().dialect.name
+    if dialect == "postgresql":
+        statement = pg_insert(ConversationSession).values(values)
+        statement = statement.on_conflict_do_update(
+            index_elements=[
+                ConversationSession.user_id,
+                ConversationSession.channel_type,
+                ConversationSession.external_session_id,
+            ],
+            set_={
+                "pending_clarification": values["pending_clarification"],
+                "status": AWAITING_CLARIFICATION,
+                "active_reminder_id": None,
+                "version": ConversationSession.version + 1,
+                "updated_at": values["updated_at"],
+            },
+        )
+        db.execute(statement)
+    elif dialect == "sqlite":
+        statement = sqlite_insert(ConversationSession).values(values)
+        statement = statement.on_conflict_do_update(
+            index_elements=[
+                ConversationSession.user_id,
+                ConversationSession.channel_type,
+                ConversationSession.external_session_id,
+            ],
+            set_={
+                "pending_clarification": values["pending_clarification"],
+                "status": AWAITING_CLARIFICATION,
+                "active_reminder_id": None,
+                "version": ConversationSession.version + 1,
+                "updated_at": values["updated_at"],
+            },
+        )
+        db.execute(statement)
+    else:  # pragma: no cover - supported deployments use PostgreSQL or SQLite tests
+        db.add(ConversationSession(**values))
+    session = db.scalar(
+        select(ConversationSession).where(
+            ConversationSession.user_id == user_id,
+            ConversationSession.channel_type == TELEGRAM,
+            ConversationSession.external_session_id == external_session_id,
+        )
+    )
+    assert session is not None
+    return session
+
+
 def handle_reminder_text(
     db: Session,
     update: TelegramUpdate,
@@ -171,9 +448,11 @@ def handle_reminder_text(
     identity_id: UUID,
     telegram_user_id: int,
     interpreter: IntentInterpreter,
+    intent_router: IntentRouter | None = None,
     now: datetime,
+    session_ttl_seconds: int = 900,
 ) -> ReminderReply:
-    """Interpret and transactionally create one one-time reminder for a Telegram user."""
+    """Interpret and transactionally create one or more reminders for a Telegram user."""
     assert update.message is not None
     log_event(
         logger,
@@ -253,16 +532,67 @@ def handle_reminder_text(
             "Your saved time zone is invalid; please update it.",
         )
 
-    interpretation = interpreter.interpret(
-        update.message.text or "", timezone_name=timezone_name, now=now
+    session = load_session(
+        db,
+        user_id=user.id,
+        external_session_id=telegram_session_id(update.message.chat.id),
+        now=now,
+        ttl_seconds=session_ttl_seconds,
     )
+    session_is_expired = session is not None and session_expired(
+        session, now=now, ttl_seconds=session_ttl_seconds
+    )
+    pending = None if session_is_expired else pending_from_session(session)
+    text = update.message.text or ""
+    recent_messages = _recent_messages(db, user_id=user.id)
+    log_event(
+        logger,
+        logging.INFO,
+        "reminder_context_loaded",
+        update_id=update.update_id,
+        has_pending=pending is not None,
+        session_expired=session_is_expired,
+        pending_field_count=(
+            sum(value is not None for value in pending.model_dump().values())
+            if pending is not None
+            else 0
+        ),
+        recent_message_count=len(recent_messages),
+    )
+    observed_session_version = None if session_is_expired or session is None else session.version
+    if session_is_expired:
+        interpretation = None
+    else:
+        route, interpretation = _route_and_interpret(
+            interpreter,
+            text,
+            timezone_name=timezone_name,
+            now=now,
+            pending=pending,
+            user_name=user.name,
+            intent_router=intent_router,
+            recent_messages=recent_messages,
+        )
+    if interpretation is None:
+        interpretation = Interpretation(
+            response_text="That clarification expired. Please send the complete reminder again.",
+            fallback_allowed=False,
+        )
+        route = ConversationRoute.UNRELATED
     log_event(
         logger,
         logging.INFO,
         "reminder_intent_interpreted",
         update_id=update.update_id,
-        has_intent=interpretation.intent is not None,
-        task_length=len(interpretation.intent.task) if interpretation.intent else None,
+        has_intent=bool(interpretation.resolved_intents),
+        intent_count=len(interpretation.resolved_intents),
+        needs_clarification=interpretation.clarification is not None,
+        route=route,
+        task_length=(
+            len(interpretation.resolved_intents[0].task)
+            if interpretation.resolved_intents
+            else None
+        ),
         fallback_allowed=interpretation.fallback_allowed,
     )
     db.rollback()
@@ -307,7 +637,134 @@ def handle_reminder_text(
                     response_kind="authorization_failure",
                 )
 
-            if interpretation.intent is None:
+            locked_session = load_session(
+                db,
+                user_id=user.id,
+                external_session_id=telegram_session_id(update.message.chat.id),
+                now=now,
+                ttl_seconds=session_ttl_seconds,
+                for_update=True,
+            )
+            if pending is not None and locked_session is None:
+                return _store_response(
+                    db,
+                    update=update,
+                    user_id=user.id,
+                    text="That clarification expired. Please send the complete reminder again.",
+                    response_kind="clarification_expired",
+                )
+            if session_is_expired and locked_session is None:
+                return _store_response(
+                    db,
+                    update=update,
+                    user_id=user.id,
+                    text="That clarification expired. Please send the complete reminder again.",
+                    response_kind="clarification_expired",
+                )
+
+            if (
+                locked_session is not None
+                and (
+                    observed_session_version is None
+                    or locked_session.version != observed_session_version
+                )
+            ):
+                # Another update committed while this message was being
+                # interpreted (potentially during a provider call).  Re-route
+                # and re-interpret against the locked, latest session instead
+                # of saving an interpretation derived from stale fields.
+                pending = pending_from_session(locked_session)
+                route, interpretation = _route_and_interpret(
+                    interpreter,
+                    text,
+                    timezone_name=user.timezone,
+                    now=now,
+                    pending=pending,
+                    user_name=user.name,
+                    intent_router=intent_router,
+                    recent_messages=_recent_messages(db, user_id=user.id),
+                )
+                observed_session_version = locked_session.version
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "reminder_session_reinterpreted",
+                    update_id=update.update_id,
+                    session_version=observed_session_version,
+                    route=route,
+                )
+
+            if route in {ConversationRoute.UNRELATED, ConversationRoute.SOCIAL}:
+                # Do not parse, extend, or overwrite a pending reminder for
+                # conversational text that the router found unrelated.
+                return _store_response(
+                    db,
+                    update=update,
+                    user_id=user.id,
+                    text=interpretation.response_text
+                    or "I didn't find a reminder request in that message.",
+                    response_kind=("social" if route is ConversationRoute.SOCIAL else "unrelated"),
+                )
+
+            if interpretation.clarification is not None:
+                clarification = interpretation.clarification
+                if locked_session is None:
+                    locked_session = _upsert_clarification_session(
+                        db,
+                        user_id=user.id,
+                        external_session_id=telegram_session_id(update.message.chat.id),
+                        pending=clarification.pending,
+                        now=now,
+                    )
+                else:
+                    if locked_session.version != observed_session_version:
+                        raise RuntimeError("conversation session version changed before save")
+                    locked_session.pending_clarification = clarification.pending.model_dump(mode="json")
+                    locked_session.status = AWAITING_CLARIFICATION
+                    locked_session.active_reminder_id = None
+                    locked_session.version += 1
+                    locked_session.updated_at = _now_utc(now)
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "clarification_session_saved",
+                    update_id=update.update_id,
+                    session_id=str(locked_session.id),
+                    session_version=locked_session.version,
+                    missing_task=clarification.pending.task is None,
+                    missing_date=clarification.pending.date_local is None,
+                    missing_time=clarification.pending.hour is None,
+                )
+                return _store_response(
+                    db,
+                    update=update,
+                    user_id=user.id,
+                    text=clarification.question,
+                    response_kind="clarification",
+                )
+
+            intents = interpretation.resolved_intents
+            if not intents:
+                if interpretation.clear_context and locked_session is not None:
+                    end_session(locked_session, now=now)
+                    return _store_response(
+                        db,
+                        update=update,
+                        user_id=user.id,
+                        text=interpretation.response_text
+                        or "Okay, I won't create that reminder.",
+                        response_kind="clarification_canceled",
+                    )
+                if locked_session is not None and locked_session.pending_clarification:
+                    pending_session = pending_from_session(locked_session)
+                    if pending_session is not None:
+                        return _store_response(
+                            db,
+                            update=update,
+                            user_id=user.id,
+                            text="Please answer the pending clarification before creating a reminder.",
+                            response_kind="clarification",
+                        )
                 return _store_response(
                     db,
                     update=update,
@@ -317,40 +774,42 @@ def handle_reminder_text(
                     response_kind="clarification",
                 )
 
-            if interpretation.intent.timezone_name != user.timezone:
-                log_event(
-                    logger,
-                    logging.ERROR,
-                    "reminder_timezone_mismatch",
-                    update_id=update.update_id,
-                )
-                return _store_response(
-                    db,
-                    update=update,
-                    user_id=user.id,
-                    text="I couldn't verify the reminder time zone. Please try again.",
-                    response_kind="timezone_validation_failure",
-                )
-
-            due_at = _now_utc(interpretation.intent.due_at)
             reference = _now_utc(now)
-            if due_at <= reference:
-                log_event(
-                    logger,
-                    logging.WARNING,
-                    "reminder_schedule_rejected",
-                    update_id=update.update_id,
-                    reason="past_or_present_due_time",
-                )
-                return _store_response(
-                    db,
-                    update=update,
-                    user_id=user.id,
-                    text="Please choose a future time for the reminder.",
-                    response_kind="schedule_validation_failure",
-                )
             try:
-                local_display = _local_display(due_at, user.timezone)
+                zone = ZoneInfo(user.timezone)
+                scheduled: list[tuple[CreateOneTimeReminderIntent, datetime, str]] = []
+                for intent in intents:
+                    if intent.timezone_name != user.timezone:
+                        log_event(
+                            logger,
+                            logging.ERROR,
+                            "reminder_timezone_mismatch",
+                            update_id=update.update_id,
+                        )
+                        return _store_response(
+                            db,
+                            update=update,
+                            user_id=user.id,
+                            text="I couldn't verify the reminder time zone. Please try again.",
+                            response_kind="timezone_validation_failure",
+                        )
+                    due_at = _now_utc(intent.due_at)
+                    if due_at <= reference:
+                        log_event(
+                            logger,
+                            logging.WARNING,
+                            "reminder_schedule_rejected",
+                            update_id=update.update_id,
+                            reason="past_or_present_due_time",
+                        )
+                        return _store_response(
+                            db,
+                            update=update,
+                            user_id=user.id,
+                            text="Please choose a future time for each reminder.",
+                            response_kind="schedule_validation_failure",
+                        )
+                    scheduled.append((intent, due_at, _local_display(due_at, user.timezone)))
             except ZoneInfoNotFoundError:
                 log_event(
                     logger,
@@ -367,37 +826,55 @@ def handle_reminder_text(
                     response_kind="schedule_validation_failure",
                 )
 
-            reminder = Reminder(
-                user_id=user.id,
-                task=interpretation.intent.task,
-                schedule_type=ONE_TIME,
-                start_local=due_at.astimezone(ZoneInfo(user.timezone)).isoformat(),
-                timezone=user.timezone,
-                recurrence_rule=None,
-                status=ACTIVE,
-                version=1,
-            )
-            db.add(reminder)
-            db.flush()
-            occurrence = ReminderOccurrence(
-                reminder_id=reminder.id,
-                scheduled_at=due_at,
-                next_due_at=due_at,
-                status=PENDING,
-            )
-            db.add(occurrence)
-            db.flush()
-            db.add(
-                Notification(
-                    occurrence_id=occurrence.id,
-                    destination_identity_id=identity.id,
-                    sequence=1,
-                    due_at=due_at,
-                    status=PENDING,
-                    attempt_count=0,
+            if locked_session is not None:
+                end_session(locked_session, now=now)
+
+            confirmations: list[str] = []
+            for intent, due_at, local_display in scheduled:
+                reminder = Reminder(
+                    user_id=user.id,
+                    task=intent.task,
+                    schedule_type=ONE_TIME,
+                    start_local=due_at.astimezone(zone).isoformat(),
+                    timezone=user.timezone,
+                    recurrence_rule=None,
+                    status=ACTIVE,
+                    version=1,
                 )
-            )
-            text = f"I'll remind you to {reminder.task} on {local_display} via Telegram."
+                db.add(reminder)
+                db.flush()
+                occurrence = ReminderOccurrence(
+                    reminder_id=reminder.id,
+                    scheduled_at=due_at,
+                    next_due_at=due_at,
+                    status=PENDING,
+                )
+                db.add(occurrence)
+                db.flush()
+                db.add(
+                    Notification(
+                        occurrence_id=occurrence.id,
+                        destination_identity_id=identity.id,
+                        sequence=1,
+                        due_at=due_at,
+                        status=PENDING,
+                        attempt_count=0,
+                    )
+                )
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "reminder_notification_scheduled",
+                    update_id=update.update_id,
+                    reminder_id=str(reminder.id),
+                    occurrence_id=str(occurrence.id),
+                    due_at=due_at.isoformat(),
+                    delivery_channel=TELEGRAM,
+                )
+                confirmations.append(
+                    f"I'll remind you to {reminder.task} on {local_display} via Telegram."
+                )
+            text = "\n".join(confirmations)
             reply = _store_response(
                 db,
                 update=update,
@@ -405,6 +882,20 @@ def handle_reminder_text(
                 text=text,
                 response_kind="confirmation",
             )
+            log_event(
+                logger,
+                logging.INFO,
+                "reminder_confirmation_staged",
+                update_id=update.update_id,
+                reminder_count=len(scheduled),
+            )
+        log_event(
+            logger,
+            logging.INFO,
+            "reminder_transaction_committed",
+            update_id=update.update_id,
+            reminder_count=len(scheduled),
+        )
     except IntegrityError as exc:
         duplicate = _recover_from_idempotency_race(db, update)
         if duplicate is not None:
@@ -432,7 +923,7 @@ def handle_reminder_text(
         logging.INFO,
         "reminder_created",
         update_id=update.update_id,
-        task_length=len(interpretation.intent.task),
+        intent_count=len(interpretation.resolved_intents),
         schedule_type=ONE_TIME,
         notification_status=PENDING,
     )

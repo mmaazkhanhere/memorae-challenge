@@ -327,6 +327,15 @@ class HttpTelegramClient:
             )
         result = payload.get("result") or {}
         provider_message_id = result.get("message_id")
+        log_event(
+            logger,
+            logging.INFO,
+            "telegram_api_message_accepted",
+            provider_host=host,
+            provider_message_id=(
+                str(provider_message_id) if provider_message_id is not None else None
+            ),
+        )
         return TelegramDeliveryResult(
             provider_message_id=(
                 str(provider_message_id) if provider_message_id is not None else None

@@ -201,6 +201,47 @@ class Notification(Base):
     )
 
 
+class ConversationSession(Base):
+    __tablename__ = "conversation_sessions"
+    __table_args__ = (
+        CheckConstraint(
+            "channel_type IN ('TELEGRAM', 'VOICE_CALL')",
+            name="ck_conversation_sessions_channel_type",
+        ),
+        CheckConstraint(
+            "status IN ('ACTIVE', 'AWAITING_CLARIFICATION', 'ENDED')",
+            name="ck_conversation_sessions_status",
+        ),
+        UniqueConstraint(
+            "user_id",
+            "channel_type",
+            "external_session_id",
+            name="uq_conversation_sessions_external",
+        ),
+        Index("ix_conversation_sessions_user_status", "user_id", "status"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    user_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    channel_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    external_session_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    active_reminder_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("reminders.id", ondelete="SET NULL"), nullable=True
+    )
+    pending_clarification: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(30), nullable=False, default="ACTIVE", server_default="ACTIVE"
+    )
+    version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
 class IdempotencyRecord(Base):
     __tablename__ = "idempotency_records"
     __table_args__ = (
