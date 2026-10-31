@@ -56,6 +56,7 @@ _ACKNOWLEDGEMENTS = {
     "thanks",
     "thank you",
 }
+_CONFIRMATION_WORDS = {"yes", "yeah", "okay", "ok", "sure", "no", "nope"}
 _GREETINGS = {
     "hi",
     "hello",
@@ -92,8 +93,10 @@ def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecisio
 
     if normalized in _CANCELLATIONS:
         return RouteDecision(ConversationRoute.CANCELLATION)
-    if normalized in _ACKNOWLEDGEMENTS:
+    if normalized in _CONFIRMATION_WORDS:
         return RouteDecision(ConversationRoute.CLARIFICATION_REPLY)
+    if normalized in _ACKNOWLEDGEMENTS:
+        return RouteDecision(ConversationRoute.SOCIAL)
     if _NEW_REMINDER.match(raw):
         # A complete new command intentionally supersedes a stale draft rather
         # than being parsed as an edit to its task or schedule.
@@ -103,9 +106,6 @@ def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecisio
     # a new reminder, an answer to the pending question, or something else;
     # preserve context and let the interpreter decide semantically.
     if _TASK_CORRECTION.match(raw):
-        return RouteDecision(ConversationRoute.CLARIFICATION_REPLY)
-
-    if pending.task is None and raw and not _QUESTION.match(raw):
         return RouteDecision(ConversationRoute.CLARIFICATION_REPLY)
 
     # A follow-up that cannot be verified as a simple field is context-aware

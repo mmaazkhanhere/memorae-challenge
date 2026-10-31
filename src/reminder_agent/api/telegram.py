@@ -114,6 +114,7 @@ def telegram_webhook(
             update,
             default_region=request.app.state.settings.phone_default_region,
             reminder_interpreter=request.app.state.reminder_interpreter,
+            intent_router=request.app.state.intent_router,
             now=request.app.state.clock(),
             session_ttl_seconds=request.app.state.settings.conversation_session_ttl_seconds,
         )

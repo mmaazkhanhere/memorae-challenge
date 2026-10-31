@@ -23,7 +23,8 @@ class Settings(BaseSettings):
     notification_retry_base_delay_seconds: float = Field(default=30.0, gt=0, le=3600)
     llm_base_url: str = "https://api.openai.com/v1"
     llm_api_key: str | None = None
-    llm_model: str = "gpt-6-luna"
+    llm_extract_model: str = "gpt-5.4-mini-2026-03-17"
+    llm_intent_model: str = "openai/gpt-oss-20b"
     llm_timeout_seconds: float = Field(default=10.0, gt=0)
     conversation_session_ttl_seconds: int = Field(default=900, ge=60, le=86400)
     phone_default_region: str | None = None

@@ -312,6 +312,7 @@ def _handle_message(
     update: TelegramUpdate,
     *,
     reminder_interpreter=None,
+    intent_router=None,
     now: datetime | None = None,
     session_ttl_seconds: int = 900,
 ) -> OnboardingReply:
@@ -351,6 +352,7 @@ def _handle_message(
             identity_id=identity.id,
             telegram_user_id=update.message.from_user.id,
             interpreter=reminder_interpreter or ReminderIntentInterpreter(),
+            intent_router=intent_router,
             now=now or datetime.now(timezone.utc),
             session_ttl_seconds=session_ttl_seconds,
         )
@@ -802,6 +804,7 @@ def handle_update(
     *,
     default_region: str | None = None,
     reminder_interpreter=None,
+    intent_router=None,
     now: datetime | None = None,
     session_ttl_seconds: int = 900,
 ) -> OnboardingReply | None:
@@ -823,6 +826,7 @@ def handle_update(
         db,
         update,
         reminder_interpreter=reminder_interpreter,
+        intent_router=intent_router,
         now=now,
         session_ttl_seconds=session_ttl_seconds,
     )

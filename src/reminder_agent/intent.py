@@ -5,7 +5,8 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any, Literal, Protocol
+from enum import StrEnum
+from typing import Any, Literal, Protocol, Sequence
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -15,6 +16,112 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from reminder_agent.observability import get_logger, log_event
 
 logger = get_logger()
+
+
+class IntentRoute(StrEnum):
+    NEW_REQUEST = "NEW_REQUEST"
+    UPDATE_PENDING = "UPDATE_PENDING"
+    CANCEL_PENDING = "CANCEL_PENDING"
+    SOCIAL = "SOCIAL"
+    UNRELATED = "UNRELATED"
+    UNCERTAIN = "UNCERTAIN"
+
+
+class IntentRouteSuggestion(BaseModel):
+    """A non-authoritative route proposed by the intent-classification model."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    operation: IntentRoute
+
+
+class IntentRouter(Protocol):
+    def classify(
+        self,
+        text: str,
+        *,
+        pending: "PendingReminder | None",
+        recent_messages: Sequence[str],
+    ) -> IntentRouteSuggestion: ...
+
+
+class OpenAICompatibleIntentRouter:
+    """Classify an ambiguous turn without extracting or modifying reminder data."""
+
+    def __init__(self, base_url: str, api_key: str, model: str, timeout_seconds: float = 10.0) -> None:
+        self._url = base_url.rstrip("/") + "/chat/completions"
+        self._api_key = api_key
+        self._model = model
+        self._timeout = timeout_seconds
+
+    def classify(
+        self,
+        text: str,
+        *,
+        pending: "PendingReminder | None",
+        recent_messages: Sequence[str],
+    ) -> IntentRouteSuggestion:
+        log_event(
+            logger,
+            logging.INFO,
+            "intent_classification_started",
+            model=self._model,
+            has_pending=pending is not None,
+            recent_message_count=min(len(recent_messages), 34),
+        )
+        prompt = (
+            "Return JSON only: {\"operation\": one of NEW_REQUEST, UPDATE_PENDING, "
+            "CANCEL_PENDING, SOCIAL, UNRELATED, UNCERTAIN}. Classify intent only; do not "
+            "extract reminder fields, suggest values, or execute anything. NEW_REQUEST is an "
+            "independent reminder; UPDATE_PENDING changes the supplied draft. If the message "
+            "could reasonably mean either, return UNCERTAIN."
+        )
+        payload = {
+            "model": self._model,
+            "messages": [
+                {"role": "system", "content": prompt},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "latest_message": text,
+                            "pending": pending.model_dump(mode="json") if pending else None,
+                            "recent_messages": list(recent_messages)[-34:],
+                        }
+                    ),
+                },
+            ],
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+        }
+        try:
+            response = httpx.post(
+                self._url,
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                json=payload,
+                timeout=self._timeout,
+            )
+            response.raise_for_status()
+            content = response.json()["choices"][0]["message"]["content"]
+            data = json.loads(content) if isinstance(content, str) else content
+            suggestion = IntentRouteSuggestion.model_validate(data)
+            log_event(
+                logger,
+                logging.INFO,
+                "intent_classification_completed",
+                model=self._model,
+                operation=suggestion.operation,
+            )
+            return suggestion
+        except (httpx.HTTPError, KeyError, TypeError, ValueError, ValidationError, json.JSONDecodeError):
+            log_event(
+                logger,
+                logging.WARNING,
+                "intent_router_failed",
+                model=self._model,
+                reason="provider_or_schema_error",
+            )
+            return IntentRouteSuggestion(operation=IntentRoute.UNCERTAIN)
 
 
 class CreateOneTimeReminderIntent(BaseModel):
@@ -356,6 +463,7 @@ def restrict_to_explicit_field_updates(
     *,
     context: PendingReminder,
     now: datetime,
+    allow_task_replacement: bool = False,
 ) -> PendingReminderFieldUpdate:
     """Keep only provider updates demonstrably present in the user's reply.
 
@@ -379,6 +487,12 @@ def restrict_to_explicit_field_updates(
         if proposed.minute == expected_minute:
             permitted["minute"] = proposed.minute
         if proposed.meridiem == expected_meridiem and expected_meridiem is not None:
+            permitted["meridiem"] = proposed.meridiem
+    elif proposed.meridiem is not None and raw.lower().strip(" .,!?") in {"am", "pm"}:
+        # A standalone AM/PM answer is a valid response to an outstanding
+        # ambiguous-hour clarification; it has no hour token to match.
+        expected_meridiem = _normalise_meridiem(raw)
+        if proposed.meridiem == expected_meridiem:
             permitted["meridiem"] = proposed.meridiem
 
     if day is not None:
@@ -407,6 +521,12 @@ def restrict_to_explicit_field_updates(
             corrected_task = _task_from_remainder(correction.group("task"))
             if corrected_task and _same_task(proposed.task, corrected_task):
                 permitted["task"] = proposed.task
+        # The backend has already selected the user's locked pending draft and
+        # the classifier has identified this turn as UPDATE_PENDING.  In that
+        # case a nonblank, schema-validated task patch is an explicit
+        # replacement; do not require a particular natural-language phrase.
+        elif allow_task_replacement:
+            permitted["task"] = proposed.task
 
     return PendingReminderFieldUpdate.model_validate(permitted)
 
@@ -909,6 +1029,7 @@ class OpenAICompatibleIntentInterpreter:
             model=self._model,
             input_length=len(text.strip()),
             timezone=timezone_name,
+            has_pending_context=context is not None,
         )
         prompt = (
             "Return JSON only. For one complete request use operation "
@@ -966,7 +1087,7 @@ class OpenAICompatibleIntentInterpreter:
                 "reminder_intent_provider_response",
                 endpoint_host=endpoint_host,
                 model=self._model,
-                generated_content=content,
+                response_length=len(content) if isinstance(content, str) else None,
             )
             data = json.loads(content) if isinstance(content, str) else content
             if not isinstance(data, dict):
@@ -980,6 +1101,15 @@ class OpenAICompatibleIntentInterpreter:
                     updates = PendingReminderFieldUpdate.model_validate(raw_updates)
                     if not updates.supplied_fields():
                         raise ValueError("pending update had no supplied fields")
+                    log_event(
+                        logger,
+                        logging.INFO,
+                        "reminder_extraction_completed",
+                        model=self._model,
+                        operation=operation,
+                        field_count=len(updates.supplied_fields()),
+                        has_pending_context=True,
+                    )
                     return Interpretation(field_updates=updates, fallback_allowed=False)
                 if operation == "UNKNOWN":
                     return Interpretation(
@@ -1019,6 +1149,15 @@ class OpenAICompatibleIntentInterpreter:
                 question = data.get("question")
                 if not isinstance(question, str) or not question.strip():
                     raise ValueError("missing clarification question")
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "reminder_extraction_completed",
+                    model=self._model,
+                    operation=operation,
+                    field_count=sum(value is not None for value in pending_values.values()),
+                    has_pending_context=False,
+                )
                 return Interpretation(
                     clarification=NeedsClarification(pending=pending, question=question)
                 )
@@ -1078,6 +1217,15 @@ class OpenAICompatibleIntentInterpreter:
             log_event(
                 logger,
                 logging.INFO,
+                "reminder_extraction_completed",
+                model=self._model,
+                operation=operation,
+                field_count=2,
+                has_pending_context=False,
+            )
+            log_event(
+                logger,
+                logging.INFO,
                 "reminder_intent_provider_finished",
                 endpoint_host=endpoint_host,
                 model=self._model,
@@ -1092,7 +1240,7 @@ class OpenAICompatibleIntentInterpreter:
             ValueError,
             ValidationError,
             json.JSONDecodeError,
-        ):
+        ) as exc:
             log_event(
                 logger,
                 logging.ERROR,
@@ -1100,6 +1248,12 @@ class OpenAICompatibleIntentInterpreter:
                 endpoint_host=endpoint_host,
                 model=self._model,
                 error_type="provider_or_schema_error",
+                has_pending_context=context is not None,
+                error_message=(
+                    exc.errors(include_url=False)
+                    if isinstance(exc, ValidationError)
+                    else str(exc)
+                ),
             )
             return Interpretation(
                 response_text=(

@@ -49,7 +49,7 @@ only handles short greetings and thanks plus unambiguous one-time reminders such
 Anything requiring context, a clarification, recurrence, or conversational interpretation falls
 back to the configured model. By default, a configured API key uses
 OpenAI's `https://api.openai.com/v1` endpoint and the `gpt-6-luna` model. `LLM_BASE_URL`,
-`LLM_API_KEY`, and `LLM_MODEL` can instead target any OpenAI-compatible `/chat/completions`
+`LLM_API_KEY`, `LLM_INTENT_MODEL`, and `LLM_EXTRACT_MODEL` can instead target any OpenAI-compatible `/chat/completions`
 endpoint, including a Groq or Gemini-compatible gateway, without coupling reminder business
 rules to a provider. The model can only propose a task and time; the authenticated Telegram
 sender, ownership checks, user-timezone attachment, future time validation, and database

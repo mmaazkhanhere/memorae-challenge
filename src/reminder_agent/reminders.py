@@ -38,6 +38,8 @@ from reminder_agent.conversation_router import (
 )
 from reminder_agent.intent import (
     CreateOneTimeReminderIntent,
+    IntentRoute,
+    IntentRouter,
     IntentInterpreter,
     Interpretation,
     PendingReminder,
@@ -136,7 +138,14 @@ def _store_response(
             request_hash=_request_hash(update),
             status="SUCCEEDED",
             delivery_status="PENDING",
-            response={"chat_id": reply.chat_id, "text": reply.text, "reply_markup": None},
+            response={
+                "chat_id": reply.chat_id,
+                "text": reply.text,
+                "reply_markup": None,
+                # Kept only in the durable idempotency record so the intent
+                # classifier can receive the last 34 turns; never log it.
+                "request_text": update.message.text or "",
+            },
             created_at=now,
             updated_at=now,
         )
@@ -201,6 +210,29 @@ def _interpret(
     return interpreter.interpret(text, timezone_name=timezone_name, now=now, context=context)
 
 
+def _recent_messages(db: Session, *, user_id: UUID) -> list[str]:
+    records = db.scalars(
+        select(IdempotencyRecord)
+        .where(
+            IdempotencyRecord.source == TELEGRAM,
+            IdempotencyRecord.user_id == user_id,
+        )
+        .order_by(IdempotencyRecord.created_at.desc())
+        .limit(34)
+    ).all()
+    messages: list[str] = []
+    for record in reversed(records):
+        if not isinstance(record.response, dict):
+            continue
+        request_text = record.response.get("request_text")
+        response_text = record.response.get("text")
+        if isinstance(request_text, str):
+            messages.append(f"user: {request_text}")
+        if isinstance(response_text, str):
+            messages.append(f"assistant: {response_text}")
+    return messages[-34:]
+
+
 def _route_and_interpret(
     interpreter: IntentInterpreter,
     text: str,
@@ -209,9 +241,63 @@ def _route_and_interpret(
     now: datetime,
     pending: PendingReminder | None,
     user_name: str | None,
+    intent_router: IntentRouter | None = None,
+    recent_messages: list[str] | None = None,
 ) -> tuple[ConversationRoute, Interpretation]:
     """Route first, then interpret only the route that permits it."""
     route = route_message(text, pending=pending).route
+    classifier_selected_update = False
+    log_event(
+        logger,
+        logging.INFO,
+        "reminder_route_deterministic",
+        route=route,
+        has_pending=pending is not None,
+    )
+    if route is ConversationRoute.MODEL_FALLBACK and intent_router is not None:
+        log_event(
+            logger,
+            logging.INFO,
+            "reminder_route_classifier_requested",
+            has_pending=pending is not None,
+            recent_message_count=min(len(recent_messages or []), 34),
+        )
+        suggestion = intent_router.classify(
+            text,
+            pending=pending,
+            recent_messages=recent_messages or [],
+        ).operation
+        log_event(
+            logger,
+            logging.INFO,
+            "reminder_route_classifier_selected",
+            operation=suggestion,
+        )
+        if suggestion is IntentRoute.NEW_REQUEST:
+            route = ConversationRoute.NEW_REQUEST
+        elif suggestion is IntentRoute.UPDATE_PENDING and pending is not None:
+            route = ConversationRoute.CLARIFICATION_REPLY
+            classifier_selected_update = True
+        elif suggestion is IntentRoute.CANCEL_PENDING and pending is not None:
+            route = ConversationRoute.CANCELLATION
+        elif suggestion is IntentRoute.SOCIAL:
+            route = ConversationRoute.SOCIAL
+        elif suggestion is IntentRoute.UNRELATED:
+            route = ConversationRoute.UNRELATED
+        else:
+            log_event(
+                logger,
+                logging.INFO,
+                "reminder_route_uncertain",
+                has_pending=pending is not None,
+            )
+            return ConversationRoute.UNRELATED, Interpretation(
+                response_text=(
+                    "I’m not sure whether you want a new reminder or to update your unfinished "
+                    "one. Please say which reminder you mean."
+                ),
+                fallback_allowed=False,
+            )
     if route is ConversationRoute.CANCELLATION:
         interpretation = Interpretation(
             response_text="Okay, I won't create that reminder.",
@@ -248,16 +334,27 @@ def _route_and_interpret(
                 fallback_allowed=False,
             )
         else:
+            proposed_fields = interpretation.field_updates.supplied_fields()
             verified_updates = restrict_to_explicit_field_updates(
                 text,
                 interpretation.field_updates,
                 context=pending,
                 now=now,
+                allow_task_replacement=classifier_selected_update,
             )
             interpretation = RuleBasedIntentInterpreter().apply_field_updates(
                 pending,
                 verified_updates,
                 now=now,
+            )
+            log_event(
+                logger,
+                logging.INFO,
+                "pending_update_applied",
+                proposed_field_count=len(proposed_fields),
+                accepted_field_count=len(verified_updates.supplied_fields()),
+                completed=interpretation.intent is not None,
+                needs_clarification=interpretation.clarification is not None,
             )
     return route, interpretation
 
@@ -337,6 +434,7 @@ def handle_reminder_text(
     identity_id: UUID,
     telegram_user_id: int,
     interpreter: IntentInterpreter,
+    intent_router: IntentRouter | None = None,
     now: datetime,
     session_ttl_seconds: int = 900,
 ) -> ReminderReply:
@@ -432,6 +530,21 @@ def handle_reminder_text(
     )
     pending = None if session_is_expired else pending_from_session(session)
     text = update.message.text or ""
+    recent_messages = _recent_messages(db, user_id=user.id)
+    log_event(
+        logger,
+        logging.INFO,
+        "reminder_context_loaded",
+        update_id=update.update_id,
+        has_pending=pending is not None,
+        session_expired=session_is_expired,
+        pending_field_count=(
+            sum(value is not None for value in pending.model_dump().values())
+            if pending is not None
+            else 0
+        ),
+        recent_message_count=len(recent_messages),
+    )
     observed_session_version = None if session_is_expired or session is None else session.version
     if session_is_expired:
         interpretation = None
@@ -443,6 +556,8 @@ def handle_reminder_text(
             now=now,
             pending=pending,
             user_name=user.name,
+            intent_router=intent_router,
+            recent_messages=recent_messages,
         )
     if interpretation is None:
         interpretation = Interpretation(
@@ -552,6 +667,8 @@ def handle_reminder_text(
                     now=now,
                     pending=pending,
                     user_name=user.name,
+                    intent_router=intent_router,
+                    recent_messages=_recent_messages(db, user_id=user.id),
                 )
                 observed_session_version = locked_session.version
                 log_event(
@@ -758,6 +875,13 @@ def handle_reminder_text(
                 update_id=update.update_id,
                 reminder_count=len(scheduled),
             )
+        log_event(
+            logger,
+            logging.INFO,
+            "reminder_transaction_committed",
+            update_id=update.update_id,
+            reminder_count=len(scheduled),
+        )
     except IntegrityError as exc:
         duplicate = _recover_from_idempotency_race(db, update)
         if duplicate is not None:

@@ -14,7 +14,11 @@ from sqlalchemy.orm import Session
 
 from reminder_agent.api.telegram import router as telegram_router
 from reminder_agent.db.session import get_db
-from reminder_agent.intent import OpenAICompatibleIntentInterpreter, ReminderIntentInterpreter
+from reminder_agent.intent import (
+    OpenAICompatibleIntentInterpreter,
+    OpenAICompatibleIntentRouter,
+    ReminderIntentInterpreter,
+)
 from reminder_agent.observability import configure_logging, log_event, request_id
 from reminder_agent.settings import Settings, get_settings, validate_runtime_settings
 from reminder_agent.telegram import TelegramClient
@@ -61,6 +65,7 @@ def create_app(
     telegram_client: TelegramClient | None = None,
     session_factory: Callable[[], Session] | None = None,
     reminder_interpreter=None,
+    intent_router=None,
     clock: Callable[[], datetime] | None = None,
 ) -> FastAPI:
     runtime_settings = settings or get_settings()
@@ -84,13 +89,21 @@ def create_app(
     app.state.settings = runtime_settings
     app.state.telegram_client = telegram_client
     model_interpreter = None
-    if app.state.settings.llm_base_url and app.state.settings.llm_api_key:
+    if app.state.settings.llm_api_key:
         model_interpreter = OpenAICompatibleIntentInterpreter(
             app.state.settings.llm_base_url,
             app.state.settings.llm_api_key,
-            app.state.settings.llm_model,
+            app.state.settings.llm_extract_model,
             app.state.settings.llm_timeout_seconds,
         )
+        app.state.intent_router = intent_router or OpenAICompatibleIntentRouter(
+            app.state.settings.llm_base_url,
+            app.state.settings.llm_api_key,
+            app.state.settings.llm_intent_model,
+            app.state.settings.llm_timeout_seconds,
+        )
+    else:
+        app.state.intent_router = intent_router
     app.state.reminder_interpreter = reminder_interpreter or ReminderIntentInterpreter(
         model_interpreter
     )
