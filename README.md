@@ -2,7 +2,8 @@
 
 ## Local development
 
-VS-03 implements Telegram onboarding, verified phone linking, and one-time reminder creation
+VS-03 and VS-07 implement Telegram onboarding, verified phone linking, one-time reminders, and
+weekly recurring reminders
 with FastAPI, SQLAlchemy, Alembic, and PostgreSQL.
 
 ```powershell
@@ -37,17 +38,19 @@ Production startup fails fast unless `DATABASE_URL` uses PostgreSQL,
 least 32 characters. The sample placeholders and local SQLite defaults are intended only for
 injected test applications. `/ready` also verifies that the domain tables exist, so a stale
 `alembic_version` row cannot make an empty database appear healthy. Readiness also requires the
-current migration head (`0012_conversation_session_version`) and the worker/confirmation claim
+current migration head (`0013_recurring_occurrence_keys`) and the worker/confirmation claim
 columns, so a partially migrated database is rejected before webhooks are accepted.
 The additive schema-repair migrations also rebuild missing domain tables when a
 database was reset without resetting its Alembic version row.
 
-One-time reminder text uses a confidence-first, strict typed boundary. The built-in parser
+Reminder text uses a confidence-first, strict typed boundary. The built-in parser
 only handles short greetings and thanks plus unambiguous one-time reminders such as
 `Remind me in five minutes to call the bank`, `Remind me tomorrow at 9 AM to check my email`,
 `Remind me on Friday at 6 PM to go to the gym`, and `Remind me to pay the bill at 8 PM today`.
-Anything requiring context, a clarification, recurrence, or conversational interpretation falls
-back to the configured model. By default, a configured API key uses
+It also accepts weekly schedules such as `Remind me every Monday at 8 AM to call the bank` and
+stores a typed weekly rule rather than trusting a model-generated recurrence string. Anything
+requiring context, a clarification, or conversational interpretation falls back to the configured
+model. By default, a configured API key uses
 OpenAI's `https://api.openai.com/v1` endpoint and the `gpt-6-luna` model. `LLM_BASE_URL`,
 `LLM_API_KEY`, `LLM_INTENT_MODEL`, and `LLM_EXTRACT_MODEL` can instead target any OpenAI-compatible `/chat/completions`
 endpoint, including a Groq or Gemini-compatible gateway, without coupling reminder business
@@ -60,6 +63,17 @@ Creating a reminder transactionally writes one active reminder, one pending occu
 pending Telegram notification, and the Telegram update's idempotency result. The confirmation
 is sent only after commit and includes the user's local time and Telegram destination. VS-03
 does not run delivery; the pending notification is consumed by the VS-04 scheduler worker.
+
+VS-07 recurring reminders store the canonical weekly rule, intended IANA timezone, and a stable
+local recurrence-instance key. The worker materializes a rolling 35-day horizon before claiming
+due notifications and pages through active series so later reminders are not starved by the first
+batch. PostgreSQL uniqueness and `INSERT ... ON CONFLICT` make replayed updates, worker restarts,
+and concurrent materializers idempotent. Recurrence uses local wall-clock time: fall-back overlaps
+choose the earlier instant, while spring-forward gaps shift forward by the DST gap while preserving
+minutes. Delivery still uses the leased PostgreSQL notification worker, so provider timeouts can
+remain `UNKNOWN` and strict exactly-once external delivery is not guaranteed. Ambiguous task,
+weekday, or time input is clarified or rejected; weekly schedules are supported, not arbitrary
+monthly/calendar rules.
 
 VS-04 runs `reminder-worker` as an independent PostgreSQL-backed process. It polls due
 notifications every `WORKER_POLL_INTERVAL_SECONDS`, claims rows with PostgreSQL
@@ -96,6 +110,18 @@ When running PostgreSQL integration tests, set `TEST_DATABASE_URL` to the dedica
 `memorae_test` database on port 5434. The test fixture refuses to run destructive cleanup if
 `TEST_DATABASE_URL` is the same database as `DATABASE_URL`; the application database is never a
 test target.
+
+The VS-07 schema change is migration `0013_recurring_occurrence_keys`; run
+`uv run alembic upgrade head` before starting the API or worker. A real Telegram smoke test
+requires a configured bot token, a linked Telegram user, a public webhook endpoint, and a user
+message such as `Remind me every Monday at 8 AM to check the smoke test`; verify the confirmation,
+the recurring rows, and the next Telegram delivery. Do not use a model- or client-supplied user ID
+to choose the destination.
+
+Smoke-test record (2026-11-01): the configured bot token was present, but both the Python and
+host PowerShell calls to Telegram `getMe` failed during TLS connection establishment. No inbound
+message or outbound smoke notification was claimed as successful; rerun the procedure above from
+a network path that can reach `api.telegram.org`.
 
 ## Structured logs
 
