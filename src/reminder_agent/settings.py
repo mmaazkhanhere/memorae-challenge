@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     )
     worker_poll_interval_seconds: float = Field(default=5.0, gt=0, le=60)
     worker_claim_lease_seconds: float = Field(default=60.0, gt=10, le=600)
+    recurrence_materialization_horizon_days: int = Field(default=35, ge=7, le=366)
+    recurrence_materialization_batch_size: int = Field(default=100, ge=1, le=1000)
     notification_retry_max_attempts: int = Field(default=3, ge=1, le=10)
     notification_uncertain_max_retries: int = Field(default=2, ge=0, le=2)
     notification_retry_base_delay_seconds: float = Field(default=30.0, gt=0, le=3600)

@@ -5,6 +5,7 @@ import httpx
 import pytest
 
 from reminder_agent.intent import (
+    CreateRecurringReminderIntent,
     CreateOneTimeReminderIntent,
     IntentRoute,
     OpenAICompatibleIntentRouter,
@@ -270,15 +271,17 @@ def test_weekday_schedule_with_explicit_meridiem_is_parsed_deterministically() -
     assert result.intent.due_at == datetime(2026, 10, 30, 18, 0, tzinfo=timezone.utc)
 
 
-def test_recurring_request_is_not_parsed_deterministically() -> None:
+def test_recurring_request_is_parsed_deterministically() -> None:
     result = RuleBasedIntentInterpreter().interpret(
         "Remind me to call John every Friday at 6 PM",
         timezone_name="UTC",
         now=NOW,
     )
 
-    assert result.intent is None
-    assert result.fallback_allowed is True
+    assert isinstance(result.intent, CreateRecurringReminderIntent)
+    assert result.intent.task == "call John"
+    assert result.intent.weekdays == (4,)
+    assert result.intent.start_local == datetime(2026, 10, 30, 18)
 
 
 def test_ambiguous_hour_is_clarified_without_guessing_next_morning() -> None:

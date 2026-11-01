@@ -11,9 +11,10 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from reminder_agent.observability import get_logger, log_event
+from reminder_agent.recurrence import WeeklyRecurrence
 from reminder_agent.request_policy import OUT_OF_SCOPE_RESPONSE
 
 logger = get_logger()
@@ -164,8 +165,59 @@ class CreateOneTimeReminderIntent(BaseModel):
         return value
 
 
+class CreateRecurringReminderIntent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    operation: Literal["CREATE_RECURRING_REMINDER"] = "CREATE_RECURRING_REMINDER"
+    task: str = Field(min_length=1, max_length=200)
+    weekdays: tuple[int, ...] = Field(min_length=1, max_length=7)
+    hour: int = Field(ge=0, le=23)
+    minute: int = Field(ge=0, le=59)
+    start_local: datetime
+    timezone_name: str = Field(min_length=1, max_length=150)
+
+    @field_validator("task")
+    @classmethod
+    def task_must_not_be_blank(cls, value: str) -> str:
+        value = " ".join(value.split())
+        if not value:
+            raise ValueError("task must not be blank")
+        return value
+
+    @field_validator("weekdays")
+    @classmethod
+    def weekdays_must_be_sorted_and_unique(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        if any(day < 0 or day > 6 for day in value):
+            raise ValueError("weekdays must be between Monday (0) and Sunday (6)")
+        normalized = tuple(sorted(set(value)))
+        if normalized != value:
+            raise ValueError("weekdays must be sorted and unique")
+        return value
+
+    @field_validator("start_local")
+    @classmethod
+    def start_local_must_be_naive(cls, value: datetime) -> datetime:
+        if value.tzinfo is not None and value.utcoffset() is not None:
+            raise ValueError("start_local must be timezone-naive")
+        return value.replace(tzinfo=None)
+
+    @field_validator("timezone_name")
+    @classmethod
+    def timezone_must_be_valid(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except Exception as exc:
+            raise ValueError("timezone_name must be a valid IANA timezone") from exc
+        return value
+
+    @model_validator(mode="after")
+    def start_local_must_match_weekday(self) -> "CreateRecurringReminderIntent":
+        if self.start_local.weekday() not in self.weekdays:
+            raise ValueError("start_local must fall on one of the selected weekdays")
+        return self
+
 class PendingReminder(BaseModel):
-    """Validated, serializable partial data for a one-time reminder."""
+    """Validated, serializable partial data for a one-time or weekly reminder."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -175,6 +227,7 @@ class PendingReminder(BaseModel):
     hour: int | None = Field(default=None, ge=0, le=23)
     minute: int = Field(default=0, ge=0, le=59)
     meridiem: Literal["am", "pm"] | None = None
+    recurrence_weekdays: tuple[int, ...] | None = None
     timezone_name: str = Field(min_length=1, max_length=150)
     date_explicit: bool = False
 
@@ -192,6 +245,19 @@ class PendingReminder(BaseModel):
             return None
         value = " ".join(value.split())
         return value or None
+
+    @field_validator("recurrence_weekdays")
+    @classmethod
+    def recurrence_weekdays_must_be_sorted_and_unique(
+        cls, value: tuple[int, ...] | None
+    ) -> tuple[int, ...] | None:
+        if value is None:
+            return value
+        if not value or any(day < 0 or day > 6 for day in value):
+            raise ValueError("recurrence weekdays must be between Monday (0) and Sunday (6)")
+        if tuple(sorted(set(value))) != value:
+            raise ValueError("recurrence weekdays must be sorted and unique")
+        return value
 
     @field_validator("timezone_name")
     @classmethod
@@ -287,8 +353,8 @@ def _last_clarification_question(recent_messages: Sequence[str]) -> str | None:
 
 @dataclass(frozen=True)
 class Interpretation:
-    intent: CreateOneTimeReminderIntent | None = None
-    intents: tuple[CreateOneTimeReminderIntent, ...] = ()
+    intent: CreateOneTimeReminderIntent | CreateRecurringReminderIntent | None = None
+    intents: tuple[CreateOneTimeReminderIntent | CreateRecurringReminderIntent, ...] = ()
     clarification: NeedsClarification | None = None
     field_updates: PendingReminderFieldUpdate | None = None
     response_text: str | None = None
@@ -296,7 +362,9 @@ class Interpretation:
     clear_context: bool = False
 
     @property
-    def resolved_intents(self) -> tuple[CreateOneTimeReminderIntent, ...]:
+    def resolved_intents(
+        self,
+    ) -> tuple[CreateOneTimeReminderIntent | CreateRecurringReminderIntent, ...]:
         """Return one or more validated commands represented by this result."""
         if self.intents:
             return self.intents
@@ -723,6 +791,22 @@ class RuleBasedIntentInterpreter:
         r"\b(?:in\s+the\s+)?(?:morning|afternoon|evening|night)\b",
         re.IGNORECASE,
     )
+    _recurrence = re.compile(
+        r"\bevery\s+(?P<days>(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+        r"(?:\s*(?:,|and)\s*(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))*)"
+        r"\s+at\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*"
+        r"(?P<meridiem>a\.m\.|p\.m\.|am|pm)?"
+        r"(?:\s+(?:(?:to|for)\s+)?(?P<task>.+))?$",
+        re.IGNORECASE,
+    )
+    _recurrence_after_task = re.compile(
+        r"(?P<task>.+?)\s+every\s+"
+        r"(?P<days>(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+        r"(?:\s*(?:,|and)\s*(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))*)"
+        r"\s+at\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*"
+        r"(?P<meridiem>a\.m\.|p\.m\.|am|pm)?$",
+        re.IGNORECASE,
+    )
     _multiple_request_separator = re.compile(
         r"\s+and\s+(?=(?:please\s+)?(?:remind\s+me|set\s+(?:a\s+)?reminder)\b)",
         re.IGNORECASE,
@@ -811,6 +895,15 @@ class RuleBasedIntentInterpreter:
         )
         prefix = self._prefix.match(raw)
         if prefix is None:
+            recurrence = self._recurrence.search(raw)
+            if recurrence is None or recurrence.group("task") is None:
+                recurrence = self._recurrence_after_task.search(raw) or recurrence
+            if recurrence is not None:
+                return self._build_recurring(
+                    recurrence,
+                    timezone_name=timezone_name,
+                    now=_normalise_now(now),
+                )
             # Keep bare clock answers and social acknowledgements deterministic,
             # but allow the provider to interpret complex natural language even
             # when it does not contain the literal word "remind".
@@ -825,7 +918,21 @@ class RuleBasedIntentInterpreter:
                 fallback_allowed=not (simple_time or simple_ack),
             )
 
-        # Relative phrases, recurrence, and conversational qualifiers have
+        zone = ZoneInfo(timezone_name)
+        reference = _normalise_now(now)
+        without_prefix = raw[prefix.end() :]
+
+        recurrence = self._recurrence.search(without_prefix)
+        if recurrence is None or recurrence.group("task") is None:
+            recurrence = self._recurrence_after_task.search(without_prefix) or recurrence
+        if recurrence is not None:
+            return self._build_recurring(
+                recurrence,
+                timezone_name=timezone_name,
+                now=reference,
+            )
+
+        # Relative phrases and conversational qualifiers have
         # too much meaning for a small regex parser.  Do not extract a partial
         # intent that could be mistaken for a complete command; let the model
         # return a typed proposal instead.
@@ -834,10 +941,6 @@ class RuleBasedIntentInterpreter:
                 response_text="I need a little more detail to schedule that reminder.",
                 fallback_allowed=True,
             )
-
-        zone = ZoneInfo(timezone_name)
-        reference = _normalise_now(now)
-        without_prefix = raw[prefix.end() :]
 
         relative = self._relative.search(without_prefix)
         if relative is not None:
@@ -950,6 +1053,77 @@ class RuleBasedIntentInterpreter:
             fallback_allowed=True,
         )
 
+    def _build_recurring(
+        self,
+        match: re.Match[str],
+        *,
+        timezone_name: str,
+        now: datetime,
+    ) -> Interpretation:
+        raw_days = re.findall(
+            r"monday|tuesday|wednesday|thursday|friday|saturday|sunday",
+            match.group("days").lower(),
+        )
+        weekdays = tuple(sorted({self._weekdays[day] for day in raw_days}))
+        hour = int(match.group("hour"))
+        minute = int(match.group("minute") or 0)
+        meridiem = _normalise_meridiem(match.group("meridiem"))
+        if not _valid_clock(hour, minute, meridiem):
+            return self._invalid_time()
+        if meridiem is not None:
+            hour = _clock_to_24(hour, meridiem)
+        task = _task_from_remainder(match.group("task"))
+        if not task:
+            question = "What should I remind you about every week?"
+            return Interpretation(
+                response_text=question,
+                fallback_allowed=False,
+            )
+        if meridiem is None and hour <= 12:
+            pending = PendingReminder(
+                task=task,
+                date_local=now.astimezone(ZoneInfo(timezone_name)).date(),
+                hour=hour,
+                minute=minute,
+                recurrence_weekdays=weekdays,
+                timezone_name=timezone_name,
+            )
+            question = f"Do you mean {hour:g} AM or {hour:g} PM every week?"
+            return Interpretation(
+                clarification=NeedsClarification(pending=pending, question=question),
+                response_text=question,
+                fallback_allowed=False,
+            )
+        local_now = now.astimezone(ZoneInfo(timezone_name))
+        start_date = local_now.date()
+        for offset in range(8):
+            candidate = start_date + timedelta(days=offset)
+            if candidate.weekday() not in weekdays:
+                continue
+            candidate_local = datetime.combine(candidate, time(hour, minute))
+            if candidate_local > local_now.replace(tzinfo=None):
+                start_local = candidate_local
+                break
+        else:  # pragma: no cover - a tuple of weekdays always yields a date
+            raise AssertionError("could not calculate recurring start")
+        try:
+            WeeklyRecurrence(weekdays, hour, minute)
+            return Interpretation(
+                intent=CreateRecurringReminderIntent(
+                    task=task,
+                    weekdays=weekdays,
+                    hour=hour,
+                    minute=minute,
+                    start_local=start_local,
+                    timezone_name=timezone_name,
+                )
+            )
+        except ValidationError:
+            return Interpretation(
+                response_text="Please provide a short recurring reminder task and time.",
+                fallback_allowed=False,
+            )
+
     def _interpret_follow_up(
         self, text: str, *, context: PendingReminder, now: datetime
     ) -> Interpretation:
@@ -981,6 +1155,8 @@ class RuleBasedIntentInterpreter:
                 local_now = _normalise_now(now).astimezone(ZoneInfo(context.timezone_name))
                 if meridiem == "am" and date_local == local_now.date():
                     date_local += timedelta(days=1)
+        elif normalized in {"am", "pm"}:
+            meridiem = normalized
         if day is not None:
             local_now = _normalise_now(now).astimezone(ZoneInfo(context.timezone_name))
             date_local = _date_from_day(day, local_now)
@@ -990,6 +1166,8 @@ class RuleBasedIntentInterpreter:
         remainder = raw
         if clock is not None:
             remainder = remainder.replace(clock.group(0), "", 1)
+        elif normalized in {"am", "pm"}:
+            remainder = ""
         if day is not None:
             remainder = remainder.replace(day.group(0), "", 1)
         candidate_task = _task_from_remainder(remainder)
@@ -1003,6 +1181,7 @@ class RuleBasedIntentInterpreter:
                 "hour": hour,
                 "minute": minute,
                 "meridiem": meridiem,
+                "recurrence_weekdays": context.recurrence_weekdays,
                 "date_explicit": date_explicit,
             }
         )
@@ -1040,6 +1219,14 @@ class RuleBasedIntentInterpreter:
         elif pending.hour <= 12 and pending.meridiem is None:
             missing.append("AM or PM")
         if missing:
+            if pending.recurrence_weekdays is not None and missing == ["AM or PM"]:
+                assert pending.hour is not None
+                question = f"Do you mean {pending.hour:g} AM or {pending.hour:g} PM every week?"
+                return Interpretation(
+                    clarification=NeedsClarification(pending=pending, question=question),
+                    response_text=question,
+                    fallback_allowed=fallback_allowed,
+                )
             if missing == ["AM or PM"]:
                 assert pending.date_local is not None and pending.hour is not None
                 zone = ZoneInfo(pending.timezone_name)
@@ -1100,6 +1287,35 @@ class RuleBasedIntentInterpreter:
                 response_text=question,
                 fallback_allowed=fallback_allowed,
             )
+
+        if pending.recurrence_weekdays is not None:
+            assert pending.date_local is not None and pending.hour is not None
+            recurrence_hour = (
+                _clock_to_24(pending.hour, pending.meridiem)
+                if pending.meridiem is not None
+                else pending.hour
+            )
+            zone = ZoneInfo(pending.timezone_name)
+            local_now = _normalise_now(now).astimezone(zone)
+            start_date = max(pending.date_local, local_now.date())
+            for offset in range(8):
+                candidate_date = start_date + timedelta(days=offset)
+                if candidate_date.weekday() not in pending.recurrence_weekdays:
+                    continue
+                start_local = datetime.combine(candidate_date, time(recurrence_hour, pending.minute))
+                if start_local > local_now.replace(tzinfo=None):
+                    return Interpretation(
+                        intent=CreateRecurringReminderIntent(
+                            task=pending.task or "",
+                            weekdays=pending.recurrence_weekdays,
+                            hour=recurrence_hour,
+                            minute=pending.minute,
+                            start_local=start_local,
+                            timezone_name=pending.timezone_name,
+                        ),
+                        fallback_allowed=False,
+                    )
+            raise AssertionError("could not calculate recurring start")
 
         assert pending.date_local is not None and pending.hour is not None
         due_local = resolve_pending_due_at(pending, now=now)
@@ -1261,6 +1477,9 @@ class OpenAICompatibleIntentInterpreter:
             "Return JSON only. For one complete request use operation "
             "CREATE_ONE_TIME_REMINDER with task and due_local. For multiple clearly separated "
             "requests use CREATE_ONE_TIME_REMINDERS with an intents array of {task,due_local}; "
+            "For a weekly recurring request use CREATE_RECURRING_REMINDER with task, weekdays "
+            "(integer Monday=0 through Sunday=6), hour, minute, and start_local (a naive local "
+            "ISO datetime). Only return weekly recurrence; never invent a recurrence rule. "
             "never merge separate tasks into one task. For an incomplete or ambiguous "
             "request use operation NEEDS_CLARIFICATION with pending fields task, date_local "
             "(YYYY-MM-DD), hour, minute, meridiem, date_explicit, and a focused question. "
@@ -1433,6 +1652,24 @@ class OpenAICompatibleIntentInterpreter:
                         )
                     )
                 return Interpretation(intents=tuple(intents))
+            if operation == "CREATE_RECURRING_REMINDER":
+                task = data.get("task")
+                weekdays = data.get("weekdays")
+                start_local_value = data.get("start_local")
+                if not isinstance(task, str) or not isinstance(weekdays, list):
+                    raise ValueError("recurring intent is missing fields")
+                if not isinstance(start_local_value, str):
+                    raise ValueError("recurring intent is missing start_local")
+                start_local = datetime.fromisoformat(start_local_value)
+                intent = CreateRecurringReminderIntent(
+                    task=task,
+                    weekdays=tuple(int(day) for day in weekdays),
+                    hour=int(data["hour"]),
+                    minute=int(data.get("minute", 0)),
+                    start_local=start_local,
+                    timezone_name=timezone_name,
+                )
+                return Interpretation(intent=intent)
             if operation != "CREATE_ONE_TIME_REMINDER":
                 result = Interpretation(
                     response_text=OUT_OF_SCOPE_RESPONSE

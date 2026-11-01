@@ -19,6 +19,7 @@ from reminder_agent.db.models import (
 )
 from reminder_agent.db.session import build_engine
 from reminder_agent.observability import configure_logging, get_logger, log_event
+from reminder_agent.recurrence_service import materialize_active_recurring_reminders
 from reminder_agent.settings import get_settings, validate_runtime_settings
 from reminder_agent.telegram import HttpTelegramClient, TelegramAPIError, TelegramClient
 
@@ -290,6 +291,8 @@ class NotificationWorker:
         max_attempts: int = 3,
         uncertain_max_retries: int = 2,
         retry_base_delay_seconds: float = 30.0,
+        recurrence_materialization_horizon_days: int = 35,
+        recurrence_materialization_batch_size: int = 100,
         clock: Callable[[], datetime] = utc_now,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -301,6 +304,8 @@ class NotificationWorker:
         self.max_attempts = max_attempts
         self.uncertain_max_retries = min(max(uncertain_max_retries, 0), 2)
         self.retry_base_delay_seconds = retry_base_delay_seconds
+        self.recurrence_materialization_horizon_days = recurrence_materialization_horizon_days
+        self.recurrence_materialization_batch_size = recurrence_materialization_batch_size
         self.clock = clock
         self.sleep = sleep
 
@@ -569,6 +574,20 @@ class NotificationWorker:
 
     def run_once(self) -> int:
         now = _as_utc(self.clock())
+        materialized = materialize_active_recurring_reminders(
+            self.session_factory,
+            now=now,
+            horizon_days=self.recurrence_materialization_horizon_days,
+            batch_size=self.recurrence_materialization_batch_size,
+        )
+        if materialized:
+            log_event(
+                logger,
+                logging.INFO,
+                "recurring_occurrences_materialized",
+                worker_id=self.worker_id,
+                count=materialized,
+            )
         log_event(
             logger,
             logging.DEBUG,
@@ -627,6 +646,8 @@ def run() -> None:
         max_attempts=settings.notification_retry_max_attempts,
         uncertain_max_retries=settings.notification_uncertain_max_retries,
         retry_base_delay_seconds=settings.notification_retry_base_delay_seconds,
+        recurrence_materialization_horizon_days=settings.recurrence_materialization_horizon_days,
+        recurrence_materialization_batch_size=settings.recurrence_materialization_batch_size,
     )
     confirmation_worker = ConfirmationWorker(
         session_factory,
