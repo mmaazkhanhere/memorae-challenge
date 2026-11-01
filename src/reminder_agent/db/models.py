@@ -137,6 +137,11 @@ class ReminderOccurrence(Base):
             name="ck_occurrences_status",
         ),
         UniqueConstraint("reminder_id", "scheduled_at", name="uq_occurrence_reminder_scheduled"),
+        UniqueConstraint(
+            "reminder_id",
+            "recurrence_instance_key",
+            name="uq_occurrence_reminder_recurrence_key",
+        ),
         Index("ix_occurrences_due_status", "next_due_at", "status"),
     )
 
@@ -146,6 +151,7 @@ class ReminderOccurrence(Base):
     )
     scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     next_due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    recurrence_instance_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="PENDING", server_default="PENDING"
     )

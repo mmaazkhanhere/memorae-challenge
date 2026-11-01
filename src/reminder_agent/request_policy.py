@@ -66,10 +66,6 @@ _OUT_OF_SCOPE_PATTERNS = (
         r"done|move|reschedule|list|show)\b",
         re.IGNORECASE,
     ),
-    # Recurrence and memory persistence are intentionally deferred to VS-07 and
-    # VS-13. Rejecting them here prevents an LLM from silently mapping them to a
-    # one-time reminder or inventing a memory write.
-    re.compile(r"\b(?:every|each|weekly|monthly|recurring|repeat|repeats)\b", re.IGNORECASE),
     re.compile(r"\bremember\b", re.IGNORECASE),
 )
 
@@ -100,4 +96,4 @@ def assess_request(text: str, *, has_pending: bool = False) -> RequestAssessment
 def is_supported_operation(operation: object) -> bool:
     """Return whether an application service may execute a parsed operation."""
 
-    return operation == "CREATE_ONE_TIME_REMINDER"
+    return operation in {"CREATE_ONE_TIME_REMINDER", "CREATE_RECURRING_REMINDER"}

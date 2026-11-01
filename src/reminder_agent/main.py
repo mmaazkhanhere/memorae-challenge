@@ -32,7 +32,7 @@ REQUIRED_SCHEMA_TABLES = (
     "notifications",
     "conversation_sessions",
 )
-REQUIRED_SCHEMA_VERSION = "0012_conversation_session_version"
+REQUIRED_SCHEMA_VERSION = "0013_recurring_occurrence_keys"
 REQUIRED_SCHEMA_COLUMNS = {
     "notifications": {
         "claimed_by",
@@ -56,6 +56,7 @@ REQUIRED_SCHEMA_COLUMNS = {
         "version",
         "updated_at",
     },
+    "reminder_occurrences": {"recurrence_instance_key"},
 }
 
 

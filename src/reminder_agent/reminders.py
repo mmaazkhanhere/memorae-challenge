@@ -12,6 +12,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from pydantic import ValidationError
 
 from reminder_agent.db.models import (
     ChannelIdentity,
@@ -37,6 +38,7 @@ from reminder_agent.conversation_router import (
     unrelated_response,
 )
 from reminder_agent.intent import (
+    CreateRecurringReminderIntent,
     CreateOneTimeReminderIntent,
     IntentRoute,
     IntentRouter,
@@ -47,6 +49,8 @@ from reminder_agent.intent import (
     RuleBasedIntentInterpreter,
     restrict_to_explicit_field_updates,
 )
+from reminder_agent.recurrence import WeeklyRecurrence, resolve_local_datetime
+from reminder_agent.recurrence_service import materialize_recurring_reminder
 from reminder_agent.observability import get_logger, log_event
 from reminder_agent.request_policy import (
     OUT_OF_SCOPE_RESPONSE,
@@ -59,6 +63,7 @@ TELEGRAM = "TELEGRAM"
 LINKED = "LINKED"
 ACTIVE = "ACTIVE"
 ONE_TIME = "ONE_TIME"
+RECURRING = "RECURRING"
 PENDING = "PENDING"
 logger = get_logger()
 
@@ -861,8 +866,31 @@ def handle_reminder_text(
             reference = _now_utc(now)
             try:
                 zone = ZoneInfo(user.timezone)
-                scheduled: list[tuple[CreateOneTimeReminderIntent, datetime, str]] = []
+                scheduled: list[
+                    tuple[
+                        CreateOneTimeReminderIntent | CreateRecurringReminderIntent,
+                        datetime,
+                        str,
+                    ]
+                ] = []
                 for intent in intents:
+                    if not isinstance(
+                        intent, (CreateOneTimeReminderIntent, CreateRecurringReminderIntent)
+                    ):
+                        log_event(
+                            logger,
+                            logging.WARNING,
+                            "reminder_intent_rejected",
+                            update_id=update.update_id,
+                            reason="invalid_typed_intent",
+                        )
+                        return _store_response(
+                            db,
+                            update=update,
+                            user_id=user.id,
+                            text="I couldn't understand that recurring reminder. Please provide the task, weekday, and time.",
+                            response_kind="invalid_intent",
+                        )
                     if intent.timezone_name != user.timezone:
                         log_event(
                             logger,
@@ -877,7 +905,20 @@ def handle_reminder_text(
                             text="I couldn't verify the reminder time zone. Please try again.",
                             response_kind="timezone_validation_failure",
                         )
-                    due_at = _now_utc(intent.due_at)
+                    if isinstance(intent, CreateRecurringReminderIntent):
+                        recurrence = WeeklyRecurrence(intent.weekdays, intent.hour, intent.minute)
+                        if intent.start_local.weekday() not in intent.weekdays:
+                            raise ValueError(
+                                "recurring start_local must match a selected weekday"
+                            )
+                        local_due = resolve_local_datetime(
+                            intent.start_local.date(),
+                            intent.start_local.timetz(),
+                            zone,
+                        )
+                        due_at = _now_utc(local_due)
+                    else:
+                        due_at = _now_utc(intent.due_at)
                     if due_at <= reference:
                         log_event(
                             logger,
@@ -909,12 +950,53 @@ def handle_reminder_text(
                     text="Your saved time zone is invalid; please update it.",
                     response_kind="schedule_validation_failure",
                 )
+            except (TypeError, ValueError, ValidationError) as exc:
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "reminder_schedule_rejected",
+                    update_id=update.update_id,
+                    reason="invalid_recurring_intent",
+                    error_type=type(exc).__name__,
+                )
+                return _store_response(
+                    db,
+                    update=update,
+                    user_id=user.id,
+                    text="I couldn't understand that recurring reminder. Please provide the task, weekday, and time.",
+                    response_kind="invalid_intent",
+                )
 
             if locked_session is not None:
                 end_session(locked_session, now=now)
 
             confirmations: list[str] = []
             for intent, due_at, local_display in scheduled:
+                if isinstance(intent, CreateRecurringReminderIntent):
+                    recurrence = WeeklyRecurrence(intent.weekdays, intent.hour, intent.minute)
+                    reminder = Reminder(
+                        user_id=user.id,
+                        task=intent.task,
+                        schedule_type=RECURRING,
+                        start_local=intent.start_local.isoformat(timespec="minutes"),
+                        timezone=user.timezone,
+                        recurrence_rule=recurrence.canonical_rule,
+                        status=ACTIVE,
+                        version=1,
+                    )
+                    db.add(reminder)
+                    db.flush()
+                    materialize_recurring_reminder(db, reminder, now=reference, horizon_days=35)
+                    day_label = ", ".join(
+                        ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")[day]
+                        for day in intent.weekdays
+                    )
+                    confirmations.append(
+                        f"I'll remind you to {reminder.task} every {day_label} at "
+                        f"{intent.hour:02d}:{intent.minute:02d} {user.timezone} via Telegram. "
+                        f"Next: {local_display}."
+                    )
+                    continue
                 reminder = Reminder(
                     user_id=user.id,
                     task=intent.task,
@@ -1008,7 +1090,14 @@ def handle_reminder_text(
         "reminder_created",
         update_id=update.update_id,
         intent_count=len(interpretation.resolved_intents),
-        schedule_type=ONE_TIME,
+        schedule_type=(
+            RECURRING
+            if any(
+                isinstance(intent, CreateRecurringReminderIntent)
+                for intent in interpretation.resolved_intents
+            )
+            else ONE_TIME
+        ),
         notification_status=PENDING,
     )
     return reply
