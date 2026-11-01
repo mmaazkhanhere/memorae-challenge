@@ -134,8 +134,8 @@ def telegram_webhook(
                 "telegram_update_duplicate",
                 update_id=update.update_id,
             )
-        if reply is not None and reply.should_send and reply.idempotency_key is not None:
-            if not claim_delivery(db, reply.idempotency_key):
+        if reply is not None and reply.should_send:
+            if reply.idempotency_key is not None and not claim_delivery(db, reply.idempotency_key):
                 log_event(
                     logger,
                     logging.INFO,
@@ -169,14 +169,15 @@ def telegram_webhook(
                 retry_delay = retry_after or (
                     request.app.state.settings.telegram_confirmation_background_retry_base_delay_seconds
                 )
-                record_delivery_outcome(
-                    db,
-                    reply.idempotency_key,
-                    sent=False,
-                    error_kind=exc.failure_kind,
-                    status_code=exc.status_code,
-                    next_attempt_at=datetime.now(timezone.utc) + timedelta(seconds=retry_delay),
-                )
+                if reply.idempotency_key is not None:
+                    record_delivery_outcome(
+                        db,
+                        reply.idempotency_key,
+                        sent=False,
+                        error_kind=exc.failure_kind,
+                        status_code=exc.status_code,
+                        next_attempt_at=datetime.now(timezone.utc) + timedelta(seconds=retry_delay),
+                    )
                 log_event(
                     logger,
                     logging.ERROR,
@@ -188,10 +189,12 @@ def telegram_webhook(
                     provider_description=exc.telegram_description,
                     exc_info=True,
                 )
-                # The mutation is durable. A 200 prevents Telegram from replaying
-                # the inbound update and creating a duplicate response.
+                # Durable mutations use the idempotency record to prevent a
+                # replay. Stateless policy responses have no database record
+                # by design, so a retry may deliver the same harmless response.
                 return {"ok": True}
-            record_delivery_outcome(db, reply.idempotency_key, sent=True)
+            if reply.idempotency_key is not None:
+                record_delivery_outcome(db, reply.idempotency_key, sent=True)
             log_event(
                 logger,
                 logging.INFO,

@@ -14,6 +14,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from reminder_agent.observability import get_logger, log_event
+from reminder_agent.request_policy import OUT_OF_SCOPE_RESPONSE
 
 logger = get_logger()
 
@@ -692,7 +693,7 @@ class RuleBasedIntentInterpreter:
     """Conservative parser that refuses to guess incomplete date/time requests."""
 
     _prefix = re.compile(
-        r"^\s*(?:please\s+)?(?:remind\s+me|set\s+(?:a\s+)?reminder)\s+",
+        r"^\s*(?:please\s+)?(?:remind\s+me|set\s+(?:a\s+)?reminder)(?:\s+|$)",
         re.IGNORECASE,
     )
     _relative = re.compile(
@@ -819,7 +820,7 @@ class RuleBasedIntentInterpreter:
             )
             return Interpretation(
                 response_text=(
-                    "I can help create reminders. Start with what to remember and when."
+                    "Please tell me the reminder task and a future time."
                 ),
                 fallback_allowed=not (simple_time or simple_ack),
             )
@@ -1359,7 +1360,7 @@ class OpenAICompatibleIntentInterpreter:
                     )
                 if operation == "UNKNOWN":
                     return Interpretation(
-                        response_text="I couldn't find a reminder detail in that reply.",
+                        response_text=OUT_OF_SCOPE_RESPONSE,
                         fallback_allowed=False,
                     )
                 # A model response must never be authoritative while a
@@ -1434,7 +1435,7 @@ class OpenAICompatibleIntentInterpreter:
                 return Interpretation(intents=tuple(intents))
             if operation != "CREATE_ONE_TIME_REMINDER":
                 result = Interpretation(
-                    response_text="Please tell me the reminder task and a future time."
+                    response_text=OUT_OF_SCOPE_RESPONSE
                 )
                 log_event(
                     logger,

@@ -48,6 +48,11 @@ from reminder_agent.intent import (
     restrict_to_explicit_field_updates,
 )
 from reminder_agent.observability import get_logger, log_event
+from reminder_agent.request_policy import (
+    OUT_OF_SCOPE_RESPONSE,
+    assess_request,
+    is_supported_operation,
+)
 from reminder_agent.telegram import TelegramUpdate
 
 TELEGRAM = "TELEGRAM"
@@ -66,6 +71,31 @@ class ReminderReply:
     should_send: bool = True
     is_duplicate: bool = False
     reply_markup: dict | None = None
+
+
+def list_owned_reminders(
+    db: Session,
+    *,
+    user_id: UUID,
+    status: str | None = None,
+) -> list[Reminder]:
+    """Read reminders owned by ``user_id`` and never another account.
+
+    This is intentionally a small application-service primitive rather than a
+    conversational list feature. Callers must provide the canonical user ID
+    resolved by their authenticated channel context.
+    """
+
+    filters = [Reminder.user_id == user_id]
+    if status is not None:
+        filters.append(Reminder.status == status)
+    return list(
+        db.scalars(
+            select(Reminder)
+            .where(*filters)
+            .order_by(Reminder.created_at.asc(), Reminder.id.asc())
+        ).all()
+    )
 
 
 def _request_hash(update: TelegramUpdate) -> str:
@@ -109,6 +139,28 @@ def _now_utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _authorized_telegram_identity(
+    user: User | None,
+    identity: ChannelIdentity | None,
+    *,
+    telegram_user_id: int,
+    chat_id: int,
+) -> bool:
+    """Check that the channel identity belongs to the requested user."""
+
+    return bool(
+        user is not None
+        and identity is not None
+        and user.onboarding_status == ACTIVE
+        and bool(user.timezone)
+        and identity.user_id == user.id
+        and identity.channel_type == TELEGRAM
+        and identity.status == LINKED
+        and identity.external_id == str(telegram_user_id)
+        and identity.telegram_chat_id == chat_id
+    )
 
 
 def _local_display(due_at: datetime, timezone_name: str) -> str:
@@ -492,7 +544,12 @@ def handle_reminder_text(
 
     user = db.get(User, user_id)
     identity = db.get(ChannelIdentity, identity_id)
-    if user is None or identity is None:
+    if not _authorized_telegram_identity(
+        user,
+        identity,
+        telegram_user_id=telegram_user_id,
+        chat_id=update.message.chat.id,
+    ):
         db.rollback()
         log_event(
             logger,
@@ -560,7 +617,22 @@ def handle_reminder_text(
         recent_message_count=len(recent_messages),
     )
     observed_session_version = None if session_is_expired or session is None else session.version
-    if session_is_expired:
+    policy = assess_request(text, has_pending=pending is not None)
+    if policy.is_rejected:
+        log_event(
+            logger,
+            logging.WARNING,
+            "reminder_request_rejected_by_policy",
+            update_id=update.update_id,
+            reason=policy.reason,
+        )
+        # Policy rejections are deliberately stateless. In particular, do not
+        # create an IdempotencyRecord merely to remember a limitation response.
+        # The webhook sends this reply directly and supported state-changing
+        # requests continue to use durable idempotency below.
+        db.rollback()
+        return ReminderReply(update.message.chat.id, OUT_OF_SCOPE_RESPONSE)
+    elif session_is_expired:
         interpretation = None
     else:
         route, interpretation = _route_and_interpret(
@@ -612,16 +684,11 @@ def handle_reminder_text(
 
             user = db.get(User, user_id)
             identity = db.get(ChannelIdentity, identity_id)
-            if (
-                user is None
-                or identity is None
-                or user.onboarding_status != ACTIVE
-                or not user.timezone
-                or identity.user_id != user.id
-                or identity.channel_type != TELEGRAM
-                or identity.status != LINKED
-                or identity.external_id != str(telegram_user_id)
-                or identity.telegram_chat_id != update.message.chat.id
+            if not _authorized_telegram_identity(
+                user,
+                identity,
+                telegram_user_id=telegram_user_id,
+                chat_id=update.message.chat.id,
             ):
                 log_event(
                     logger,
@@ -744,6 +811,23 @@ def handle_reminder_text(
                 )
 
             intents = interpretation.resolved_intents
+            if any(
+                not is_supported_operation(getattr(intent, "operation", None))
+                for intent in intents
+            ):
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "reminder_operation_rejected_by_policy",
+                    update_id=update.update_id,
+                )
+                return _store_response(
+                    db,
+                    update=update,
+                    user_id=user.id,
+                    text=OUT_OF_SCOPE_RESPONSE,
+                    response_kind="unsupported_operation",
+                )
             if not intents:
                 if interpretation.clear_context and locked_session is not None:
                     end_session(locked_session, now=now)

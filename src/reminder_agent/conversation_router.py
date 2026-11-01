@@ -24,7 +24,7 @@ class RouteDecision:
 
 
 _NEW_REMINDER = re.compile(
-    r"^\s*(?:please\s+)?(?:remind\s+me|set\s+(?:a\s+)?reminder)\b",
+    r"^\s*(?:please\s+)?(?:remind\s+me|set\s+(?:a\s+)?reminder)(?:\s+|$)",
     re.IGNORECASE,
 )
 _CLOCK_WITH_AT = re.compile(
