@@ -356,6 +356,35 @@ def test_missing_task_is_clarified_without_an_intent() -> None:
     assert result.response_text == "What should I remind you about?"
 
 
+def test_missing_task_preserves_a_complete_tomorrow_schedule() -> None:
+    interpreter = RuleBasedIntentInterpreter()
+
+    initial = interpreter.interpret(
+        "Remind me tomorrow at 8 AM.",
+        timezone_name="Asia/Karachi",
+        now=NOW,
+    )
+
+    assert initial.clarification is not None
+    assert initial.clarification.pending.task is None
+    assert initial.clarification.pending.date_local == date(2026, 10, 31)
+    assert initial.clarification.pending.hour == 8
+    assert initial.clarification.pending.minute == 0
+    assert initial.clarification.pending.meridiem == "am"
+    assert initial.clarification.pending.date_explicit is True
+
+    completed = interpreter.interpret(
+        "Submit my assignment.",
+        timezone_name="Asia/Karachi",
+        now=NOW,
+        context=initial.clarification.pending,
+    )
+
+    assert completed.intent is not None
+    assert completed.intent.task == "Submit my assignment"
+    assert completed.intent.due_at == datetime(2026, 10, 31, 3, 0, tzinfo=timezone.utc)
+
+
 def test_task_only_request_uses_model_fallback_for_clarification() -> None:
     class RecordingModel:
         called = False

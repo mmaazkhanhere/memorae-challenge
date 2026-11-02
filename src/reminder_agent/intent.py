@@ -1993,10 +1993,23 @@ class RuleBasedIntentInterpreter:
     @staticmethod
     def _build(task: str, due_at: datetime, timezone_name: str) -> Interpretation:
         if not task:
+            # The parser has already resolved a complete, user-supplied
+            # schedule.  Keep it in the draft while asking only for the task;
+            # otherwise the next turn has no way to complete this reminder.
+            local_due_at = due_at.astimezone(ZoneInfo(timezone_name))
+            hour = local_due_at.hour % 12 or 12
+            meridiem = "am" if local_due_at.hour < 12 else "pm"
             question = "What should I remind you about?"
             return Interpretation(
                 clarification=NeedsClarification(
-                    pending=PendingReminder(timezone_name=timezone_name),
+                    pending=PendingReminder(
+                        date_local=local_due_at.date(),
+                        hour=hour,
+                        minute=local_due_at.minute,
+                        meridiem=meridiem,
+                        timezone_name=timezone_name,
+                        date_explicit=True,
+                    ),
                     question=question,
                 ),
                 response_text=question,
@@ -2596,8 +2609,12 @@ class ReminderIntentInterpreter:
                     "meridiem",
                     "date_explicit",
                 ):
+                    # A Pydantic model supplies defaults (for example,
+                    # ``minute=0`` and ``date_explicit=False``) even when the
+                    # provider omitted a field.  Only explicitly returned
+                    # values are permitted to supplement the trusted draft.
                     value = getattr(provider_pending, field)
-                    if value is not None:
+                    if field in provider_pending.model_fields_set and value is not None:
                         merged_values[field] = value
                 merged_pending = PendingReminder.model_validate(merged_values)
                 return Interpretation(

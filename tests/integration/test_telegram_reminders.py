@@ -1129,6 +1129,39 @@ def test_missing_task_never_completes_from_time_only_follow_up(
     assert session.pending_clarification["task"] is None
 
 
+def test_task_follow_up_completes_a_reminder_with_an_existing_schedule(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory)
+
+    assert post_update(
+        api_client,
+        update_factory(145, text="Remind me tomorrow at 8 AM."),
+    ).status_code == 200
+    session = db.scalar(select(ConversationSession))
+    assert session is not None
+    assert session.pending_clarification["task"] is None
+    assert session.pending_clarification["date_local"] == "2026-10-31"
+    assert session.pending_clarification["hour"] == 8
+    assert session.pending_clarification["minute"] == 0
+
+    assert post_update(
+        api_client,
+        update_factory(146, text="Submit my assignment."),
+    ).status_code == 200
+
+    reminder = db.scalar(select(Reminder))
+    occurrence = db.scalar(select(ReminderOccurrence))
+    assert reminder is not None and occurrence is not None
+    assert reminder.task == "Submit my assignment"
+    assert utc_timestamp(occurrence.scheduled_at) == datetime(
+        2026, 10, 31, 3, 0, tzinfo=timezone.utc
+    )
+    db.refresh(session)
+    assert session.status == "ENDED"
+    assert session.pending_clarification is None
+
+
 def test_multiple_people_in_one_task_create_one_reminder(
     api_client, telegram_client, db, update_factory
 ) -> None:
