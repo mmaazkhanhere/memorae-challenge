@@ -146,6 +146,10 @@ def materialize_active_recurring_reminders(
                         logging.WARNING,
                         "recurring_materialization_skipped",
                         reminder_id=str(reminder.id),
+                        recurrence_rule=reminder.recurrence_rule,
+                        start_local=reminder.start_local,
+                        timezone=reminder.timezone,
                         reason=type(exc).__name__,
+                        error_message=str(exc),
                     )
         return created
