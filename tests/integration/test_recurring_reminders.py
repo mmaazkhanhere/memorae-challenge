@@ -72,6 +72,50 @@ def test_weekly_reminder_materializes_local_wall_clock_and_confirms(
     assert db.scalar(select(func.count()).select_from(Notification)) == len(occurrences)
 
 
+def test_every_day_reminder_materializes_all_seven_weekdays(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory)
+    response = post_update(
+        api_client,
+        update_factory(308, text="Remind me every day at 8 AM to drink water."),
+    )
+
+    assert response.status_code == 200
+    reminder = db.scalar(select(Reminder))
+    assert reminder is not None
+    assert reminder.recurrence_rule == (
+        "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR,SA,SU;BYHOUR=08;BYMINUTE=00"
+    )
+    occurrences = db.scalars(
+        select(ReminderOccurrence)
+        .where(ReminderOccurrence.reminder_id == reminder.id)
+        .order_by(ReminderOccurrence.scheduled_at)
+    ).all()
+    assert len(occurrences) >= 7
+    assert len({occurrence.recurrence_instance_key for occurrence in occurrences[:7]}) == 7
+
+
+def test_monthly_and_yearly_reminders_persist_calendar_rules(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory)
+    assert post_update(
+        api_client,
+        update_factory(309, text="Remind me every month on the 15th at 8 AM to pay rent."),
+    ).status_code == 200
+    assert post_update(
+        api_client,
+        update_factory(310, text="Remind me every year on March 10 at 9 AM to renew insurance."),
+    ).status_code == 200
+
+    reminders = db.scalars(select(Reminder).order_by(Reminder.created_at)).all()
+    assert [reminder.recurrence_rule for reminder in reminders] == [
+        "FREQ=MONTHLY;BYMONTHDAY=15;BYHOUR=08;BYMINUTE=00",
+        "FREQ=YEARLY;BYMONTH=03;BYMONTHDAY=10;BYHOUR=09;BYMINUTE=00",
+    ]
+
+
 def test_replaying_recurring_update_creates_no_duplicate_series(
     api_client, telegram_client, db, update_factory
 ) -> None:

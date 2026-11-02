@@ -26,6 +26,20 @@ def test_router_classifies_pending_conversation_before_parsing() -> None:
     assert route_message("thanks", pending=pending).route is ConversationRoute.SOCIAL
 
 
+def test_router_recognizes_read_only_listing_with_or_without_pending_draft() -> None:
+    assert route_message("What do I have tomorrow?", pending=None).route is (
+        ConversationRoute.LIST_REQUEST
+    )
+
+
+def test_router_recognizes_recurring_reminder_list_requests() -> None:
+    assert route_message("can you show me all the recurring reminders?", pending=None).route == ConversationRoute.LIST_REQUEST
+    assert route_message("what do i have on every Tuesday?", pending=None).route == ConversationRoute.LIST_REQUEST
+    assert route_message("Show my reminders this week", pending=_pending()).route is (
+        ConversationRoute.LIST_REQUEST
+    )
+
+
 def test_router_does_not_start_a_reminder_from_unrelated_text() -> None:
     assert route_message("7 PM", pending=None).route is ConversationRoute.UNRELATED
     assert route_message("I have five tasks today", pending=None).route is (

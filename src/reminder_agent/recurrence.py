@@ -1,9 +1,4 @@
-"""Small, strict recurrence engine used by VS-07.
-
-The challenge only needs weekly wall-clock schedules.  Keeping the accepted
-rule vocabulary deliberately small makes model output safe to validate and
-keeps recurrence calculations independent from provider integrations.
-"""
+"""Small, strict recurrence engine for weekly, monthly, and yearly schedules."""
 
 from __future__ import annotations
 
@@ -29,6 +24,7 @@ class WeeklyRecurrence:
     weekdays: tuple[int, ...]
     hour: int
     minute: int
+    interval: int = 1
 
     def __post_init__(self) -> None:
         if not self.weekdays or any(day < 0 or day > 6 for day in self.weekdays):
@@ -37,11 +33,62 @@ class WeeklyRecurrence:
             raise ValueError("weekly recurrence weekdays must be sorted and unique")
         if not 0 <= self.hour <= 23 or not 0 <= self.minute <= 59:
             raise ValueError("weekly recurrence has an invalid local time")
+        if self.interval < 1:
+            raise ValueError("weekly recurrence interval must be positive")
 
     @property
     def canonical_rule(self) -> str:
         days = ",".join(WEEKDAY_NAMES[day] for day in self.weekdays)
-        return f"FREQ=WEEKLY;BYDAY={days};BYHOUR={self.hour:02d};BYMINUTE={self.minute:02d}"
+        interval = f";INTERVAL={self.interval}" if self.interval != 1 else ""
+        return f"FREQ=WEEKLY{interval};BYDAY={days};BYHOUR={self.hour:02d};BYMINUTE={self.minute:02d}"
+
+
+@dataclass(frozen=True)
+class MonthlyRecurrence:
+    day_of_month: int
+    hour: int
+    minute: int
+    interval: int = 1
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.day_of_month <= 31:
+            raise ValueError("monthly recurrence has an invalid day")
+        if not 0 <= self.hour <= 23 or not 0 <= self.minute <= 59:
+            raise ValueError("monthly recurrence has an invalid local time")
+        if self.interval < 1:
+            raise ValueError("monthly recurrence interval must be positive")
+
+    @property
+    def canonical_rule(self) -> str:
+        interval = f";INTERVAL={self.interval}" if self.interval != 1 else ""
+        return (
+            f"FREQ=MONTHLY{interval};BYMONTHDAY={self.day_of_month:02d};"
+            f"BYHOUR={self.hour:02d};BYMINUTE={self.minute:02d}"
+        )
+
+
+@dataclass(frozen=True)
+class YearlyRecurrence:
+    month: int
+    day_of_month: int
+    hour: int
+    minute: int
+    interval: int = 1
+
+    def __post_init__(self) -> None:
+        date(2000, self.month, self.day_of_month)
+        if not 0 <= self.hour <= 23 or not 0 <= self.minute <= 59:
+            raise ValueError("yearly recurrence has an invalid local time")
+        if self.interval < 1:
+            raise ValueError("yearly recurrence interval must be positive")
+
+    @property
+    def canonical_rule(self) -> str:
+        interval = f";INTERVAL={self.interval}" if self.interval != 1 else ""
+        return (
+            f"FREQ=YEARLY{interval};BYMONTH={self.month:02d};BYMONTHDAY={self.day_of_month:02d};"
+            f"BYHOUR={self.hour:02d};BYMINUTE={self.minute:02d}"
+        )
 
 
 def parse_weekly_rule(rule: str) -> WeeklyRecurrence:
@@ -63,7 +110,43 @@ def parse_weekly_rule(rule: str) -> WeeklyRecurrence:
         minute = int(fields["BYMINUTE"])
     except (KeyError, ValueError) as exc:
         raise ValueError("weekly recurrence requires BYHOUR and BYMINUTE") from exc
-    return WeeklyRecurrence(tuple(sorted({WEEKDAY_BY_NAME[day] for day in raw_days})), hour, minute)
+    return WeeklyRecurrence(tuple(sorted({WEEKDAY_BY_NAME[day] for day in raw_days})), hour, minute, int(fields.get("INTERVAL", "1")))
+
+
+def _rule_fields(rule: str) -> dict[str, str]:
+    fields = {}
+    for part in rule.split(";"):
+        if "=" not in part:
+            raise ValueError("invalid recurrence rule")
+        key, value = part.split("=", 1)
+        fields[key.upper()] = value.upper()
+    return fields
+
+
+def parse_recurrence_rule(
+    rule: str,
+) -> WeeklyRecurrence | MonthlyRecurrence | YearlyRecurrence:
+    fields = _rule_fields(rule)
+    try:
+        hour = int(fields["BYHOUR"])
+        minute = int(fields["BYMINUTE"])
+    except (KeyError, ValueError) as exc:
+        raise ValueError("recurrence requires BYHOUR and BYMINUTE") from exc
+    frequency = fields.get("FREQ")
+    try:
+        interval = int(fields.get("INTERVAL", "1"))
+    except ValueError as exc:
+        raise ValueError("recurrence interval must be an integer") from exc
+    if frequency == "WEEKLY":
+        raw_days = fields.get("BYDAY", "").split(",")
+        if not raw_days or any(day not in WEEKDAY_BY_NAME for day in raw_days):
+            raise ValueError("weekly recurrence requires valid BYDAY values")
+        return WeeklyRecurrence(tuple(sorted({WEEKDAY_BY_NAME[day] for day in raw_days})), hour, minute, interval)
+    if frequency == "MONTHLY":
+        return MonthlyRecurrence(int(fields["BYMONTHDAY"]), hour, minute, interval)
+    if frequency == "YEARLY":
+        return YearlyRecurrence(int(fields["BYMONTH"]), int(fields["BYMONTHDAY"]), hour, minute, interval)
+    raise ValueError("unsupported recurrence frequency")
 
 
 def resolve_local_datetime(local_date: date, local_time: time, zone: ZoneInfo) -> datetime:
@@ -102,17 +185,63 @@ def iter_weekly_occurrences(
 ):
     """Yield future UTC/local recurrence instances through a rolling horizon."""
 
+    yield from iter_recurrence_occurrences(
+        recurrence,
+        start_local=start_local,
+        now=now,
+        timezone_name=timezone_name,
+        horizon_days=horizon_days,
+    )
+
+
+def iter_recurrence_occurrences(
+    recurrence: WeeklyRecurrence | MonthlyRecurrence | YearlyRecurrence,
+    *,
+    start_local: datetime,
+    now: datetime,
+    timezone_name: str,
+    horizon_days: int,
+):
     zone = ZoneInfo(timezone_name)
     local_now = now.astimezone(zone)
-    first_date = max(start_local.date(), local_now.date())
     end_date = local_now.date() + timedelta(days=horizon_days)
-    current = first_date
+    if isinstance(recurrence, WeeklyRecurrence):
+        current = max(start_local.date(), local_now.date())
+        while current <= end_date:
+            weeks_since_start = (current - start_local.date()).days // 7
+            if current.weekday() in recurrence.weekdays and weeks_since_start % recurrence.interval == 0:
+                local_due = resolve_local_datetime(current, time(recurrence.hour, recurrence.minute), zone)
+                due_utc = local_due.astimezone(timezone.utc)
+                if due_utc > now:
+                    yield current, local_due, due_utc
+            current += timedelta(days=1)
+        return
+
+    current = max(start_local.date().replace(day=1), local_now.date().replace(day=1))
     while current <= end_date:
-        if current.weekday() in recurrence.weekdays:
-            local_due = resolve_local_datetime(
-                current, time(recurrence.hour, recurrence.minute), zone
-            )
-            due_utc = local_due.astimezone(timezone.utc)
-            if due_utc > now:
-                yield current, local_due, due_utc
-        current += timedelta(days=1)
+        if isinstance(recurrence, YearlyRecurrence) and current.month != recurrence.month:
+            current = date(current.year + (1 if current.month >= recurrence.month else 0), recurrence.month, 1)
+            if current <= local_now.date().replace(day=1):
+                current = date(current.year + 1, recurrence.month, 1)
+        day = recurrence.day_of_month
+        months_since_start = (current.year - start_local.year) * 12 + current.month - start_local.month
+        years_since_start = current.year - start_local.year
+        matches_interval = (
+            months_since_start % recurrence.interval == 0
+            if isinstance(recurrence, MonthlyRecurrence)
+            else years_since_start % recurrence.interval == 0
+        )
+        if matches_interval and current.month == getattr(recurrence, "month", current.month):
+            try:
+                candidate = date(current.year, current.month, day)
+            except ValueError:
+                candidate = None
+            if candidate is not None and start_local.date() <= candidate <= end_date:
+                local_due = resolve_local_datetime(candidate, time(recurrence.hour, recurrence.minute), zone)
+                due_utc = local_due.astimezone(timezone.utc)
+                if due_utc > now:
+                    yield candidate, local_due, due_utc
+        if isinstance(recurrence, MonthlyRecurrence):
+            current = date(current.year + (1 if current.month == 12 else 0), 1 if current.month == 12 else current.month + 1, 1)
+        else:
+            current = date(current.year + 1, 1, 1)

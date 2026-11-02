@@ -3,10 +3,69 @@ from zoneinfo import ZoneInfo
 
 from reminder_agent.intent import CreateRecurringReminderIntent, RuleBasedIntentInterpreter
 from reminder_agent.recurrence import (
+    MonthlyRecurrence,
+    YearlyRecurrence,
+    iter_recurrence_occurrences,
     WeeklyRecurrence,
+    parse_recurrence_rule,
     parse_weekly_rule,
     resolve_local_datetime,
 )
+
+
+def test_monthly_31st_skips_months_without_day_31() -> None:
+    occurrences = list(
+        iter_recurrence_occurrences(
+            MonthlyRecurrence(31, 8, 0),
+            start_local=datetime(2026, 1, 31, 8),
+            now=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            timezone_name="UTC",
+            horizon_days=220,
+        )
+    )
+
+    assert [item[0] for item in occurrences[:4]] == [
+        date(2026, 1, 31),
+        date(2026, 3, 31),
+        date(2026, 5, 31),
+        date(2026, 7, 31),
+    ]
+
+
+def test_monthly_interval_projects_every_third_month() -> None:
+    recurrence = MonthlyRecurrence(15, 8, 0, interval=3)
+    occurrences = list(
+        iter_recurrence_occurrences(
+            recurrence,
+            start_local=datetime(2026, 1, 15, 8),
+            now=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            timezone_name="UTC",
+            horizon_days=365,
+        )
+    )
+
+    assert recurrence.canonical_rule == "FREQ=MONTHLY;INTERVAL=3;BYMONTHDAY=15;BYHOUR=08;BYMINUTE=00"
+    assert parse_recurrence_rule(recurrence.canonical_rule) == recurrence
+    assert [item[0] for item in occurrences] == [
+        date(2026, 1, 15),
+        date(2026, 4, 15),
+        date(2026, 7, 15),
+        date(2026, 10, 15),
+    ]
+
+
+def test_yearly_february_29_skips_non_leap_years() -> None:
+    occurrences = list(
+        iter_recurrence_occurrences(
+            YearlyRecurrence(2, 29, 8, 0),
+            start_local=datetime(2027, 2, 28, 8),
+            now=datetime(2027, 1, 1, tzinfo=timezone.utc),
+            timezone_name="UTC",
+            horizon_days=900,
+        )
+    )
+
+    assert [item[0] for item in occurrences] == [date(2028, 2, 29)]
 
 
 def test_weekly_phrase_is_parsed_into_a_typed_local_schedule() -> None:

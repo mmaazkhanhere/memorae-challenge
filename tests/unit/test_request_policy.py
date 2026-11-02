@@ -33,3 +33,8 @@ def test_prompt_injection_is_rejected_as_untrusted_input() -> None:
 def test_only_currently_implemented_operation_is_supported() -> None:
     assert is_supported_operation("CREATE_ONE_TIME_REMINDER") is True
     assert is_supported_operation("CANCEL_REMINDER") is False
+
+
+def test_listing_is_in_scope_and_read_only_operation_is_supported() -> None:
+    assert assess_request("What do I have tomorrow?").is_rejected is False
+    assert is_supported_operation("LIST_REMINDERS") is True
