@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -44,12 +45,19 @@ from reminder_agent.intent import (
     IntentRouter,
     IntentInterpreter,
     Interpretation,
+    ListRemindersIntent,
     PendingReminder,
     ReminderIntentInterpreter,
     RuleBasedIntentInterpreter,
     restrict_to_explicit_field_updates,
 )
-from reminder_agent.recurrence import WeeklyRecurrence, resolve_local_datetime
+from reminder_agent.reminder_listing import format_reminder_list, list_reminders_in_range
+from reminder_agent.recurrence import (
+    MonthlyRecurrence,
+    WeeklyRecurrence,
+    YearlyRecurrence,
+    resolve_local_datetime,
+)
 from reminder_agent.recurrence_service import materialize_recurring_reminder
 from reminder_agent.observability import get_logger, log_event
 from reminder_agent.request_policy import (
@@ -66,6 +74,28 @@ ONE_TIME = "ONE_TIME"
 RECURRING = "RECURRING"
 PENDING = "PENDING"
 logger = get_logger()
+
+
+def _recurrence_for_intent(intent: CreateRecurringReminderIntent):
+    if intent.frequency == "WEEKLY":
+        return WeeklyRecurrence(intent.weekdays, intent.hour, intent.minute, intent.interval)
+    if intent.frequency == "MONTHLY":
+        return MonthlyRecurrence(
+            intent.day_of_month or 0, intent.hour, intent.minute, intent.interval
+        )
+    return YearlyRecurrence(
+        intent.month or 0,
+        intent.day_of_month or 0,
+        intent.hour,
+        intent.minute,
+        intent.interval,
+    )
+
+
+def _ordinal_suffix(day: int) -> str:
+    if 10 < day % 100 < 14:
+        return "th"
+    return {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
 
 
 @dataclass(frozen=True)
@@ -258,23 +288,34 @@ def _interpret(
     interpreter: IntentInterpreter,
     text: str,
     *,
+    selected_route: IntentRoute,
     timezone_name: str,
     now: datetime,
     context: PendingReminder | None,
     recent_messages: list[str],
 ):
-    """Always pass the pending context when one exists."""
-    if isinstance(interpreter, ReminderIntentInterpreter):
-        return interpreter.interpret(
-            text,
-            timezone_name=timezone_name,
-            now=now,
-            context=context,
-            recent_messages=recent_messages,
-        )
-    if context is None:
-        return interpreter.interpret(text, timezone_name=timezone_name, now=now)
-    return interpreter.interpret(text, timezone_name=timezone_name, now=now, context=context)
+    """Pass an explicit classifier route into the extraction boundary."""
+    kwargs = {"timezone_name": timezone_name, "now": now}
+    parameters = inspect.signature(interpreter.interpret).parameters
+    if "selected_route" in parameters:
+        kwargs["selected_route"] = selected_route
+    if context is not None and "context" in parameters:
+        kwargs["context"] = context
+    if "recent_messages" in parameters:
+        kwargs["recent_messages"] = recent_messages
+    return interpreter.interpret(text, **kwargs)
+
+
+def _selected_intent_route(
+    route: ConversationRoute, *, pending: PendingReminder | None
+) -> IntentRoute:
+    if route is ConversationRoute.LIST_REQUEST:
+        return IntentRoute.LIST_REQUEST
+    if route is ConversationRoute.CLARIFICATION_REPLY:
+        return IntentRoute.UPDATE_PENDING
+    if route is ConversationRoute.MODEL_FALLBACK:
+        return IntentRoute.UPDATE_PENDING if pending is not None else IntentRoute.NEW_REQUEST
+    return IntentRoute.NEW_REQUEST
 
 
 def _recent_messages(db: Session, *, user_id: UUID) -> list[str]:
@@ -340,7 +381,9 @@ def _route_and_interpret(
             "reminder_route_classifier_selected",
             operation=suggestion,
         )
-        if suggestion is IntentRoute.NEW_REQUEST:
+        if suggestion is IntentRoute.LIST_REQUEST:
+            route = ConversationRoute.LIST_REQUEST
+        elif suggestion is IntentRoute.NEW_REQUEST:
             route = ConversationRoute.NEW_REQUEST
         elif suggestion is IntentRoute.UPDATE_PENDING and pending is not None:
             route = ConversationRoute.CLARIFICATION_REPLY
@@ -382,9 +425,11 @@ def _route_and_interpret(
             fallback_allowed=False,
         )
     else:
+        selected_route = _selected_intent_route(route, pending=pending)
         interpretation = _interpret(
             interpreter,
             text,
+            selected_route=selected_route,
             timezone_name=timezone_name,
             now=now,
             context=(
@@ -666,7 +711,7 @@ def handle_reminder_text(
         needs_clarification=interpretation.clarification is not None,
         route=route,
         task_length=(
-            len(interpretation.resolved_intents[0].task)
+            len(getattr(interpretation.resolved_intents[0], "task", ""))
             if interpretation.resolved_intents
             else None
         ),
@@ -776,6 +821,41 @@ def handle_reminder_text(
                     text=interpretation.response_text
                     or "I didn't find a reminder request in that message.",
                     response_kind=("social" if route is ConversationRoute.SOCIAL else "unrelated"),
+                )
+
+            list_intents = [
+                intent
+                for intent in interpretation.resolved_intents
+                if isinstance(intent, ListRemindersIntent)
+            ]
+            if list_intents:
+                if len(list_intents) != 1 or len(interpretation.resolved_intents) != 1:
+                    return ReminderReply(
+                        update.message.chat.id,
+                        "Please ask for one reminder date range at a time.",
+                    )
+                list_intent = list_intents[0]
+                if list_intent.timezone_name != user.timezone:
+                    return ReminderReply(
+                        update.message.chat.id,
+                        "I couldn't verify your reminder time zone. Please try again.",
+                    )
+                listed = list_reminders_in_range(
+                    db,
+                    user_id=user.id,
+                    start_date=list_intent.start_date,
+                    end_date=list_intent.end_date,
+                    timezone_name=user.timezone,
+                    now=now,
+                )
+                return ReminderReply(
+                    update.message.chat.id,
+                    format_reminder_list(
+                        listed,
+                        start_date=list_intent.start_date,
+                        end_date=list_intent.end_date,
+                        timezone_name=user.timezone,
+                    ),
                 )
 
             if interpretation.clarification is not None:
@@ -906,11 +986,7 @@ def handle_reminder_text(
                             response_kind="timezone_validation_failure",
                         )
                     if isinstance(intent, CreateRecurringReminderIntent):
-                        recurrence = WeeklyRecurrence(intent.weekdays, intent.hour, intent.minute)
-                        if intent.start_local.weekday() not in intent.weekdays:
-                            raise ValueError(
-                                "recurring start_local must match a selected weekday"
-                            )
+                        recurrence = _recurrence_for_intent(intent)
                         local_due = resolve_local_datetime(
                             intent.start_local.date(),
                             intent.start_local.timetz(),
@@ -973,7 +1049,7 @@ def handle_reminder_text(
             confirmations: list[str] = []
             for intent, due_at, local_display in scheduled:
                 if isinstance(intent, CreateRecurringReminderIntent):
-                    recurrence = WeeklyRecurrence(intent.weekdays, intent.hour, intent.minute)
+                    recurrence = _recurrence_for_intent(intent)
                     reminder = Reminder(
                         user_id=user.id,
                         task=intent.task,
@@ -987,12 +1063,31 @@ def handle_reminder_text(
                     db.add(reminder)
                     db.flush()
                     materialize_recurring_reminder(db, reminder, now=reference, horizon_days=35)
-                    day_label = ", ".join(
-                        ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")[day]
-                        for day in intent.weekdays
-                    )
+                    if intent.frequency == "WEEKLY":
+                        day_label = ", ".join(
+                            ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")[day]
+                            for day in intent.weekdays
+                        )
+                        cadence = (
+                            f"every {intent.interval} weeks on {day_label}"
+                            if intent.interval != 1
+                            else f"every {day_label}"
+                        )
+                    elif intent.frequency == "MONTHLY":
+                        cadence = (
+                            f"every {intent.interval} months on the "
+                            f"{intent.day_of_month}{_ordinal_suffix(intent.day_of_month or 0)}"
+                            if intent.interval != 1
+                            else f"every month on the {intent.day_of_month}{_ordinal_suffix(intent.day_of_month or 0)}"
+                        )
+                    else:
+                        cadence = (
+                            f"every {intent.interval} years on {intent.month:02d}-{intent.day_of_month:02d}"
+                            if intent.interval != 1
+                            else f"every year on {intent.month:02d}-{intent.day_of_month:02d}"
+                        )
                     confirmations.append(
-                        f"I'll remind you to {reminder.task} every {day_label} at "
+                        f"I'll remind you to {reminder.task} {cadence} at "
                         f"{intent.hour:02d}:{intent.minute:02d} {user.timezone} via Telegram. "
                         f"Next: {local_display}."
                     )

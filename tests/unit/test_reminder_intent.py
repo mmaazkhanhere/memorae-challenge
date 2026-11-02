@@ -4,10 +4,12 @@ from datetime import date, datetime, timezone
 import httpx
 import pytest
 
+from reminder_agent.conversation_router import ConversationRoute
 from reminder_agent.intent import (
     CreateRecurringReminderIntent,
     CreateOneTimeReminderIntent,
     IntentRoute,
+    IntentRouteSuggestion,
     OpenAICompatibleIntentRouter,
     Interpretation,
     NeedsClarification,
@@ -19,11 +21,111 @@ from reminder_agent.intent import (
     restrict_to_explicit_field_updates,
     resolve_pending_due_at,
 )
+from reminder_agent.reminders import _route_and_interpret
 from reminder_agent.settings import Settings
 from reminder_agent.request_policy import OUT_OF_SCOPE_RESPONSE
 
 
 NOW = datetime(2026, 10, 30, 12, 0, tzinfo=timezone.utc)
+
+
+def test_monthly_ordinal_request_preserves_recurrence_while_asking_for_time() -> None:
+    result = RuleBasedIntentInterpreter().interpret(
+        "Remind me on the first day of every month to pay rent",
+        selected_route=IntentRoute.NEW_REQUEST,
+        timezone_name="Asia/Karachi",
+        now=NOW,
+    )
+
+    assert result.clarification is not None
+    assert result.clarification.question == "What time should I use on the 1st day of each month?"
+    assert result.clarification.pending.task == "pay rent"
+    assert result.clarification.pending.recurrence_frequency == "MONTHLY"
+    assert result.clarification.pending.recurrence_day_of_month == 1
+
+
+def test_monthly_ordinal_follow_up_builds_recurring_intent() -> None:
+    parser = RuleBasedIntentInterpreter()
+    first = parser.interpret(
+        "Remind me on the first day of every month to pay rent",
+        selected_route=IntentRoute.NEW_REQUEST,
+        timezone_name="Asia/Karachi",
+        now=NOW,
+    )
+    assert first.clarification is not None
+
+    result = parser.interpret(
+        "9 am",
+        selected_route=IntentRoute.UPDATE_PENDING,
+        context=first.clarification.pending,
+        timezone_name="Asia/Karachi",
+        now=NOW,
+    )
+
+    assert result.intent is not None
+    assert isinstance(result.intent, CreateRecurringReminderIntent)
+    assert result.intent.frequency == "MONTHLY"
+    assert result.intent.day_of_month == 1
+    assert result.intent.task == "pay rent"
+    assert result.intent.hour == 9
+
+
+def test_monthly_numeric_ordinal_without_suffix_preserves_recurrence() -> None:
+    parser = RuleBasedIntentInterpreter()
+    first = parser.interpret(
+        "Remind me on the 2 of every month to pay bills",
+        selected_route=IntentRoute.NEW_REQUEST,
+        timezone_name="Asia/Karachi",
+        now=NOW,
+    )
+
+    assert first.clarification is not None
+    assert first.clarification.pending.task == "pay bills"
+    assert first.clarification.pending.recurrence_frequency == "MONTHLY"
+    assert first.clarification.pending.recurrence_day_of_month == 2
+
+    result = parser.interpret(
+        "5 pm",
+        selected_route=IntentRoute.UPDATE_PENDING,
+        context=first.clarification.pending,
+        timezone_name="Asia/Karachi",
+        now=NOW,
+    )
+
+    assert result.intent is not None
+    assert isinstance(result.intent, CreateRecurringReminderIntent)
+    assert result.intent.frequency == "MONTHLY"
+    assert result.intent.day_of_month == 2
+    assert result.intent.task == "pay bills"
+    assert result.intent.hour == 17
+
+
+def test_monthly_numeric_ordinal_with_suffix_preserves_recurrence() -> None:
+    parser = RuleBasedIntentInterpreter()
+    first = parser.interpret(
+        "remind me on the 15th of every month to call parents",
+        selected_route=IntentRoute.NEW_REQUEST,
+        timezone_name="Asia/Karachi",
+        now=NOW,
+    )
+
+    assert first.clarification is not None
+    assert first.clarification.pending.task == "call parents"
+    assert first.clarification.pending.recurrence_day_of_month == 15
+
+    result = parser.interpret(
+        "6 pm",
+        selected_route=IntentRoute.UPDATE_PENDING,
+        context=first.clarification.pending,
+        timezone_name="Asia/Karachi",
+        now=NOW,
+    )
+
+    assert result.intent is not None
+    assert isinstance(result.intent, CreateRecurringReminderIntent)
+    assert result.intent.frequency == "MONTHLY"
+    assert result.intent.day_of_month == 15
+    assert result.intent.hour == 18
 
 
 def test_intent_router_classifies_only_the_operation_and_limits_history(monkeypatch) -> None:
@@ -54,6 +156,7 @@ def test_intent_router_classifies_only_the_operation_and_limits_history(monkeypa
     )
 
     assert suggestion.operation is IntentRoute.NEW_REQUEST
+    assert "LIST_REQUEST" in captured["messages"][0]["content"]
     context = json.loads(captured["messages"][1]["content"])
     assert context["active_pending"]["task"] == "call Bilal"
     assert context["missing_fields"] == ["date"]
@@ -61,6 +164,69 @@ def test_intent_router_classifies_only_the_operation_and_limits_history(monkeypa
     assert len(context["recent_messages"]) == 6
     assert "message 33" not in context["recent_messages"]
     assert "message 34" in context["recent_messages"]
+
+
+def test_intent_router_accepts_list_request_route(monkeypatch) -> None:
+    def fake_post(*args, **kwargs):
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={"choices": [{"message": {"content": '{"operation":"LIST_REQUEST"}'}}]},
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    suggestion = OpenAICompatibleIntentRouter(
+        "https://api.groq.example/openai/v1", "secret", "openai/gpt-oss-20b"
+    ).classify(
+        "Could you tell me what is scheduled next week?",
+        pending=None,
+        recent_messages=(),
+    )
+
+    assert suggestion.operation is IntentRoute.LIST_REQUEST
+
+
+def test_list_request_route_from_classifier_reaches_interpreter() -> None:
+    class ListRouter:
+        def classify(self, *args, **kwargs):
+            return IntentRouteSuggestion(operation=IntentRoute.LIST_REQUEST)
+
+    class RecordingInterpreter:
+        def __init__(self) -> None:
+            self.called = False
+
+        def interpret(self, *args, **kwargs):
+            self.called = True
+            return Interpretation(response_text="listing")
+
+    interpreter = RecordingInterpreter()
+    route, result = _route_and_interpret(
+        interpreter,
+        "Could you tell me what is scheduled next week?",
+        timezone_name="UTC",
+        now=NOW,
+        pending=None,
+        user_name="Ada",
+        intent_router=ListRouter(),
+    )
+
+    assert route is ConversationRoute.LIST_REQUEST
+    assert interpreter.called is True
+    assert result.response_text == "listing"
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["what do i have on every Tuesday?", "can you show me all the recurring reminders?"],
+)
+def test_recurring_list_phrases_are_parsed_as_read_only_list_requests(text: str) -> None:
+    result = RuleBasedIntentInterpreter().interpret(
+        text, timezone_name="Asia/Karachi", now=NOW
+    )
+
+    assert result.intent is not None
+    assert result.intent.operation == "LIST_REMINDERS"
+    assert result.fallback_allowed is False
 
 
 def test_pending_update_normalises_meridiem_case() -> None:
@@ -282,6 +448,41 @@ def test_recurring_request_is_parsed_deterministically() -> None:
     assert result.intent.task == "call John"
     assert result.intent.weekdays == (4,)
     assert result.intent.start_local == datetime(2026, 10, 30, 18)
+
+
+def test_every_day_recurring_request_expands_to_all_weekdays() -> None:
+    result = RuleBasedIntentInterpreter().interpret(
+        "Remind me every day at 8 AM to drink water",
+        timezone_name="Asia/Karachi",
+        now=NOW,
+    )
+
+    assert isinstance(result.intent, CreateRecurringReminderIntent)
+    assert result.intent.task == "drink water"
+    assert result.intent.weekdays == tuple(range(7))
+    assert result.intent.hour == 8
+
+
+@pytest.mark.parametrize(
+    ("text", "frequency", "day_of_month", "month"),
+    [
+        ("Remind me every month on the 15th at 8 AM to pay rent", "MONTHLY", 15, None),
+        ("Remind me every year on March 10 at 9 AM to renew insurance", "YEARLY", 10, 3),
+    ],
+)
+def test_monthly_and_yearly_recurrence_requests_are_parsed(
+    text: str, frequency: str, day_of_month: int, month: int | None
+) -> None:
+    result = RuleBasedIntentInterpreter().interpret(
+        text,
+        timezone_name="Asia/Karachi",
+        now=NOW,
+    )
+
+    assert isinstance(result.intent, CreateRecurringReminderIntent)
+    assert result.intent.frequency == frequency
+    assert result.intent.day_of_month == day_of_month
+    assert result.intent.month == month
 
 
 def test_ambiguous_hour_is_clarified_without_guessing_next_morning() -> None:
@@ -1045,6 +1246,77 @@ def test_openai_compatible_interpreter_returns_only_provider_field_updates_for_c
     assert completed.intent is not None
     assert completed.intent.task == "call the bank"
     assert completed.intent.due_at == datetime(2026, 10, 30, 19, 0, tzinfo=timezone.utc)
+
+
+def test_llm_recurrence_update_fields_are_verified_and_merged() -> None:
+    context = PendingReminder(
+        task="pay bills",
+        date_local=date(2026, 11, 2),
+        hour=5,
+        meridiem="pm",
+        timezone_name="Asia/Karachi",
+    )
+    proposed = PendingReminderFieldUpdate(
+        recurrence_frequency="MONTHLY",
+        recurrence_day_of_month=2,
+        certainty="CLEAR",
+        evidence={
+            "recurrence_frequency": "monthly",
+            "recurrence_day_of_month": "2nd",
+        },
+    )
+
+    verified = restrict_to_explicit_field_updates(
+        "make it monthly on the 2nd",
+        proposed,
+        context=context,
+        now=NOW,
+        allow_semantic_field_updates=True,
+    )
+    completed = RuleBasedIntentInterpreter().apply_field_updates(
+        context, verified, now=NOW
+    )
+
+    assert completed.intent is not None
+    assert isinstance(completed.intent, CreateRecurringReminderIntent)
+    assert completed.intent.frequency == "MONTHLY"
+    assert completed.intent.day_of_month == 2
+
+
+def test_llm_recurring_extraction_derives_start_for_every_three_months(monkeypatch) -> None:
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda *args, **kwargs: httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"operation":"CREATE_RECURRING_REMINDER",'
+                                '"task":"review budget","frequency":"MONTHLY",'
+                                '"interval":3,"day_of_month":15,"hour":8,"minute":0}'
+                            )
+                        }
+                    }
+                ]
+            },
+        ),
+    )
+
+    result = OpenAICompatibleIntentInterpreter(
+        "https://llm.example/v1", "secret", "provider-model"
+    ).interpret(
+        "remind me every three months on the 15th at 8 AM to review budget",
+        timezone_name="Asia/Karachi",
+        now=datetime(2026, 10, 30, 12, tzinfo=timezone.utc),
+    )
+
+    assert isinstance(result.intent, CreateRecurringReminderIntent)
+    assert result.intent.interval == 3
+    assert result.intent.start_local == datetime(2027, 1, 15, 8)
 
 
 def test_openai_compatible_interpreter_preserves_pending_on_ambiguous_update(monkeypatch) -> None:

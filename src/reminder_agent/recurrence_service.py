@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from reminder_agent.db.models import ChannelIdentity, Notification, Reminder, ReminderOccurrence
 from reminder_agent.observability import get_logger, log_event
-from reminder_agent.recurrence import iter_weekly_occurrences, parse_weekly_rule
+from reminder_agent.recurrence import iter_recurrence_occurrences, parse_recurrence_rule
 
 
 TELEGRAM = "TELEGRAM"
@@ -49,7 +49,7 @@ def materialize_recurring_reminder(
 
     if reminder.schedule_type != "RECURRING" or reminder.status != ACTIVE:
         return 0
-    recurrence = parse_weekly_rule(reminder.recurrence_rule or "")
+    recurrence = parse_recurrence_rule(reminder.recurrence_rule or "")
     start_local = datetime.fromisoformat(reminder.start_local)
     now = _utc(now)
     identity = db.scalar(
@@ -65,7 +65,7 @@ def materialize_recurring_reminder(
 
     insert = _insert_for_dialect(db)
     created = 0
-    for _local_date, local_due, due_at in iter_weekly_occurrences(
+    for _local_date, local_due, due_at in iter_recurrence_occurrences(
         recurrence,
         start_local=start_local,
         now=now,

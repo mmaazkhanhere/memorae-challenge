@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import inspect
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
@@ -22,6 +23,7 @@ logger = get_logger()
 
 class IntentRoute(StrEnum):
     NEW_REQUEST = "NEW_REQUEST"
+    LIST_REQUEST = "LIST_REQUEST"
     UPDATE_PENDING = "UPDATE_PENDING"
     CANCEL_PENDING = "CANCEL_PENDING"
     SOCIAL = "SOCIAL"
@@ -73,12 +75,22 @@ class OpenAICompatibleIntentRouter:
             recent_message_count=len(relevant_history),
         )
         prompt = (
-            "Return JSON only: {\"operation\": one of NEW_REQUEST, UPDATE_PENDING, "
-            "CANCEL_PENDING, SOCIAL, UNRELATED, UNCERTAIN}. Classify intent only; do not "
-            "extract reminder fields, suggest values, or execute anything. NEW_REQUEST is an "
-            "independent reminder; UPDATE_PENDING changes the supplied draft. If the message "
-            "could reasonably mean either, return UNCERTAIN. Use active_pending, missing_fields, "
-            "and last_clarification_question to classify a reply to an active clarification."
+            """
+            Classify the latest message into one operation:
+
+            - NEW_REQUEST: Separate reminder, even if one is pending.
+            - LIST_REQUEST: Retrieve reminders.
+            - UPDATE_PENDING: Clarify or modify the pending reminder.
+            - CANCEL_PENDING: Cancel the pending reminder.
+            - SOCIAL: Casual chat.
+            - UNRELATED: Non-reminder request.
+            - UNCERTAIN: Ambiguous intent.
+
+            Use pending state and conversation context. Distinguish new requests from pending updates by meaning, not keywords. If unclear, return UNCERTAIN.
+
+            Do not extract fields or execute actions.
+            Return JSON only: {"operation": "<OPERATION>"}.
+            """
         )
         payload = {
             "model": self._model,
@@ -170,7 +182,11 @@ class CreateRecurringReminderIntent(BaseModel):
 
     operation: Literal["CREATE_RECURRING_REMINDER"] = "CREATE_RECURRING_REMINDER"
     task: str = Field(min_length=1, max_length=200)
-    weekdays: tuple[int, ...] = Field(min_length=1, max_length=7)
+    frequency: Literal["WEEKLY", "MONTHLY", "YEARLY"] = "WEEKLY"
+    interval: int = Field(default=1, ge=1, le=60)
+    weekdays: tuple[int, ...] = Field(default=(), max_length=7)
+    day_of_month: int | None = Field(default=None, ge=1, le=31)
+    month: int | None = Field(default=None, ge=1, le=12)
     hour: int = Field(ge=0, le=23)
     minute: int = Field(ge=0, le=59)
     start_local: datetime
@@ -211,9 +227,60 @@ class CreateRecurringReminderIntent(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def start_local_must_match_weekday(self) -> "CreateRecurringReminderIntent":
-        if self.start_local.weekday() not in self.weekdays:
-            raise ValueError("start_local must fall on one of the selected weekdays")
+    def recurrence_fields_must_match_frequency(self) -> "CreateRecurringReminderIntent":
+        if self.frequency == "WEEKLY":
+            if not self.weekdays or self.start_local.weekday() not in self.weekdays:
+                raise ValueError("weekly start_local must match a selected weekday")
+            if self.day_of_month is not None or self.month is not None:
+                raise ValueError("weekly recurrence cannot include month fields")
+        elif self.frequency == "MONTHLY":
+            if self.day_of_month is None or self.start_local.day != self.day_of_month:
+                raise ValueError("monthly start_local must match day_of_month")
+            if self.weekdays or self.month is not None:
+                raise ValueError("monthly recurrence has invalid fields")
+        else:
+            if (
+                self.month is None
+                or self.day_of_month is None
+                or self.start_local.month != self.month
+                or self.start_local.day != self.day_of_month
+            ):
+                raise ValueError("yearly start_local must match month and day_of_month")
+            if self.weekdays:
+                raise ValueError("yearly recurrence cannot include weekdays")
+        return self
+
+
+class ListRemindersIntent(BaseModel):
+    """A read-only request for all reminders or an inclusive local-date range."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    operation: Literal["LIST_REMINDERS"] = "LIST_REMINDERS"
+    start_date: date | None = None
+    end_date: date | None = None
+    timezone_name: str = Field(min_length=1, max_length=150)
+
+    @field_validator("timezone_name")
+    @classmethod
+    def timezone_must_be_valid(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except Exception as exc:
+            raise ValueError("timezone_name must be a valid IANA timezone") from exc
+        return value
+
+    @model_validator(mode="after")
+    def date_range_must_be_ordered(self) -> "ListRemindersIntent":
+        if (self.start_date is None) != (self.end_date is None):
+            raise ValueError("start_date and end_date must be supplied together")
+        if self.start_date is None:
+            return self
+        assert self.end_date is not None
+        if self.end_date < self.start_date:
+            raise ValueError("end_date must not precede start_date")
+        if (self.end_date - self.start_date).days > 366:
+            raise ValueError("date range is too large")
         return self
 
 class PendingReminder(BaseModel):
@@ -228,6 +295,10 @@ class PendingReminder(BaseModel):
     minute: int = Field(default=0, ge=0, le=59)
     meridiem: Literal["am", "pm"] | None = None
     recurrence_weekdays: tuple[int, ...] | None = None
+    recurrence_frequency: Literal["MONTHLY", "YEARLY"] | None = None
+    recurrence_interval: int | None = Field(default=None, ge=1, le=60)
+    recurrence_day_of_month: int | None = Field(default=None, ge=1, le=31)
+    recurrence_month: int | None = Field(default=None, ge=1, le=12)
     timezone_name: str = Field(min_length=1, max_length=150)
     date_explicit: bool = False
 
@@ -285,9 +356,16 @@ class PendingReminderFieldUpdate(BaseModel):
     minute: int | None = Field(default=None, ge=0, le=59)
     meridiem: Literal["am", "pm"] | None = None
     date_explicit: bool | None = None
+    recurrence_frequency: Literal["MONTHLY", "YEARLY"] | None = None
+    recurrence_interval: int | None = Field(default=None, ge=1, le=60)
+    recurrence_day_of_month: int | None = Field(default=None, ge=1, le=31)
+    recurrence_month: int | None = Field(default=None, ge=1, le=12)
     certainty: Literal["CLEAR"] | None = None
     evidence: dict[
-        Literal["task", "date_local", "hour", "minute", "meridiem", "date_explicit"], str
+        Literal[
+            "task", "date_local", "hour", "minute", "meridiem", "date_explicit",
+            "recurrence_frequency", "recurrence_interval", "recurrence_day_of_month", "recurrence_month",
+        ], str
     ] = Field(default_factory=dict, exclude=True)
 
     @field_validator("certainty", mode="before")
@@ -353,8 +431,12 @@ def _last_clarification_question(recent_messages: Sequence[str]) -> str | None:
 
 @dataclass(frozen=True)
 class Interpretation:
-    intent: CreateOneTimeReminderIntent | CreateRecurringReminderIntent | None = None
-    intents: tuple[CreateOneTimeReminderIntent | CreateRecurringReminderIntent, ...] = ()
+    intent: (
+        CreateOneTimeReminderIntent | CreateRecurringReminderIntent | ListRemindersIntent | None
+    ) = None
+    intents: tuple[
+        CreateOneTimeReminderIntent | CreateRecurringReminderIntent | ListRemindersIntent, ...
+    ] = ()
     clarification: NeedsClarification | None = None
     field_updates: PendingReminderFieldUpdate | None = None
     response_text: str | None = None
@@ -364,7 +446,9 @@ class Interpretation:
     @property
     def resolved_intents(
         self,
-    ) -> tuple[CreateOneTimeReminderIntent | CreateRecurringReminderIntent, ...]:
+    ) -> tuple[
+        CreateOneTimeReminderIntent | CreateRecurringReminderIntent | ListRemindersIntent, ...
+    ]:
         """Return one or more validated commands represented by this result."""
         if self.intents:
             return self.intents
@@ -394,6 +478,7 @@ class IntentInterpreter(Protocol):
         self,
         text: str,
         *,
+        selected_route: IntentRoute | None = None,
         timezone_name: str,
         now: datetime,
         context: PendingReminder | None = None,
@@ -446,6 +531,61 @@ def _number(value: str) -> int | None:
         return int(value)
     except ValueError:
         return _NUMBER_WORDS.get(value.lower())
+
+
+def _ordinal_suffix(value: int) -> str:
+    if 10 < value % 100 < 14:
+        return "th"
+    return {1: "st", 2: "nd", 3: "rd"}.get(value % 10, "th")
+
+
+def _next_recurring_start_local(
+    *,
+    frequency: str,
+    interval: int,
+    weekdays: tuple[int, ...],
+    day_of_month: int | None,
+    month: int | None,
+    hour: int,
+    minute: int,
+    timezone_name: str,
+    now: datetime,
+) -> datetime:
+    """Derive the next local occurrence for a fully specified recurrence.
+
+    The extraction model supplies the recurrence rule; this application helper
+    owns the clock calculation so a model never has to invent ``start_local``.
+    """
+    local_now = _normalise_now(now).astimezone(ZoneInfo(timezone_name)).replace(tzinfo=None)
+    if frequency == "WEEKLY":
+        for offset in range(8):
+            candidate_date = local_now.date() + timedelta(days=offset)
+            if candidate_date.weekday() not in weekdays:
+                continue
+            candidate = datetime.combine(candidate_date, time(hour, minute))
+            if candidate > local_now:
+                return candidate
+        raise ValueError("could not find weekly recurrence start")
+
+    if day_of_month is None:
+        raise ValueError("calendar recurrence requires day_of_month")
+    candidate_year = local_now.year
+    candidate_month = month or local_now.month
+    while True:
+        try:
+            candidate_date = date(candidate_year, candidate_month, day_of_month)
+        except ValueError:
+            candidate_date = None
+        if candidate_date is not None:
+            candidate = datetime.combine(candidate_date, time(hour, minute))
+            if candidate > local_now:
+                return candidate
+        if frequency == "YEARLY":
+            candidate_year += interval
+        else:
+            candidate_month += interval
+            candidate_year += (candidate_month - 1) // 12
+            candidate_month = (candidate_month - 1) % 12 + 1
 
 
 def _normalise_meridiem(value: str | None) -> str | None:
@@ -727,6 +867,17 @@ def restrict_to_explicit_field_updates(
             and _evidence_is_grounded(proposed.evidence.get("meridiem"), raw)
         ):
             permitted["meridiem"] = proposed.meridiem
+        for field in (
+            "recurrence_frequency",
+            "recurrence_interval",
+            "recurrence_day_of_month",
+            "recurrence_month",
+        ):
+            value = getattr(proposed, field)
+            if value is not None and _evidence_is_grounded(
+                proposed.evidence.get(field), raw
+            ):
+                permitted[field] = value
 
     remainder = raw
     if clock is not None:
@@ -792,7 +943,7 @@ class RuleBasedIntentInterpreter:
         re.IGNORECASE,
     )
     _recurrence = re.compile(
-        r"\bevery\s+(?P<days>(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+        r"\bevery\s+(?P<days>(?:day|monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
         r"(?:\s*(?:,|and)\s*(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))*)"
         r"\s+at\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*"
         r"(?P<meridiem>a\.m\.|p\.m\.|am|pm)?"
@@ -801,12 +952,41 @@ class RuleBasedIntentInterpreter:
     )
     _recurrence_after_task = re.compile(
         r"(?P<task>.+?)\s+every\s+"
-        r"(?P<days>(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+        r"(?P<days>(?:day|monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
         r"(?:\s*(?:,|and)\s*(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))*)"
         r"\s+at\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*"
         r"(?P<meridiem>a\.m\.|p\.m\.|am|pm)?$",
         re.IGNORECASE,
     )
+    _monthly_recurrence = re.compile(
+        r"(?:(?P<before>.+?)\s+)?(?:every\s+month|monthly)\s+on(?:\s+the)?\s+"
+        r"(?P<day>\d{1,2})(?:st|nd|rd|th)?\s+at\s+(?P<hour>\d{1,2})"
+        r"(?::(?P<minute>\d{2}))?\s*(?P<meridiem>a\.m\.|p\.m\.|am|pm)?"
+        r"(?:\s+(?:(?:to|for)\s+)?(?P<after>.+))?$",
+        re.IGNORECASE,
+    )
+    _yearly_recurrence = re.compile(
+        r"(?:(?P<before>.+?)\s+)?(?:every\s+year|yearly)\s+on\s+"
+        r"(?P<month>january|february|march|april|may|june|july|august|september|"
+        r"october|november|december)\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?\s+at\s+"
+        r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*"
+        r"(?P<meridiem>a\.m\.|p\.m\.|am|pm)?(?:\s+(?:(?:to|for)\s+)?(?P<after>.+))?$",
+        re.IGNORECASE,
+    )
+    _monthly_ordinal_recurrence = re.compile(
+        r"(?:(?P<before>.+?)\s+)?on\s+(?:the\s+)?(?P<ordinal>first|second|third|fourth|fifth|"
+        r"\d{1,2}(?:st|nd|rd|th)?)\s*(?:day\s+)?of\s+(?:every|each)\s+month"
+        r"(?:\s+at\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*"
+        r"(?P<meridiem>a\.m\.|p\.m\.|am|pm))?"
+        r"(?:\s+(?:(?:to|for)\s+)?(?P<after>.+))?$",
+        re.IGNORECASE,
+    )
+    _ordinal_numbers = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5}
+    _months = {
+        "january": 1, "february": 2, "march": 3, "april": 4,
+        "may": 5, "june": 6, "july": 7, "august": 8,
+        "september": 9, "october": 10, "november": 11, "december": 12,
+    }
     _multiple_request_separator = re.compile(
         r"\s+and\s+(?=(?:please\s+)?(?:remind\s+me|set\s+(?:a\s+)?reminder)\b)",
         re.IGNORECASE,
@@ -820,16 +1000,44 @@ class RuleBasedIntentInterpreter:
         "saturday": 5,
         "sunday": 6,
     }
+    _list_request = re.compile(
+        r"^\s*(?:can\s+you\s+)?(?:what\s+(?:do\s+i\s+have|are\s+my\s+reminders?)|"
+        r"(?:list|show)(?:\s+(?:my|me))?\s+(?:all\s+(?:the\s+)?)?(?:recurring\s+)?reminders?)\b",
+        re.IGNORECASE,
+    )
+    _list_range = re.compile(
+        r"\b(?:from|between)\s+(?P<start>today|tomorrow|monday|tuesday|wednesday|"
+        r"thursday|friday|saturday|sunday|\d{4}-\d{2}-\d{2})\s+"
+        r"(?:to|and)\s+(?P<end>today|tomorrow|monday|tuesday|wednesday|thursday|"
+        r"friday|saturday|sunday|\d{4}-\d{2}-\d{2})\b",
+        re.IGNORECASE,
+    )
 
     def interpret(
         self,
         text: str,
         *,
+        selected_route: IntentRoute | None = None,
         timezone_name: str,
         now: datetime,
         context: PendingReminder | None = None,
     ) -> Interpretation:
         raw = text.strip()
+        route = selected_route or (
+            IntentRoute.UPDATE_PENDING if context is not None else IntentRoute.NEW_REQUEST
+        )
+        if route is IntentRoute.UNCERTAIN:
+            return Interpretation(
+                response_text="I’m not sure what you want to do. Please clarify.",
+                fallback_allowed=False,
+            )
+        if route is IntentRoute.UPDATE_PENDING and context is None:
+            return Interpretation(
+                response_text="There is no unfinished reminder to update.",
+                fallback_allowed=False,
+            )
+        if route is not IntentRoute.UPDATE_PENDING:
+            context = None
         # An explicit new reminder command supersedes an unresolved clarification.
         # This gives users a safe way to answer a multi-target question with one
         # complete request instead of merging unrelated text into the old action.
@@ -837,6 +1045,10 @@ class RuleBasedIntentInterpreter:
             context = None
         if context is not None:
             return self._interpret_follow_up(text, context=context, now=now)
+
+        listing = self._interpret_listing(raw, timezone_name=timezone_name, now=now)
+        if listing is not None:
+            return listing
 
         # Split independently timed clauses such as "tomorrow at 9 AM to pay
         # rent and at 6 PM to call Sara".  The date before the first clock is
@@ -859,6 +1071,7 @@ class RuleBasedIntentInterpreter:
             parsed = [
                 self.interpret(
                     command,
+                    selected_route=route,
                     timezone_name=timezone_name,
                     now=now,
                     context=None,
@@ -895,6 +1108,9 @@ class RuleBasedIntentInterpreter:
         )
         prefix = self._prefix.match(raw)
         if prefix is None:
+            calendar = self._interpret_calendar_recurrence(raw, timezone_name=timezone_name, now=now)
+            if calendar is not None:
+                return calendar
             recurrence = self._recurrence.search(raw)
             if recurrence is None or recurrence.group("task") is None:
                 recurrence = self._recurrence_after_task.search(raw) or recurrence
@@ -921,6 +1137,12 @@ class RuleBasedIntentInterpreter:
         zone = ZoneInfo(timezone_name)
         reference = _normalise_now(now)
         without_prefix = raw[prefix.end() :]
+
+        calendar = self._interpret_calendar_recurrence(
+            without_prefix, timezone_name=timezone_name, now=reference
+        )
+        if calendar is not None:
+            return calendar
 
         recurrence = self._recurrence.search(without_prefix)
         if recurrence is None or recurrence.group("task") is None:
@@ -1053,6 +1275,271 @@ class RuleBasedIntentInterpreter:
             fallback_allowed=True,
         )
 
+    def _interpret_calendar_recurrence(
+        self, text: str, *, timezone_name: str, now: datetime
+    ) -> Interpretation | None:
+        ordinal = self._monthly_ordinal_recurrence.search(text)
+        if ordinal is not None:
+            raw_ordinal = ordinal.group("ordinal").lower()
+            day = self._ordinal_numbers.get(raw_ordinal)
+            if day is None:
+                day = int(re.sub(r"\D", "", raw_ordinal))
+            return self._build_calendar_interpretation(
+                ordinal,
+                frequency="MONTHLY",
+                day=day,
+                month=None,
+                timezone_name=timezone_name,
+                now=now,
+            )
+        match = self._monthly_recurrence.search(text)
+        frequency = "MONTHLY"
+        month = None
+        if match is None:
+            match = self._yearly_recurrence.search(text)
+            frequency = "YEARLY"
+        if match is None:
+            return None
+        return self._build_calendar_interpretation(
+            match,
+            frequency=frequency,
+            day=int(match.group("day")),
+            month=(self._months[match.group("month").lower()] if frequency == "YEARLY" else None),
+            timezone_name=timezone_name,
+            now=now,
+        )
+
+    def _build_calendar_interpretation(
+        self,
+        match: re.Match[str],
+        *,
+        frequency: str,
+        day: int,
+        month: int | None,
+        timezone_name: str,
+        now: datetime,
+    ) -> Interpretation:
+        hour_value = match.group("hour")
+        hour = int(hour_value) if hour_value is not None else None
+        minute = int(match.group("minute") or 0)
+        meridiem = _normalise_meridiem(match.group("meridiem"))
+        task = _task_from_remainder(
+            f"{match.group('before') or ''} {match.group('after') or ''}"
+        )
+        if hour is None:
+            local_now = now.astimezone(ZoneInfo(timezone_name))
+            return Interpretation(
+                clarification=NeedsClarification(
+                    pending=PendingReminder(
+                        task=task or None,
+                        date_local=local_now.date(),
+                        hour=None,
+                        recurrence_frequency=frequency,
+                        recurrence_day_of_month=day,
+                        recurrence_month=month,
+                        timezone_name=timezone_name,
+                        date_explicit=True,
+                    ),
+                    question=(
+                        f"What time should I use on the {day}{_ordinal_suffix(day)} day "
+                        f"of each {'month' if frequency == 'MONTHLY' else 'year'}?"
+                    ),
+                ),
+                fallback_allowed=False,
+            )
+        if meridiem is None and hour <= 12:
+            return Interpretation(
+                response_text=f"Do you mean {hour:g} AM or {hour:g} PM for this {frequency.lower()} reminder?",
+                fallback_allowed=False,
+            )
+        if meridiem is not None:
+            hour = _clock_to_24(hour, meridiem)
+        if frequency == "YEARLY":
+            assert month is not None
+        try:
+            candidate_year = now.astimezone(ZoneInfo(timezone_name)).year
+            local_now = now.astimezone(ZoneInfo(timezone_name))
+            candidate_month = month or local_now.month
+            while True:
+                try:
+                    candidate_date = date(candidate_year, candidate_month, day)
+                except ValueError:
+                    candidate_year += 1 if frequency == "YEARLY" else 0
+                    if frequency == "MONTHLY":
+                        candidate_month += 1
+                        if candidate_month > 12:
+                            candidate_month = 1
+                            candidate_year += 1
+                    continue
+                candidate_local = datetime.combine(candidate_date, time(hour, minute))
+                if candidate_local > local_now.replace(tzinfo=None):
+                    break
+                if frequency == "YEARLY":
+                    candidate_year += 1
+                else:
+                    candidate_month += 1
+                    if candidate_month > 12:
+                        candidate_month = 1
+                        candidate_year += 1
+            if not task:
+                return Interpretation(
+                    response_text="What should I remind you about on that calendar date?",
+                    fallback_allowed=False,
+                )
+            return Interpretation(
+                intent=CreateRecurringReminderIntent(
+                    task=task,
+                    frequency=frequency,
+                    interval=1,
+                    weekdays=(),
+                    day_of_month=day,
+                    month=month,
+                    hour=hour,
+                    minute=minute,
+                    start_local=candidate_local,
+                    timezone_name=timezone_name,
+                )
+            )
+        except (TypeError, ValueError, ValidationError):
+            return Interpretation(
+                response_text="Please provide a valid monthly or yearly reminder date.",
+                fallback_allowed=False,
+            )
+
+    def _interpret_listing(
+        self, raw: str, *, timezone_name: str, now: datetime
+    ) -> Interpretation | None:
+        if self._list_request.match(raw) is None:
+            return None
+        zone = ZoneInfo(timezone_name)
+        local_today = _normalise_now(now).astimezone(zone).date()
+        normalized = raw.lower()
+
+        def resolve(value: str) -> date:
+            if value == "today":
+                return local_today
+            if value == "tomorrow":
+                return local_today + timedelta(days=1)
+            if value in self._weekdays:
+                return local_today + timedelta(
+                    days=(self._weekdays[value] - local_today.weekday()) % 7
+                )
+            return date.fromisoformat(value)
+
+        if "this week" in normalized:
+            start = local_today - timedelta(days=local_today.weekday())
+            return Interpretation(
+                intent=ListRemindersIntent(
+                    start_date=start,
+                    end_date=start + timedelta(days=6),
+                    timezone_name=timezone_name,
+                ),
+                fallback_allowed=False,
+            )
+        if "next week" in normalized:
+            start = local_today - timedelta(days=local_today.weekday()) + timedelta(days=7)
+            return Interpretation(
+                intent=ListRemindersIntent(
+                    start_date=start,
+                    end_date=start + timedelta(days=6),
+                    timezone_name=timezone_name,
+                ),
+                fallback_allowed=False,
+            )
+
+        # “all recurring reminders” has no single requested date.  Show the
+        # next seven local days, which gives the user a useful projection of
+        # every active recurring series without changing the read-only list
+        # intent shape.
+        if "all" in normalized:
+            return Interpretation(
+                intent=ListRemindersIntent(timezone_name=timezone_name),
+                fallback_allowed=False,
+            )
+
+        if "recurring" in normalized and ("all" in normalized or "every" in normalized):
+            return Interpretation(
+                intent=ListRemindersIntent(
+                    start_date=local_today,
+                    end_date=local_today + timedelta(days=6),
+                    timezone_name=timezone_name,
+                ),
+                fallback_allowed=False,
+            )
+
+        match = self._list_range.search(raw)
+        if match is not None:
+            try:
+                start = resolve(match.group("start").lower())
+                end = resolve(match.group("end").lower())
+                if end < start:
+                    end += timedelta(days=7)
+                return Interpretation(
+                    intent=ListRemindersIntent(
+                        start_date=start,
+                        end_date=end,
+                        timezone_name=timezone_name,
+                    ),
+                    fallback_allowed=False,
+                )
+            except (TypeError, ValueError, ValidationError):
+                return Interpretation(
+                    response_text="Please provide a valid reminder date range.",
+                    fallback_allowed=False,
+                )
+
+        for phrase, offset in (("tomorrow", 1), ("today", 0)):
+            if phrase in normalized:
+                day = local_today + timedelta(days=offset)
+                return Interpretation(
+                    intent=ListRemindersIntent(
+                        start_date=day,
+                        end_date=day,
+                        timezone_name=timezone_name,
+                    ),
+                    fallback_allowed=False,
+                )
+
+        for weekday, index in self._weekdays.items():
+            if re.search(rf"\b{weekday}\b", normalized):
+                day = local_today + timedelta(days=(index - local_today.weekday()) % 7)
+                return Interpretation(
+                    intent=ListRemindersIntent(
+                        start_date=day,
+                        end_date=day,
+                        timezone_name=timezone_name,
+                    ),
+                    fallback_allowed=False,
+                )
+
+        iso_dates = re.findall(r"\b\d{4}-\d{2}-\d{2}\b", normalized)
+        if len(iso_dates) == 1:
+            try:
+                day = date.fromisoformat(iso_dates[0])
+                return Interpretation(
+                    intent=ListRemindersIntent(
+                        start_date=day,
+                        end_date=day,
+                        timezone_name=timezone_name,
+                    ),
+                    fallback_allowed=False,
+                )
+            except ValueError:
+                return Interpretation(
+                    response_text="Please provide a valid reminder date.",
+                    fallback_allowed=False,
+                )
+
+        if re.search(r"\b(?:from|between|on|for)\b", normalized):
+            return Interpretation(
+                response_text="Please provide the reminder date or date range.",
+                fallback_allowed=True,
+            )
+        return Interpretation(
+            intent=ListRemindersIntent(timezone_name=timezone_name),
+            fallback_allowed=False,
+        )
+
     def _build_recurring(
         self,
         match: re.Match[str],
@@ -1060,11 +1547,15 @@ class RuleBasedIntentInterpreter:
         timezone_name: str,
         now: datetime,
     ) -> Interpretation:
-        raw_days = re.findall(
-            r"monday|tuesday|wednesday|thursday|friday|saturday|sunday",
-            match.group("days").lower(),
-        )
-        weekdays = tuple(sorted({self._weekdays[day] for day in raw_days}))
+        raw_day_text = match.group("days").lower()
+        if raw_day_text.strip() == "day":
+            weekdays = tuple(range(7))
+        else:
+            raw_days = re.findall(
+                r"monday|tuesday|wednesday|thursday|friday|saturday|sunday",
+                raw_day_text,
+            )
+            weekdays = tuple(sorted({self._weekdays[day] for day in raw_days}))
         hour = int(match.group("hour"))
         minute = int(match.group("minute") or 0)
         meridiem = _normalise_meridiem(match.group("meridiem"))
@@ -1209,6 +1700,13 @@ class RuleBasedIntentInterpreter:
         now: datetime,
         fallback_allowed: bool = True,
     ) -> Interpretation:
+        if pending.recurrence_frequency is not None and pending.date_local is None:
+            local_today = _normalise_now(now).astimezone(
+                ZoneInfo(pending.timezone_name)
+            ).date()
+            pending = pending.model_copy(
+                update={"date_local": local_today, "date_explicit": True}
+            )
         missing: list[str] = []
         if not pending.task:
             missing.append("task")
@@ -1219,6 +1717,17 @@ class RuleBasedIntentInterpreter:
         elif pending.hour <= 12 and pending.meridiem is None:
             missing.append("AM or PM")
         if missing:
+            if pending.recurrence_frequency is not None and "time" in missing:
+                question = (
+                    f"What time should I use on the "
+                        f"{pending.recurrence_day_of_month}{_ordinal_suffix(pending.recurrence_day_of_month or 1)} "
+                        f"day of each {'month' if pending.recurrence_frequency == 'MONTHLY' else 'year'}?"
+                )
+                return Interpretation(
+                    clarification=NeedsClarification(pending=pending, question=question),
+                    response_text=question,
+                    fallback_allowed=fallback_allowed,
+                )
             if pending.recurrence_weekdays is not None and missing == ["AM or PM"]:
                 assert pending.hour is not None
                 question = f"Do you mean {pending.hour:g} AM or {pending.hour:g} PM every week?"
@@ -1316,6 +1825,69 @@ class RuleBasedIntentInterpreter:
                         fallback_allowed=False,
                     )
             raise AssertionError("could not calculate recurring start")
+
+        if pending.recurrence_frequency is not None:
+            assert pending.date_local is not None and pending.hour is not None
+            recurrence_hour = (
+                _clock_to_24(pending.hour, pending.meridiem)
+                if pending.meridiem is not None
+                else pending.hour
+            )
+            zone = ZoneInfo(pending.timezone_name)
+            local_now = _normalise_now(now).astimezone(zone)
+            day = pending.recurrence_day_of_month
+            month = pending.recurrence_month
+            if day is None:
+                return Interpretation(
+                    response_text="What day of the month should I use?",
+                    fallback_allowed=False,
+                )
+            candidate_year = local_now.year
+            candidate_month = month or local_now.month
+            while True:
+                try:
+                    candidate_date = date(candidate_year, candidate_month, day)
+                except ValueError:
+                    if pending.recurrence_frequency == "YEARLY":
+                        candidate_year += 1
+                    else:
+                        candidate_month += 1
+                        if candidate_month > 12:
+                            candidate_month = 1
+                            candidate_year += 1
+                    continue
+                candidate_local = datetime.combine(
+                    candidate_date, time(recurrence_hour, pending.minute)
+                )
+                if candidate_local > local_now.replace(tzinfo=None):
+                    try:
+                        return Interpretation(
+                            intent=CreateRecurringReminderIntent(
+                                task=pending.task or "",
+                                frequency=pending.recurrence_frequency,
+                                interval=pending.recurrence_interval or 1,
+                                weekdays=(),
+                                day_of_month=day,
+                                month=month,
+                                hour=recurrence_hour,
+                                minute=pending.minute,
+                                start_local=candidate_local,
+                                timezone_name=pending.timezone_name,
+                            ),
+                            fallback_allowed=False,
+                        )
+                    except ValidationError:
+                        return Interpretation(
+                            response_text="Please provide a valid calendar recurrence.",
+                            fallback_allowed=False,
+                        )
+                if pending.recurrence_frequency == "YEARLY":
+                    candidate_year += 1
+                else:
+                    candidate_month += 1
+                    if candidate_month > 12:
+                        candidate_month = 1
+                        candidate_year += 1
 
         assert pending.date_local is not None and pending.hour is not None
         due_local = resolve_pending_due_at(pending, now=now)
@@ -1456,11 +2028,27 @@ class OpenAICompatibleIntentInterpreter:
         self,
         text: str,
         *,
+        selected_route: IntentRoute | None = None,
         timezone_name: str,
         now: datetime,
         context: PendingReminder | None = None,
         recent_messages: Sequence[str] = (),
     ) -> Interpretation:
+        route = selected_route or (
+            IntentRoute.UPDATE_PENDING if context is not None else IntentRoute.NEW_REQUEST
+        )
+        if route is IntentRoute.UNCERTAIN:
+            return Interpretation(
+                response_text="I’m not sure what you want to do. Please clarify.",
+                fallback_allowed=False,
+            )
+        if route is IntentRoute.UPDATE_PENDING and context is None:
+            return Interpretation(
+                response_text="There is no unfinished reminder to update.",
+                fallback_allowed=False,
+            )
+        if route is not IntentRoute.UPDATE_PENDING:
+            context = None
         local_now = _normalise_now(now).astimezone(ZoneInfo(timezone_name))
         endpoint_host = urlsplit(self._url).hostname or "unknown"
         log_event(
@@ -1474,34 +2062,28 @@ class OpenAICompatibleIntentInterpreter:
             has_pending_context=context is not None,
         )
         prompt = (
-            "Return JSON only. For one complete request use operation "
-            "CREATE_ONE_TIME_REMINDER with task and due_local. For multiple clearly separated "
-            "requests use CREATE_ONE_TIME_REMINDERS with an intents array of {task,due_local}; "
-            "For a weekly recurring request use CREATE_RECURRING_REMINDER with task, weekdays "
-            "(integer Monday=0 through Sunday=6), hour, minute, and start_local (a naive local "
-            "ISO datetime). Only return weekly recurrence; never invent a recurrence rule. "
-            "never merge separate tasks into one task. For an incomplete or ambiguous "
-            "request use operation NEEDS_CLARIFICATION with pending fields task, date_local "
-            "(YYYY-MM-DD), hour, minute, meridiem, date_explicit, and a focused question. "
-            "For unrelated requests use operation UNKNOWN. Never guess an ambiguous hour. "
-            "When existing pending reminder context is supplied, use UPDATE_PENDING_REMINDER "
-            "with an updates object containing only fields explicitly "
-            "provided by the user (task, date_local, hour, minute, meridiem, date_explicit), "
-            "plus certainty=\"CLEAR\" and evidence mapping each updated field to an exact "
-            "fragment of the latest user message; preserve the user's spelling in evidence when "
-            "possible. "
-            "Correct a typo only when it has one clear interpretation. If a date, time, task, "
-            "or target is ambiguous, use NEEDS_CLARIFICATION with a focused question and no "
-            "updates. "
-            "Do not include an existing task, date, or time unless the user explicitly corrects "
-            "that exact field in this message. Never repeat, infer, preserve, merge, or clear a "
-            "context field. Never return CREATE_ONE_TIME_REMINDER or due_local for a follow-up; "
-            "the application owns the pending reminder and will merge and validate the update. "
-            "Use UNKNOWN when the follow-up supplies no reminder field. "
-            "due_local must be a timezone-naive ISO-8601 local datetime; the application applies "
-            f"the user's validated timezone {timezone_name}. Current local time is "
-            f"{local_now.isoformat()}."
+            """
+                Extract structured reminder data from the latest message according to selected_route.
+
+                NEW_REQUEST:
+                - CREATE_ONE_TIME_REMINDER: task, due_local.
+                - CREATE_ONE_TIME_REMINDERS: separate intents array of {task, due_local}.
+                - CREATE_RECURRING_REMINDER: task, frequency (DAILY, WEEKLY, MONTHLY, YEARLY), interval, applicable schedule fields, and start_local.
+                LIST_REQUEST:
+                - LIST_REMINDERS: show the reminders saved. if a date or date range is provided, show the reminders within that range
+
+                UPDATE_PENDING:
+                - UPDATE_PENDING_REMINDER: extract only explicitly supplied changes (task, date_local, hour, minute, meridiem, date_explicit, recurrence_frequency, recurrence_interval, recurrence_day_of_month, recurrence_month), with certainty="CLEAR" and exact evidence for each field. Recurrence frequency is MONTHLY or YEARLY; interval is 1-60; day_of_month is 1-31 and month is 1-12. Do not repeat or change other pending fields.
+
+                If required fields are missing or ambiguous, return NEEDS_CLARIFICATION with relevant pending fields and a focused question.
+
+                Use provided local time and timezone. Never invent tasks, dates, times, or recurrence rules. Use timezone-naive ISO-8601 local datetimes.
+
+                Return JSON only. The operation must match selected_route.
+            """
         )
+        prompt += f"\nSelected route: {route.value}."
+        prompt += f" Current local date/time is {local_now.isoformat(timespec='minutes')} ({timezone_name})."
         if context is not None:
             prompt += f" Existing pending reminder context is {context.model_dump_json()}"
         if recent_messages:
@@ -1547,10 +2129,50 @@ class OpenAICompatibleIntentInterpreter:
             data = json.loads(content) if isinstance(content, str) else content
             if not isinstance(data, dict):
                 raise ValueError("provider response was not an object")
+            log_event(
+                logger,
+                logging.INFO,
+                "reminder_intent_provider_raw_response",
+                endpoint_host=endpoint_host,
+                model=self._model,
+                route=route,
+                provider_response=data,
+            )
             operation = data.get("operation")
-            if context is not None:
+            if route is IntentRoute.LIST_REQUEST and operation in {
+                "LIST_REQUEST",
+                "LIST_REMINDER",
+                "LIST_REMINDERS_BY_RANGE",
+                "RETRIEVE_REMINDERS",
+                "SHOW_REMINDERS",
+            }:
+                operation = "LIST_REMINDERS"
+            if route is IntentRoute.UPDATE_PENDING:
                 if operation == "UPDATE_PENDING_REMINDER":
                     raw_updates = data.get("updates")
+                    if raw_updates is None:
+                        # Some OpenAI-compatible models emit the patch fields
+                        # beside ``operation`` despite the nested contract.
+                        # Normalize that equivalent shape at the boundary;
+                        # all values still pass PendingReminderFieldUpdate and
+                        # application-side grounding below.
+                        update_fields = {
+                            "task",
+                            "date_local",
+                            "hour",
+                            "minute",
+                            "meridiem",
+                            "date_explicit",
+                            "recurrence_frequency",
+                            "recurrence_interval",
+                            "recurrence_day_of_month",
+                            "recurrence_month",
+                            "certainty",
+                            "evidence",
+                        }
+                        raw_updates = {
+                            key: value for key, value in data.items() if key in update_fields
+                        }
                     if not isinstance(raw_updates, dict):
                         raise ValueError("pending update was not an object")
                     updates = PendingReminderFieldUpdate.model_validate(raw_updates)
@@ -1605,6 +2227,11 @@ class OpenAICompatibleIntentInterpreter:
                     "minute",
                     "meridiem",
                     "date_explicit",
+                    "recurrence_weekdays",
+                    "recurrence_frequency",
+                    "recurrence_interval",
+                    "recurrence_day_of_month",
+                    "recurrence_month",
                 ):
                     if field in raw_pending and raw_pending[field] is not None:
                         pending_values[field] = raw_pending[field]
@@ -1656,20 +2283,67 @@ class OpenAICompatibleIntentInterpreter:
                 task = data.get("task")
                 weekdays = data.get("weekdays")
                 start_local_value = data.get("start_local")
-                if not isinstance(task, str) or not isinstance(weekdays, list):
+                frequency = str(data.get("frequency", "WEEKLY")).upper()
+                if not isinstance(task, str):
                     raise ValueError("recurring intent is missing fields")
-                if not isinstance(start_local_value, str):
-                    raise ValueError("recurring intent is missing start_local")
-                start_local = datetime.fromisoformat(start_local_value)
+                if not isinstance(weekdays, list):
+                    weekdays = []
+                interval = int(data.get("interval", 1))
+                hour = int(data["hour"])
+                minute = int(data.get("minute", 0))
+                day_of_month = (
+                    int(data["day_of_month"])
+                    if data.get("day_of_month") is not None
+                    else None
+                )
+                recurrence_month = int(data["month"]) if data.get("month") is not None else None
+                if isinstance(start_local_value, str):
+                    start_local = datetime.fromisoformat(start_local_value)
+                else:
+                    start_local = _next_recurring_start_local(
+                        frequency=frequency,
+                        interval=interval,
+                        weekdays=tuple(int(day) for day in weekdays),
+                        day_of_month=day_of_month,
+                        month=recurrence_month,
+                        hour=hour,
+                        minute=minute,
+                        timezone_name=timezone_name,
+                        now=now,
+                    )
                 intent = CreateRecurringReminderIntent(
                     task=task,
+                    frequency=frequency,
+                    interval=interval,
                     weekdays=tuple(int(day) for day in weekdays),
-                    hour=int(data["hour"]),
-                    minute=int(data.get("minute", 0)),
+                    day_of_month=day_of_month,
+                    month=recurrence_month,
+                    hour=hour,
+                    minute=minute,
                     start_local=start_local,
                     timezone_name=timezone_name,
                 )
                 return Interpretation(intent=intent)
+            if operation == "LIST_REMINDERS":
+                start_date_value = data.get("start_date")
+                end_date_value = data.get("end_date")
+                date_range = data.get("date_range")
+                if isinstance(date_range, dict):
+                    start_date_value = start_date_value or date_range.get("start")
+                    end_date_value = end_date_value or date_range.get("end")
+                if (start_date_value is None) != (end_date_value is None):
+                    raise ValueError("list intent has an incomplete date range")
+                if start_date_value is not None and (
+                    not isinstance(start_date_value, str) or not isinstance(end_date_value, str)
+                ):
+                    raise ValueError("list intent has invalid date range")
+                return Interpretation(
+                    intent=ListRemindersIntent(
+                        start_date=(date.fromisoformat(start_date_value) if start_date_value else None),
+                        end_date=(date.fromisoformat(end_date_value) if end_date_value else None),
+                        timezone_name=timezone_name,
+                    )
+                )
             if operation != "CREATE_ONE_TIME_REMINDER":
                 result = Interpretation(
                     response_text=OUT_OF_SCOPE_RESPONSE
@@ -1771,13 +2445,27 @@ class ReminderIntentInterpreter:
         self,
         text: str,
         *,
+        selected_route: IntentRoute | None = None,
         timezone_name: str,
         now: datetime,
         context: PendingReminder | None = None,
         recent_messages: Sequence[str] = (),
     ) -> Interpretation:
+        route = selected_route or (
+            IntentRoute.UPDATE_PENDING if context is not None else IntentRoute.NEW_REQUEST
+        )
+        if route is IntentRoute.UNCERTAIN:
+            return Interpretation(
+                response_text="I’m not sure what you want to do. Please clarify.",
+                fallback_allowed=False,
+            )
+        extraction_context = context if route is IntentRoute.UPDATE_PENDING else None
         result = self._rules.interpret(
-            text, timezone_name=timezone_name, now=now, context=context
+            text,
+            selected_route=route,
+            timezone_name=timezone_name,
+            now=now,
+            context=extraction_context,
         )
         if (
             result.intent is not None
@@ -1795,19 +2483,25 @@ class ReminderIntentInterpreter:
         if isinstance(self._model, OpenAICompatibleIntentInterpreter):
             provider_result = self._model.interpret(
                 text,
+                selected_route=route,
                 timezone_name=timezone_name,
                 now=now,
-                context=context,
+                context=extraction_context,
                 recent_messages=recent_messages,
             )
         else:
-            provider_result = self._model.interpret(
-                text, timezone_name=timezone_name, now=now, context=context
-            )
+            provider_kwargs = {
+                "timezone_name": timezone_name,
+                "now": now,
+                "context": extraction_context,
+            }
+            if "selected_route" in inspect.signature(self._model.interpret).parameters:
+                provider_kwargs["selected_route"] = route
+            provider_result = self._model.interpret(text, **provider_kwargs)
         # A provider response that contains no typed action must not erase the
         # deterministic context or replace a focused clarification with a generic
         # error. Keep the safer rule result in that case.
-        if context is not None:
+        if route is IntentRoute.UPDATE_PENDING:
             # During a clarification, only a typed patch (or an explicit
             # cancellation recognized by a provider implementation) can cross
             # the provider boundary.  A provider cannot replace the session
