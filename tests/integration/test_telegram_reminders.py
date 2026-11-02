@@ -1,5 +1,7 @@
 from datetime import date, datetime, timedelta, timezone
 import hashlib
+import os
+from threading import Barrier, Thread
 
 import pytest
 from sqlalchemy import func, select
@@ -281,6 +283,140 @@ def test_transient_confirmation_failure_retries_and_records_sent(
         )
         assert delivery is not None
         assert delivery.delivery_status == "SENT"
+
+
+def test_confirmation_failure_after_reminder_commit_keeps_the_reminder_and_blocks_replay(
+    session_factory, fixed_now, update_factory
+) -> None:
+    """An ambiguous Telegram failure must not roll back or duplicate committed work."""
+
+    from fastapi.testclient import TestClient
+    from reminder_agent.telegram import TelegramAPIError
+
+    class FailingTelegramClient:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        def send_message(self, chat_id: int, text: str, *, reply_markup=None) -> None:
+            self.attempts += 1
+            raise TelegramAPIError("bad gateway", status_code=502, failure_kind="http_error")
+
+    with session_factory.begin() as db:
+        user = User(name="Ada", timezone="Asia/Karachi", onboarding_status="ACTIVE")
+        db.add(user)
+        db.flush()
+        db.add(
+            ChannelIdentity(
+                user_id=user.id,
+                channel_type="TELEGRAM",
+                external_id="1001",
+                telegram_chat_id=2001,
+                status="LINKED",
+            )
+        )
+
+    telegram_client = FailingTelegramClient()
+    app = create_app(
+        Settings(database_url="sqlite://", telegram_webhook_secret="test-secret"),
+        telegram_client=telegram_client,
+        session_factory=session_factory,
+        clock=lambda: fixed_now,
+    )
+    update = update_factory(113, text="Remind me in five minutes to call the bank.")
+    with TestClient(app, raise_server_exceptions=False) as client:
+        assert post_update(client, update).json() == {"ok": True}
+        assert post_update(client, update).json() == {"ok": True}
+
+    assert telegram_client.attempts == 1
+    with session_factory() as db:
+        assert db.scalar(select(func.count()).select_from(Reminder)) == 1
+        assert db.scalar(select(func.count()).select_from(ReminderOccurrence)) == 1
+        assert db.scalar(select(func.count()).select_from(Notification)) == 1
+        confirmation = db.scalar(
+            select(IdempotencyRecord).where(
+                IdempotencyRecord.source == "TELEGRAM",
+                IdempotencyRecord.idempotency_key == "113",
+            )
+        )
+        assert confirmation is not None
+        assert confirmation.status == "SUCCEEDED"
+        assert confirmation.delivery_status == "UNKNOWN"
+
+
+@pytest.mark.skipif(
+    not os.getenv("TEST_DATABASE_URL", "").startswith("postgresql"),
+    reason="requires PostgreSQL session locks for concurrent clarification coverage",
+)
+def test_postgres_racing_clarification_replies_create_only_one_reminder(
+    api_client, db, fixed_now, session_factory, update_factory
+) -> None:
+    """Two distinct replies may race, but only the row-lock winner completes the draft."""
+
+    onboard(api_client, update_factory)
+    assert post_update(
+        api_client,
+        update_factory(147, text="Remind me Friday to call the bank"),
+    ).status_code == 200
+    user = db.scalar(select(User).where(User.name == "Ada"))
+    identity = db.scalar(select(ChannelIdentity).where(ChannelIdentity.external_id == "1001"))
+    assert user is not None and identity is not None
+
+    barrier = Barrier(2)
+    replies = []
+    errors: list[BaseException] = []
+
+    class CoordinatedInterpreter:
+        def interpret(self, text, *, timezone_name, now, context=None):
+            barrier.wait(timeout=5)
+            assert context is not None and context.task is not None
+            minute = 10 if text == "8 AM" else 15
+            return Interpretation(
+                intent=CreateOneTimeReminderIntent(
+                    task=context.task,
+                    due_at=fixed_now + timedelta(minutes=minute),
+                    timezone_name=timezone_name,
+                )
+            )
+
+    interpreter = CoordinatedInterpreter()
+
+    def reply_to_clarification(update_id: int, text: str) -> None:
+        session = session_factory()
+        try:
+            replies.append(
+                handle_reminder_text(
+                    session,
+                    TelegramUpdate.model_validate(update_factory(update_id, text=text)),
+                    user_id=user.id,
+                    identity_id=identity.id,
+                    telegram_user_id=1001,
+                    interpreter=interpreter,
+                    now=fixed_now,
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - asserted by the main test thread
+            errors.append(exc)
+        finally:
+            session.close()
+
+    first = Thread(target=reply_to_clarification, args=(148, "8 AM"))
+    second = Thread(target=reply_to_clarification, args=(149, "9 AM"))
+    first.start()
+    second.start()
+    first.join(timeout=5)
+    second.join(timeout=5)
+    assert not first.is_alive() and not second.is_alive()
+    assert not errors
+
+    db.expire_all()
+    assert db.scalar(select(func.count()).select_from(Reminder)) == 1
+    assert db.scalar(select(func.count()).select_from(ReminderOccurrence)) == 1
+    assert db.scalar(select(func.count()).select_from(Notification)) == 1
+    session = db.scalar(select(ConversationSession))
+    assert session is not None and session.status == "ENDED"
+    assert len(replies) == 2
+    assert sum("I'll remind you" in reply.text for reply in replies) == 1
+    assert sum("clarification expired" in reply.text.lower() for reply in replies) == 1
 
 
 def test_replaying_update_does_not_duplicate_rows_or_confirmation(
