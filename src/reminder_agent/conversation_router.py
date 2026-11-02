@@ -11,6 +11,7 @@ from reminder_agent.intent import PendingReminder
 
 class ConversationRoute(StrEnum):
     NEW_REQUEST = "NEW_REQUEST"
+    LIST_REQUEST = "LIST_REQUEST"
     CLARIFICATION_REPLY = "CLARIFICATION_REPLY"
     CANCELLATION = "CANCELLATION"
     SOCIAL = "SOCIAL"
@@ -25,6 +26,11 @@ class RouteDecision:
 
 _NEW_REMINDER = re.compile(
     r"^\s*(?:please\s+)?(?:remind\s+me|set\s+(?:a\s+)?reminder)(?:\s+|$)",
+    re.IGNORECASE,
+)
+_LIST_REMINDERS = re.compile(
+    r"^\s*(?:can\s+you\s+)?(?:what\s+(?:do\s+i\s+have|are\s+my\s+reminders?)|"
+    r"(?:list|show)(?:\s+(?:my|me))?\s+(?:all\s+(?:the\s+)?)?(?:recurring\s+)?reminders?)\b",
     re.IGNORECASE,
 )
 _CLOCK_WITH_AT = re.compile(
@@ -87,6 +93,8 @@ def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecisio
     if pending is None:
         if _NEW_REMINDER.match(raw):
             return RouteDecision(ConversationRoute.NEW_REQUEST)
+        if _LIST_REMINDERS.match(raw):
+            return RouteDecision(ConversationRoute.LIST_REQUEST)
         if _BARE_CLOCK.fullmatch(raw):
             return RouteDecision(ConversationRoute.UNRELATED)
         return RouteDecision(ConversationRoute.MODEL_FALLBACK)
@@ -97,6 +105,8 @@ def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecisio
         return RouteDecision(ConversationRoute.CLARIFICATION_REPLY)
     if normalized in _ACKNOWLEDGEMENTS:
         return RouteDecision(ConversationRoute.SOCIAL)
+    if _LIST_REMINDERS.match(raw):
+        return RouteDecision(ConversationRoute.LIST_REQUEST)
     if _NEW_REMINDER.match(raw):
         # A complete new command intentionally supersedes a stale draft rather
         # than being parsed as an edit to its task or schedule.
