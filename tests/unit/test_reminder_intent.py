@@ -22,6 +22,7 @@ from reminder_agent.intent import (
     resolve_pending_due_at,
 )
 from reminder_agent.reminders import _route_and_interpret
+from reminder_agent.rescheduling import RescheduleRequest, RescheduleScope
 from reminder_agent.settings import Settings
 from reminder_agent.request_policy import OUT_OF_SCOPE_RESPONSE
 
@@ -1248,6 +1249,49 @@ def test_openai_compatible_interpreter_accepts_structured_response(monkeypatch) 
     assert result.intent is not None
     assert result.intent.task == "call the bank"
     assert result.intent.due_at == datetime(2026, 10, 31, 4, 0, tzinfo=timezone.utc)
+
+
+def test_openai_compatible_interpreter_accepts_structured_reschedule_response(
+    monkeypatch,
+) -> None:
+    def fake_post(*args, **kwargs):
+        prompt = kwargs["json"]["messages"][0]["content"]
+        assert "RESCHEDULE_REMINDER" in prompt
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"operation":"RESCHEDULE_REMINDER",'
+                                '"target_text":"bank reminder",'
+                                '"due_local":"2026-10-31T10:00:00",'
+                                '"scope":"OCCURRENCE"}'
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    result = OpenAICompatibleIntentInterpreter(
+        "https://llm.example/v1", "secret", "provider-model"
+    ).interpret(
+        "I need you to shift the bank reminder to tomorrow at 10 AM",
+        selected_route=IntentRoute.RESCHEDULE_REQUEST,
+        timezone_name="UTC",
+        now=NOW,
+    )
+
+    assert isinstance(result.reschedule_request, RescheduleRequest)
+    assert result.reschedule_request.target_text == "bank reminder"
+    assert result.reschedule_request.due_at == datetime(
+        2026, 10, 31, 10, 0, tzinfo=timezone.utc
+    )
+    assert result.reschedule_request.scope is RescheduleScope.OCCURRENCE
 
 
 def test_openai_compatible_interpreter_returns_only_provider_field_updates_for_context(

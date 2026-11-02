@@ -68,12 +68,14 @@ from reminder_agent.request_policy import (
 )
 from reminder_agent.rescheduling import (
     PendingReschedule,
+    RescheduleDecision,
     RescheduleRequest,
     RescheduleConflict,
     RescheduleScope,
     apply_reschedule,
     decide_reschedule,
     is_reschedule_command,
+    parse_reschedule_request,
 )
 from reminder_agent.telegram import TelegramUpdate
 
@@ -308,6 +310,7 @@ def _handle_reschedule_text(
     now: datetime,
     session_ttl_seconds: int,
     force: bool = False,
+    reschedule_interpreter: ReminderIntentInterpreter | None = None,
 ) -> ReminderReply | None:
     """Handle VS-09 before the creation interpreter is invoked."""
 
@@ -316,6 +319,13 @@ def _handle_reschedule_text(
     if not force and not is_reschedule_command(text) and pending is None:
         return None
 
+    parsed_request = None
+    if pending is None:
+        parsed_request = parse_reschedule_request(
+            text,
+            timezone_name=user.timezone or "UTC",
+            now=now,
+        )
     decision = decide_reschedule(
         db,
         user_id=user.id,
@@ -323,7 +333,29 @@ def _handle_reschedule_text(
         timezone_name=user.timezone or "UTC",
         now=now,
         pending=pending,
+        request_override=(
+            parsed_request if isinstance(parsed_request, RescheduleRequest) else None
+        ),
     )
+    if isinstance(parsed_request, str) and reschedule_interpreter is not None:
+        db.rollback()
+        proposal = reschedule_interpreter.interpret_reschedule(
+            text,
+            timezone_name=user.timezone or "UTC",
+            now=now,
+        )
+        if isinstance(proposal, RescheduleRequest):
+            decision = decide_reschedule(
+                db,
+                user_id=user.id,
+                text=text,
+                timezone_name=user.timezone or "UTC",
+                now=now,
+                pending=pending,
+                request_override=proposal,
+            )
+        elif isinstance(proposal, str) and proposal.strip():
+            decision = RescheduleDecision("RESPONSE", proposal.strip())
     db.rollback()
     try:
         with db.begin():
@@ -933,6 +965,7 @@ def handle_reminder_text(
         pending=pending_reschedule,
         now=now,
         session_ttl_seconds=session_ttl_seconds,
+        reschedule_interpreter=interpreter,
     )
     if reschedule_reply is not None:
         return reschedule_reply
@@ -961,6 +994,7 @@ def handle_reminder_text(
                 now=now,
                 session_ttl_seconds=session_ttl_seconds,
                 force=True,
+                reschedule_interpreter=interpreter,
             )
             if reschedule_reply is not None:
                 return reschedule_reply

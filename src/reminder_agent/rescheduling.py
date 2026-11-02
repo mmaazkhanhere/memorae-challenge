@@ -294,6 +294,7 @@ def decide_reschedule(
     timezone_name: str,
     now: datetime,
     pending: PendingReschedule | None = None,
+    request_override: RescheduleRequest | None = None,
 ) -> RescheduleDecision:
     normalized = text.strip().lower().rstrip(".!?")
     if pending is not None:
@@ -328,7 +329,9 @@ def decide_reschedule(
             candidate_ids,
         )
 
-    parsed = parse_reschedule_request(text, timezone_name=timezone_name, now=now)
+    parsed = request_override or parse_reschedule_request(
+        text, timezone_name=timezone_name, now=now
+    )
     if isinstance(parsed, str):
         return RescheduleDecision("RESPONSE", parsed)
     candidates = find_candidates(db, user_id=user_id, target_text=parsed.target_text)

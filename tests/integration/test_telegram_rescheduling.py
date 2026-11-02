@@ -18,7 +18,12 @@ from reminder_agent.db.models import (
 from reminder_agent.worker import NotificationWorker
 from reminder_agent import rescheduling
 from reminder_agent.intent import IntentRoute, IntentRouteSuggestion
-from reminder_agent.rescheduling import RescheduleConflict, RescheduleScope, apply_reschedule
+from reminder_agent.rescheduling import (
+    RescheduleConflict,
+    RescheduleRequest,
+    RescheduleScope,
+    apply_reschedule,
+)
 
 
 def post_update(api_client, update):
@@ -98,6 +103,46 @@ def test_classifier_routes_indirect_reschedule_to_transactional_handler(
     )
 
     assert response.status_code == 200
+    assert "Moved 'call the bank'" in telegram_client.messages[-1][1]
+    reminder = db.scalar(select(Reminder))
+    assert reminder is not None and reminder.version == 2
+
+
+def test_unsupported_reschedule_language_uses_non_authoritative_extractor_fallback(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    class RescheduleRouter:
+        def classify(self, *args, **kwargs):
+            return IntentRouteSuggestion(operation=IntentRoute.RESCHEDULE_REQUEST)
+
+    class RescheduleExtractor:
+        def __init__(self) -> None:
+            self.called = False
+
+        def interpret_reschedule(self, text, *, timezone_name, now):
+            self.called = True
+            return RescheduleRequest(
+                target_text="bank reminder",
+                due_at=datetime(2026, 10, 31, 10, 0, tzinfo=timezone.utc),
+                scope=RescheduleScope.OCCURRENCE,
+            )
+
+    extractor = RescheduleExtractor()
+    api_client.app.state.intent_router = RescheduleRouter()
+    onboard(api_client, update_factory)
+    assert post_update(
+        api_client,
+        update_factory(905, text="Remind me tomorrow at 9 AM to call the bank"),
+    ).status_code == 200
+    api_client.app.state.reminder_interpreter = extractor
+
+    response = post_update(
+        api_client,
+        update_factory(906, text="I need you to shift the bank reminder to tomorrow at 10 AM"),
+    )
+
+    assert response.status_code == 200
+    assert extractor.called is True
     assert "Moved 'call the bank'" in telegram_client.messages[-1][1]
     reminder = db.scalar(select(Reminder))
     assert reminder is not None and reminder.version == 2
