@@ -31,6 +31,30 @@ def _telegram_error_is_retryable(error: TelegramAPIError) -> bool:
     return error.status_code == 429
 
 
+TELEGRAM_MAX_MESSAGE_LENGTH = 4096
+
+
+def _split_telegram_text(text: str, *, max_length: int = TELEGRAM_MAX_MESSAGE_LENGTH) -> list[str]:
+    """Split a response into Telegram-safe chunks without breaking words."""
+    if max_length < 1:
+        raise ValueError("max_length must be positive")
+    if len(text) <= max_length:
+        return [text]
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > max_length:
+        boundary = remaining.rfind("\n", 0, max_length + 1)
+        if boundary <= 0:
+            boundary = remaining.rfind(" ", 0, max_length + 1)
+        if boundary <= 0:
+            boundary = max_length
+        chunks.append(remaining[:boundary])
+        remaining = remaining[boundary:].lstrip(" \n")
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
 def _send_reply_with_retry(
     client,
     reply,
@@ -39,40 +63,41 @@ def _send_reply_with_retry(
     max_attempts: int,
     retry_delay_seconds: float,
 ) -> None:
-    for attempt in range(1, max_attempts + 1):
-        log_event(
-            logger,
-            logging.DEBUG,
-            "telegram_response_delivery_attempt",
-            update_id=update_id,
-            attempt=attempt,
-            max_attempts=max_attempts,
-        )
-        try:
-            if reply.reply_markup is None:
-                client.send_message(reply.chat_id, reply.text)
-            else:
-                client.send_message(
-                    reply.chat_id,
-                    reply.text,
-                    reply_markup=reply.reply_markup,
-                )
-            return
-        except TelegramAPIError as exc:
-            retryable = _telegram_error_is_retryable(exc)
-            if not retryable or attempt >= max_attempts:
-                raise
+    chunks = _split_telegram_text(reply.text)
+    for chunk_index, chunk in enumerate(chunks):
+        for attempt in range(1, max_attempts + 1):
             log_event(
                 logger,
-                logging.WARNING,
-                "telegram_response_delivery_retry",
+                logging.DEBUG,
+                "telegram_response_delivery_attempt",
                 update_id=update_id,
                 attempt=attempt,
-                failure_kind=exc.failure_kind,
-                provider_status_code=exc.status_code,
+                max_attempts=max_attempts,
+                chunk_index=chunk_index,
+                chunk_count=len(chunks),
             )
-            if retry_delay_seconds:
-                time.sleep(retry_delay_seconds)
+            try:
+                kwargs = {}
+                if reply.reply_markup is not None and chunk_index == len(chunks) - 1:
+                    kwargs["reply_markup"] = reply.reply_markup
+                client.send_message(reply.chat_id, chunk, **kwargs)
+                break
+            except TelegramAPIError as exc:
+                retryable = _telegram_error_is_retryable(exc)
+                if not retryable or attempt >= max_attempts:
+                    raise
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "telegram_response_delivery_retry",
+                    update_id=update_id,
+                    attempt=attempt,
+                    failure_kind=exc.failure_kind,
+                    provider_status_code=exc.status_code,
+                    chunk_index=chunk_index,
+                )
+                if retry_delay_seconds:
+                    time.sleep(retry_delay_seconds)
 
 
 @router.post("/webhook/telegram")
