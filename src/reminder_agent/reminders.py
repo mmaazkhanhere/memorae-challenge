@@ -29,6 +29,7 @@ from reminder_agent.conversations import (
     end_session,
     load_session,
     pending_from_session,
+    pending_reschedule_from_session,
     session_expired,
     telegram_session_id,
 )
@@ -64,6 +65,15 @@ from reminder_agent.request_policy import (
     OUT_OF_SCOPE_RESPONSE,
     assess_request,
     is_supported_operation,
+)
+from reminder_agent.rescheduling import (
+    PendingReschedule,
+    RescheduleRequest,
+    RescheduleConflict,
+    RescheduleScope,
+    apply_reschedule,
+    decide_reschedule,
+    is_reschedule_command,
 )
 from reminder_agent.telegram import TelegramUpdate
 
@@ -209,6 +219,7 @@ def _store_response(
     user_id: UUID,
     text: str,
     response_kind: str = "clarification",
+    operation: str = "CREATE_REMINDER",
 ) -> ReminderReply:
     assert update.message is not None
     reply = ReminderReply(
@@ -222,7 +233,7 @@ def _store_response(
             source=TELEGRAM,
             idempotency_key=str(update.update_id),
             user_id=user_id,
-            operation="CREATE_REMINDER",
+            operation=operation,
             request_hash=_request_hash(update),
             status="SUCCEEDED",
             delivery_status="PENDING",
@@ -246,6 +257,230 @@ def _store_response(
         response_kind=response_kind,
     )
     return reply
+
+
+def _save_reschedule_session(
+    db: Session,
+    *,
+    user_id: UUID,
+    external_session_id: str,
+    pending: PendingReschedule,
+    now: datetime,
+) -> ConversationSession:
+    session = db.scalar(
+        select(ConversationSession)
+        .where(
+            ConversationSession.user_id == user_id,
+            ConversationSession.channel_type == TELEGRAM,
+            ConversationSession.external_session_id == external_session_id,
+        )
+        .with_for_update()
+    )
+    if session is None:
+        session = ConversationSession(
+            user_id=user_id,
+            channel_type=TELEGRAM,
+            external_session_id=external_session_id,
+            pending_clarification=pending.model_dump(mode="json"),
+            status=AWAITING_CLARIFICATION,
+            version=1,
+            updated_at=_now_utc(now),
+        )
+        db.add(session)
+    else:
+        session.pending_clarification = pending.model_dump(mode="json")
+        session.status = AWAITING_CLARIFICATION
+        session.active_reminder_id = None
+        session.version += 1
+        session.updated_at = _now_utc(now)
+    return session
+
+
+def _handle_reschedule_text(
+    db: Session,
+    update: TelegramUpdate,
+    *,
+    user_id: UUID,
+    identity_id: UUID,
+    telegram_user_id: int,
+    user: User,
+    pending: PendingReschedule | None,
+    now: datetime,
+    session_ttl_seconds: int,
+) -> ReminderReply | None:
+    """Handle VS-09 before the creation interpreter is invoked."""
+
+    assert update.message is not None
+    text = update.message.text or ""
+    if not is_reschedule_command(text) and pending is None:
+        return None
+
+    decision = decide_reschedule(
+        db,
+        user_id=user.id,
+        text=text,
+        timezone_name=user.timezone or "UTC",
+        now=now,
+        pending=pending,
+    )
+    db.rollback()
+    try:
+        with db.begin():
+            existing = _existing_record(db, update)
+            if existing is not None:
+                return _reply_from_record(existing)
+            locked_user = db.get(User, user_id)
+            locked_identity = db.get(ChannelIdentity, identity_id)
+            if not _authorized_telegram_identity(
+                locked_user,
+                locked_identity,
+                telegram_user_id=telegram_user_id,
+                chat_id=update.message.chat.id,
+            ):
+                return _store_response(
+                    db,
+                    update=update,
+                    user_id=user_id,
+                    text="I couldn't verify your Telegram account.",
+                    response_kind="authorization_failure",
+                    operation="RESCHEDULE_REMINDER",
+                )
+            assert locked_user is not None and locked_identity is not None
+            locked_session = load_session(
+                db,
+                user_id=user_id,
+                external_session_id=telegram_session_id(update.message.chat.id),
+                now=now,
+                ttl_seconds=session_ttl_seconds,
+                for_update=True,
+            )
+            locked_pending = pending_reschedule_from_session(locked_session)
+            if locked_pending is not None:
+                decision = decide_reschedule(
+                    db,
+                    user_id=user_id,
+                    text=text,
+                    timezone_name=locked_user.timezone or "UTC",
+                    now=now,
+                    pending=locked_pending,
+                )
+
+            if decision.kind == "CANCEL":
+                if locked_session is not None:
+                    end_session(locked_session, now=now)
+                return _store_response(
+                    db,
+                    update=update,
+                    user_id=user_id,
+                    text=decision.text,
+                    response_kind="reschedule_canceled",
+                    operation="RESCHEDULE_REMINDER",
+                )
+
+            if decision.kind == "RESPONSE":
+                return _store_response(
+                    db,
+                    update=update,
+                    user_id=user_id,
+                    text=decision.text,
+                    response_kind="reschedule_rejected",
+                    operation="RESCHEDULE_REMINDER",
+                )
+
+            if decision.kind == "CLARIFY":
+                request = decision.request
+                if request is None and locked_pending is not None:
+                    request = RescheduleRequest(
+                        locked_pending.target_text,
+                        locked_pending.due_at,
+                        locked_pending.scope,
+                    )
+                if request is None:
+                    return _store_response(
+                        db,
+                        update=update,
+                        user_id=user_id,
+                        text=decision.text,
+                        response_kind="reschedule_clarification",
+                        operation="RESCHEDULE_REMINDER",
+                    )
+                pending_record = PendingReschedule(
+                    target_text=request.target_text,
+                    due_at=request.due_at,
+                    timezone_name=locked_user.timezone or "UTC",
+                    candidate_ids=decision.candidate_ids,
+                    scope=request.scope,
+                )
+                _save_reschedule_session(
+                    db,
+                    user_id=user_id,
+                    external_session_id=telegram_session_id(update.message.chat.id),
+                    pending=pending_record,
+                    now=now,
+                )
+                return _store_response(
+                    db,
+                    update=update,
+                    user_id=user_id,
+                    text=decision.text,
+                    response_kind="reschedule_clarification",
+                    operation="RESCHEDULE_REMINDER",
+                )
+
+            assert decision.kind == "MUTATE" and decision.request is not None
+            if len(decision.candidate_ids) != 1:
+                return _store_response(
+                    db,
+                    update=update,
+                    user_id=user_id,
+                    text="Please tell me which reminder to move.",
+                    response_kind="reschedule_clarification",
+                    operation="RESCHEDULE_REMINDER",
+                )
+            reminder, due_at = apply_reschedule(
+                db,
+                user_id=user_id,
+                destination_identity_id=identity_id,
+                reminder_id=decision.candidate_ids[0],
+                due_at=decision.request.due_at,
+                scope=decision.request.scope,
+                now=now,
+            )
+            if locked_session is not None:
+                end_session(locked_session, now=now)
+            if decision.request.scope is RescheduleScope.SERIES:
+                local_time = due_at.astimezone(ZoneInfo(locked_user.timezone or "UTC"))
+                confirmation = (
+                    f"Updated all future '{reminder.task}' reminders to "
+                    f"{local_time:%H:%M %Z} via Telegram."
+                )
+            else:
+                local_display = _local_display(due_at, locked_user.timezone or "UTC")
+                confirmation = f"Moved '{reminder.task}' to {local_display} via Telegram."
+            return _store_response(
+                db,
+                update=update,
+                user_id=user_id,
+                text=confirmation,
+                response_kind="reschedule_confirmation",
+                operation="RESCHEDULE_REMINDER",
+            )
+    except IntegrityError:
+        duplicate = _recover_from_idempotency_race(db, update)
+        if duplicate is not None:
+            return duplicate
+        raise
+    except (RescheduleConflict, ValueError) as exc:
+        db.rollback()
+        with db.begin():
+            return _store_response(
+                db,
+                update=update,
+                user_id=user_id,
+                text=f"I couldn't move that reminder safely: {exc}.",
+                response_kind="reschedule_conflict",
+                operation="RESCHEDULE_REMINDER",
+            )
 
 
 def _recover_from_idempotency_race(
@@ -650,6 +885,7 @@ def handle_reminder_text(
         session, now=now, ttl_seconds=session_ttl_seconds
     )
     pending = None if session_is_expired else pending_from_session(session)
+    pending_reschedule = None if session_is_expired else pending_reschedule_from_session(session)
     text = update.message.text or ""
     recent_messages = _recent_messages(db, user_id=user.id)
     log_event(
@@ -682,7 +918,20 @@ def handle_reminder_text(
         # requests continue to use durable idempotency below.
         db.rollback()
         return ReminderReply(update.message.chat.id, OUT_OF_SCOPE_RESPONSE)
-    elif session_is_expired:
+    reschedule_reply = _handle_reschedule_text(
+        db,
+        update,
+        user_id=user.id,
+        identity_id=identity.id,
+        telegram_user_id=telegram_user_id,
+        user=user,
+        pending=pending_reschedule,
+        now=now,
+        session_ttl_seconds=session_ttl_seconds,
+    )
+    if reschedule_reply is not None:
+        return reschedule_reply
+    if session_is_expired:
         interpretation = None
     else:
         route, interpretation = _route_and_interpret(
