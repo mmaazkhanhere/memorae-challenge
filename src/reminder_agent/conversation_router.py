@@ -34,6 +34,11 @@ _LIST_REMINDERS = re.compile(
     r"(?:list|show)(?:\s+(?:my|me))?\s+(?:all\s+(?:the\s+)?)?(?:recurring\s+)?reminders?)\b",
     re.IGNORECASE,
 )
+_SCHEDULE_LIST_REQUEST = re.compile(
+    r"^\s*(?:what(?:'s|\s+is)\s+(?:(?:on|in)\s+)?(?:my\s+)?schedule|"
+    r"what\s+is\s+scheduled|anything\s+coming\s+up)\b",
+    re.IGNORECASE,
+)
 _CLOCK_WITH_AT = re.compile(
     r"\bat\s+\d{1,2}(?::\d{2})?\s*(?:a\.m\.|p\.m\.|am|pm)?\b",
     re.IGNORECASE,
@@ -75,6 +80,17 @@ _GREETINGS = {
 _QUESTION = re.compile(r"^(?:what|when|where|who|why|how|can|could|do|does|is|are)\b", re.IGNORECASE)
 
 
+def is_new_reminder_command(text: str) -> bool:
+    """Return whether text explicitly starts a separate reminder request."""
+    return _NEW_REMINDER.match(text.strip()) is not None
+
+
+def is_list_request_command(text: str) -> bool:
+    """Return whether text explicitly asks to view reminders or a schedule."""
+    raw = text.strip()
+    return _LIST_REMINDERS.match(raw) is not None or _SCHEDULE_LIST_REQUEST.match(raw) is not None
+
+
 def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecision:
     """Choose a safe deterministic path or the model fallback.
 
@@ -92,9 +108,9 @@ def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecisio
         return RouteDecision(ConversationRoute.SOCIAL)
 
     if pending is None:
-        if _NEW_REMINDER.match(raw):
+        if is_new_reminder_command(raw):
             return RouteDecision(ConversationRoute.NEW_REQUEST)
-        if _LIST_REMINDERS.match(raw):
+        if is_list_request_command(raw):
             return RouteDecision(ConversationRoute.LIST_REQUEST)
         if _BARE_CLOCK.fullmatch(raw):
             return RouteDecision(ConversationRoute.UNRELATED)
@@ -106,9 +122,9 @@ def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecisio
         return RouteDecision(ConversationRoute.CLARIFICATION_REPLY)
     if normalized in _ACKNOWLEDGEMENTS:
         return RouteDecision(ConversationRoute.SOCIAL)
-    if _LIST_REMINDERS.match(raw):
+    if is_list_request_command(raw):
         return RouteDecision(ConversationRoute.LIST_REQUEST)
-    if _NEW_REMINDER.match(raw):
+    if is_new_reminder_command(raw):
         # A complete new command intentionally supersedes a stale draft rather
         # than being parsed as an edit to its task or schedule.
         return RouteDecision(ConversationRoute.NEW_REQUEST)

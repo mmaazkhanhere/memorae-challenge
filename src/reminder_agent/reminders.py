@@ -35,6 +35,8 @@ from reminder_agent.conversations import (
 )
 from reminder_agent.conversation_router import (
     ConversationRoute,
+    is_new_reminder_command,
+    is_list_request_command,
     route_message,
     social_response,
     unrelated_response,
@@ -955,6 +957,37 @@ def handle_reminder_text(
         # requests continue to use durable idempotency below.
         db.rollback()
         return ReminderReply(update.message.chat.id, OUT_OF_SCOPE_RESPONSE)
+    if pending_reschedule is not None and is_list_request_command(text):
+        # A read-only schedule query is not an answer to the old reschedule
+        # question. Leave that clarification available for a later reply and
+        # let the normal listing flow handle this message.
+        pending_reschedule = None
+    elif pending_reschedule is not None and is_new_reminder_command(text):
+        # An explicit reminder command starts a separate request.  It must not
+        # be treated as an ordinal/scope answer to an older reschedule
+        # clarification, or that clarification will repeatedly hijack future
+        # reminder creation.
+        db.rollback()
+        with db.begin():
+            locked_session = load_session(
+                db,
+                user_id=user.id,
+                external_session_id=telegram_session_id(update.message.chat.id),
+                now=now,
+                ttl_seconds=session_ttl_seconds,
+                for_update=True,
+            )
+            if pending_reschedule_from_session(locked_session) is not None:
+                end_session(locked_session, now=now)
+        session = None
+        pending_reschedule = None
+        observed_session_version = None
+        log_event(
+            logger,
+            logging.INFO,
+            "reschedule_clarification_superseded",
+            update_id=update.update_id,
+        )
     reschedule_reply = _handle_reschedule_text(
         db,
         update,

@@ -1005,7 +1005,9 @@ class RuleBasedIntentInterpreter:
     }
     _list_request = re.compile(
         r"^\s*(?:can\s+you\s+)?(?:what\s+(?:do\s+i\s+have|are\s+my\s+reminders?)|"
-        r"(?:list|show)(?:\s+(?:my|me))?\s+(?:all\s+(?:the\s+)?)?(?:recurring\s+)?reminders?)\b",
+        r"(?:list|show)(?:\s+(?:my|me))?\s+(?:all\s+(?:the\s+)?)?(?:recurring\s+)?reminders?|"
+        r"what(?:'s|\s+is)\s+(?:(?:on|in)\s+)?(?:my\s+)?schedule|"
+        r"what\s+is\s+scheduled|anything\s+coming\s+up)\b",
         re.IGNORECASE,
     )
     _list_range = re.compile(
@@ -2086,7 +2088,7 @@ class OpenAICompatibleIntentInterpreter:
                 - CREATE_ONE_TIME_REMINDERS: separate intents array of {task, due_local}.
                 - CREATE_RECURRING_REMINDER: task, frequency (DAILY, WEEKLY, MONTHLY, YEARLY), interval, applicable schedule fields, and start_local.
                 LIST_REQUEST:
-                - LIST_REMINDERS: show the reminders saved. if a date or date range is provided, show the reminders within that range
+                - LIST_REMINDERS: return only query parameters. Use start_date and end_date as ISO-8601 dates for a requested date or inclusive date range; omit both to list all reminders. Never return reminder records, tasks, or due times: the application queries its own database.
 
                 RESCHEDULE_REQUEST:
                 - RESCHEDULE_REMINDER: target_text, due_local, and scope (OCCURRENCE or SERIES). due_local must be a timezone-naive local ISO-8601 datetime. If the target, time, or scope is ambiguous, return NEEDS_CLARIFICATION with a focused question. Never mutate data.
@@ -2389,6 +2391,17 @@ class OpenAICompatibleIntentInterpreter:
                 if isinstance(date_range, dict):
                     start_date_value = start_date_value or date_range.get("start")
                     end_date_value = end_date_value or date_range.get("end")
+                # Accept the single-date shape emitted by some compatible
+                # models, but normalize it into the application's inclusive
+                # range representation.  Reminder records in the provider
+                # response are deliberately ignored; the database is the
+                # authoritative source for every listed reminder.
+                single_date_value = data.get("date")
+                if single_date_value is not None:
+                    if start_date_value is not None or end_date_value is not None:
+                        raise ValueError("list intent has conflicting date filters")
+                    start_date_value = single_date_value
+                    end_date_value = single_date_value
                 if (start_date_value is None) != (end_date_value is None):
                     raise ValueError("list intent has an incomplete date range")
                 if start_date_value is not None and (

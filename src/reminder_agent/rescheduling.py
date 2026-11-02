@@ -279,11 +279,19 @@ def find_candidates(db: Session, *, user_id: UUID, target_text: str) -> list[Res
     return list(unique.values())
 
 
-def format_candidates(candidates: list[RescheduleCandidate]) -> str:
-    return "\n".join(
-        f"{index}. {candidate.task} (currently {candidate.due_at:%Y-%m-%d %H:%M UTC})"
-        for index, candidate in enumerate(candidates, 1)
-    )
+def format_candidates(candidates: list[RescheduleCandidate], *, timezone_name: str) -> str:
+    """Render stored UTC candidate times in the user's local timezone."""
+    zone = ZoneInfo(timezone_name)
+    lines: list[str] = []
+    for index, candidate in enumerate(candidates, 1):
+        due_at = candidate.due_at
+        if due_at.tzinfo is None or due_at.utcoffset() is None:
+            due_at = due_at.replace(tzinfo=timezone.utc)
+        local_due = due_at.astimezone(zone)
+        lines.append(
+            f"{index}. {candidate.task} (currently {local_due:%Y-%m-%d %H:%M %Z})"
+        )
+    return "\n".join(lines)
 
 
 def decide_reschedule(
@@ -311,7 +319,8 @@ def decide_reschedule(
             return RescheduleDecision(
                 "CLARIFY",
                 "Which reminder should I move?\n" + format_candidates(
-                    find_candidates(db, user_id=user_id, target_text=pending.target_text)
+                    find_candidates(db, user_id=user_id, target_text=pending.target_text),
+                    timezone_name=timezone_name,
                 ),
                 candidate_ids=pending.candidate_ids,
             )
@@ -340,7 +349,8 @@ def decide_reschedule(
     if len(candidates) > 1:
         return RescheduleDecision(
             "CLARIFY",
-            "I found multiple matching reminders. Which one should I move?\n" + format_candidates(candidates),
+            "I found multiple matching reminders. Which one should I move?\n"
+            + format_candidates(candidates, timezone_name=timezone_name),
             request=parsed,
             candidate_ids=tuple(candidate.reminder_id for candidate in candidates),
         )

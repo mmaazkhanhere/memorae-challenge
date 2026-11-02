@@ -487,6 +487,76 @@ def test_never_mind_ends_a_reschedule_clarification_without_mutation(
     assert session.pending_clarification is None
 
 
+def test_new_reminder_command_supersedes_pending_reschedule_clarification(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory)
+    assert post_update(
+        api_client,
+        update_factory(960, text="Remind me tomorrow at 8 AM to call the bank"),
+    ).status_code == 200
+    assert post_update(
+        api_client,
+        update_factory(961, text="Remind me tomorrow at 9 AM to call the bank"),
+    ).status_code == 200
+
+    assert post_update(
+        api_client,
+        update_factory(962, text="Move the bank reminder to tomorrow at 10 AM"),
+    ).status_code == 200
+    session = db.scalar(select(ConversationSession))
+    assert session is not None
+    assert session.status == "AWAITING_CLARIFICATION"
+    assert session.pending_clarification["operation"] == "RESCHEDULE_REMINDER"
+
+    response = post_update(
+        api_client,
+        update_factory(963, text="Remind me tomorrow at 9 AM to call Sarah"),
+    )
+
+    assert response.status_code == 200
+    assert "I'll remind you to call Sarah" in telegram_client.messages[-1][1]
+    reminders = db.scalars(select(Reminder).order_by(Reminder.task)).all()
+    assert [reminder.task for reminder in reminders] == [
+        "call Sarah",
+        "call the bank",
+        "call the bank",
+    ]
+    db.refresh(session)
+    assert session.status == "ENDED"
+    assert session.pending_clarification is None
+
+
+def test_schedule_query_does_not_answer_pending_reschedule_clarification(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory)
+    assert post_update(
+        api_client,
+        update_factory(964, text="Remind me tomorrow at 8 AM to call the bank"),
+    ).status_code == 200
+    assert post_update(
+        api_client,
+        update_factory(965, text="Remind me tomorrow at 9 AM to call the bank"),
+    ).status_code == 200
+    assert post_update(
+        api_client,
+        update_factory(966, text="Move the bank reminder to tomorrow at 10 AM"),
+    ).status_code == 200
+
+    response = post_update(
+        api_client,
+        update_factory(967, text="What's on my schedule tomorrow?"),
+    )
+
+    assert response.status_code == 200
+    assert "call the bank" in telegram_client.messages[-1][1]
+    session = db.scalar(select(ConversationSession))
+    assert session is not None
+    assert session.status == "AWAITING_CLARIFICATION"
+    assert session.pending_clarification["operation"] == "RESCHEDULE_REMINDER"
+
+
 def test_invalid_ordinal_keeps_multiple_match_clarification_open(
     api_client, telegram_client, db, update_factory
 ) -> None:

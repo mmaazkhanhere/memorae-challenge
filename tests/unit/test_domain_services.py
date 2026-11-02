@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from uuid import UUID
 
 import pytest
 from sqlalchemy import func, select
@@ -18,9 +19,11 @@ from reminder_agent.onboarding import handle_update
 from reminder_agent.recurrence_service import materialize_recurring_reminder
 from reminder_agent.reminders import handle_reminder_text
 from reminder_agent.rescheduling import (
+    RescheduleCandidate,
     RescheduleScope,
     apply_reschedule,
     decide_reschedule,
+    format_candidates,
     find_candidates,
 )
 from reminder_agent.telegram import TelegramAPIError, TelegramDeliveryResult, TelegramUpdate
@@ -57,6 +60,23 @@ def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def test_reschedule_candidates_are_displayed_in_user_timezone() -> None:
+    text = format_candidates(
+        [
+            RescheduleCandidate(
+                reminder_id=UUID(int=0),
+                occurrence_id=UUID(int=0),
+                task="call the bank",
+                due_at=datetime(2026, 11, 3, 4, 0, tzinfo=timezone.utc),
+                schedule_type="ONE_TIME",
+            )
+        ],
+        timezone_name="Asia/Karachi",
+    )
+
+    assert text == "1. call the bank (currently 2026-11-03 09:00 PKT)"
 
 
 def _active_user_and_telegram_identity(db, *, telegram_user_id: int, chat_id: int):

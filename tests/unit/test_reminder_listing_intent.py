@@ -159,6 +159,48 @@ def test_model_interpreter_accepts_all_reminders_without_a_date_range(monkeypatc
     assert result.intent.end_date is None
 
 
+def test_model_interpreter_normalizes_single_date_and_ignores_model_reminders(monkeypatch):
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "operation": "LIST_REMINDERS",
+                                    "date": "2026-11-03",
+                                    "reminders": [
+                                        {
+                                            "task": "untrusted model result",
+                                            "due_local": "2026-11-03T08:00",
+                                        }
+                                    ],
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+
+    monkeypatch.setattr("reminder_agent.intent.httpx.post", lambda *args, **kwargs: Response())
+    result = OpenAICompatibleIntentInterpreter(
+        "https://example.test", "key", "model"
+    ).interpret(
+        "what reminders do i have tomorrow?",
+        selected_route=IntentRoute.LIST_REQUEST,
+        timezone_name="Asia/Karachi",
+        now=datetime(2026, 11, 2, 16, 59, tzinfo=timezone.utc),
+    )
+
+    assert isinstance(result.intent, ListRemindersIntent)
+    assert result.intent.start_date.isoformat() == "2026-11-03"
+    assert result.intent.end_date == result.intent.start_date
+
+
 def test_model_interpreter_normalizes_nested_date_range(monkeypatch):
     class Response:
         def raise_for_status(self):
