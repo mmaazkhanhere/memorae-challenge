@@ -157,6 +157,7 @@ def test_intent_router_classifies_only_the_operation_and_limits_history(monkeypa
 
     assert suggestion.operation is IntentRoute.NEW_REQUEST
     assert "LIST_REQUEST" in captured["messages"][0]["content"]
+    assert "RESCHEDULE_REQUEST" in captured["messages"][0]["content"]
     context = json.loads(captured["messages"][1]["content"])
     assert context["active_pending"]["task"] == "call Bilal"
     assert context["missing_fields"] == ["date"]
@@ -186,6 +187,26 @@ def test_intent_router_accepts_list_request_route(monkeypatch) -> None:
     assert suggestion.operation is IntentRoute.LIST_REQUEST
 
 
+def test_intent_router_accepts_reschedule_request_route(monkeypatch) -> None:
+    def fake_post(*args, **kwargs):
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={"choices": [{"message": {"content": '{"operation":"RESCHEDULE_REQUEST"}'}}]},
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    suggestion = OpenAICompatibleIntentRouter(
+        "https://api.groq.example/openai/v1", "secret", "openai/gpt-oss-20b"
+    ).classify(
+        "Could you shift the bank reminder to tomorrow at 10 AM?",
+        pending=None,
+        recent_messages=(),
+    )
+
+    assert suggestion.operation is IntentRoute.RESCHEDULE_REQUEST
+
+
 def test_list_request_route_from_classifier_reaches_interpreter() -> None:
     class ListRouter:
         def classify(self, *args, **kwargs):
@@ -213,6 +234,35 @@ def test_list_request_route_from_classifier_reaches_interpreter() -> None:
     assert route is ConversationRoute.LIST_REQUEST
     assert interpreter.called is True
     assert result.response_text == "listing"
+
+
+def test_classifier_reschedule_route_bypasses_reminder_extractor() -> None:
+    class RescheduleRouter:
+        def classify(self, *args, **kwargs):
+            return IntentRouteSuggestion(operation=IntentRoute.RESCHEDULE_REQUEST)
+
+    class RecordingInterpreter:
+        def __init__(self) -> None:
+            self.called = False
+
+        def interpret(self, *args, **kwargs):
+            self.called = True
+            return Interpretation(response_text="should not be called")
+
+    interpreter = RecordingInterpreter()
+    route, result = _route_and_interpret(
+        interpreter,
+        "Could you shift the bank reminder to tomorrow at 10 AM?",
+        timezone_name="UTC",
+        now=NOW,
+        pending=None,
+        user_name="Ada",
+        intent_router=RescheduleRouter(),
+    )
+
+    assert route is ConversationRoute.RESCHEDULE_REQUEST
+    assert interpreter.called is False
+    assert result.fallback_allowed is False
 
 
 @pytest.mark.parametrize(

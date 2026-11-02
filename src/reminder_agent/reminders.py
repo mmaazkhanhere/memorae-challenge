@@ -307,12 +307,13 @@ def _handle_reschedule_text(
     pending: PendingReschedule | None,
     now: datetime,
     session_ttl_seconds: int,
+    force: bool = False,
 ) -> ReminderReply | None:
     """Handle VS-09 before the creation interpreter is invoked."""
 
     assert update.message is not None
     text = update.message.text or ""
-    if not is_reschedule_command(text) and pending is None:
+    if not force and not is_reschedule_command(text) and pending is None:
         return None
 
     decision = decide_reschedule(
@@ -618,6 +619,8 @@ def _route_and_interpret(
         )
         if suggestion is IntentRoute.LIST_REQUEST:
             route = ConversationRoute.LIST_REQUEST
+        elif suggestion is IntentRoute.RESCHEDULE_REQUEST:
+            route = ConversationRoute.RESCHEDULE_REQUEST
         elif suggestion is IntentRoute.NEW_REQUEST:
             route = ConversationRoute.NEW_REQUEST
         elif suggestion is IntentRoute.UPDATE_PENDING and pending is not None:
@@ -659,6 +662,8 @@ def _route_and_interpret(
             response_text=unrelated_response(text, pending=pending),
             fallback_allowed=False,
         )
+    elif route is ConversationRoute.RESCHEDULE_REQUEST:
+        interpretation = Interpretation(fallback_allowed=False)
     else:
         selected_route = _selected_intent_route(route, pending=pending)
         interpretation = _interpret(
@@ -944,6 +949,21 @@ def handle_reminder_text(
             intent_router=intent_router,
             recent_messages=recent_messages,
         )
+        if route is ConversationRoute.RESCHEDULE_REQUEST:
+            reschedule_reply = _handle_reschedule_text(
+                db,
+                update,
+                user_id=user.id,
+                identity_id=identity.id,
+                telegram_user_id=telegram_user_id,
+                user=user,
+                pending=pending_reschedule,
+                now=now,
+                session_ttl_seconds=session_ttl_seconds,
+                force=True,
+            )
+            if reschedule_reply is not None:
+                return reschedule_reply
     if interpretation is None:
         interpretation = Interpretation(
             response_text="That clarification expired. Please send the complete reminder again.",

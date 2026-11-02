@@ -12,6 +12,7 @@ from reminder_agent.intent import PendingReminder
 class ConversationRoute(StrEnum):
     NEW_REQUEST = "NEW_REQUEST"
     LIST_REQUEST = "LIST_REQUEST"
+    RESCHEDULE_REQUEST = "RESCHEDULE_REQUEST"
     CLARIFICATION_REPLY = "CLARIFICATION_REPLY"
     CANCELLATION = "CANCELLATION"
     SOCIAL = "SOCIAL"

@@ -102,7 +102,8 @@ class RescheduleDecision:
 
 
 _COMMAND = re.compile(
-    r"^\s*(?:please\s+)?(?:move|reschedule|change)\s+(?:the\s+)?(?P<target>.+?)\s+"
+    r"^\s*(?:please\s+|can\s+you\s+|could\s+you\s+)?"
+    r"(?:move|reschedule|change|shift|push|postpone|delay)\s+(?:the\s+)?(?P<target>.+?)\s+"
     r"(?P<separator>to|until|for|at)\s+(?P<when>.+?)\s*[.!?]*\s*$",
     re.IGNORECASE,
 )
@@ -129,7 +130,14 @@ _DAY_INDEX = {
 
 
 def is_reschedule_command(text: str) -> bool:
-    return bool(re.match(r"^\s*(?:please\s+)?(?:move|reschedule|change)\b", text, re.I))
+    return bool(
+        re.match(
+            r"^\s*(?:please\s+)?"
+            r"(?:move|reschedule|change|shift|push|postpone|delay)\b",
+            text,
+            re.I,
+        )
+    )
 
 
 def _scope_from_text(text: str) -> RescheduleScope | None:

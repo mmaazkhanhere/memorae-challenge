@@ -24,6 +24,7 @@ logger = get_logger()
 class IntentRoute(StrEnum):
     NEW_REQUEST = "NEW_REQUEST"
     LIST_REQUEST = "LIST_REQUEST"
+    RESCHEDULE_REQUEST = "RESCHEDULE_REQUEST"
     UPDATE_PENDING = "UPDATE_PENDING"
     CANCEL_PENDING = "CANCEL_PENDING"
     SOCIAL = "SOCIAL"
@@ -80,6 +81,7 @@ class OpenAICompatibleIntentRouter:
 
             - NEW_REQUEST: Separate reminder, even if one is pending.
             - LIST_REQUEST: Retrieve reminders.
+            - RESCHEDULE_REQUEST: Move an existing reminder to a new time.
             - UPDATE_PENDING: Clarify or modify the pending reminder.
             - CANCEL_PENDING: Cancel the pending reminder.
             - SOCIAL: Casual chat.

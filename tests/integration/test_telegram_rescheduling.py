@@ -17,6 +17,7 @@ from reminder_agent.db.models import (
 )
 from reminder_agent.worker import NotificationWorker
 from reminder_agent import rescheduling
+from reminder_agent.intent import IntentRoute, IntentRouteSuggestion
 from reminder_agent.rescheduling import RescheduleConflict, RescheduleScope, apply_reschedule
 
 
@@ -75,6 +76,31 @@ def test_reschedule_updates_existing_reminder_and_replaces_pending_notification(
     assert notifications[1].due_at.replace(tzinfo=timezone.utc) == datetime(
         2026, 10, 31, 10, 0, tzinfo=timezone.utc
     )
+
+
+def test_classifier_routes_indirect_reschedule_to_transactional_handler(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    class RescheduleRouter:
+        def classify(self, *args, **kwargs):
+            return IntentRouteSuggestion(operation=IntentRoute.RESCHEDULE_REQUEST)
+
+    api_client.app.state.intent_router = RescheduleRouter()
+    onboard(api_client, update_factory)
+    assert post_update(
+        api_client,
+        update_factory(903, text="Remind me tomorrow at 9 AM to call the bank"),
+    ).status_code == 200
+
+    response = post_update(
+        api_client,
+        update_factory(904, text="Could you shift the bank reminder to tomorrow at 10 AM?"),
+    )
+
+    assert response.status_code == 200
+    assert "Moved 'call the bank'" in telegram_client.messages[-1][1]
+    reminder = db.scalar(select(Reminder))
+    assert reminder is not None and reminder.version == 2
 
 
 def test_reschedule_replay_does_not_apply_twice(

@@ -22,6 +22,17 @@ def test_parse_reschedule_request_resolves_explicit_local_time() -> None:
     assert result.due_at == datetime(2026, 10, 31, 10, 0, tzinfo=timezone.utc)
 
 
+def test_parse_reschedule_request_accepts_indirect_shift_wording() -> None:
+    result = parse_reschedule_request(
+        "Could you shift the bank reminder to tomorrow at 10 AM?",
+        timezone_name="UTC",
+        now=NOW,
+    )
+
+    assert isinstance(result, RescheduleRequest)
+    assert result.target_text == "bank reminder"
+
+
 def test_parse_reschedule_request_requires_am_pm_for_ambiguous_clock() -> None:
     result = parse_reschedule_request(
         "Move the bank reminder to 10",
