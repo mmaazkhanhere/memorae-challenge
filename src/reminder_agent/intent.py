@@ -2075,6 +2075,8 @@ class OpenAICompatibleIntentInterpreter:
                 UPDATE_PENDING:
                 - UPDATE_PENDING_REMINDER: extract only explicitly supplied changes (task, date_local, hour, minute, meridiem, date_explicit, recurrence_frequency, recurrence_interval, recurrence_day_of_month, recurrence_month), with certainty="CLEAR" and exact evidence for each field. Recurrence frequency is MONTHLY or YEARLY; interval is 1-60; day_of_month is 1-31 and month is 1-12. Do not repeat or change other pending fields.
 
+                For UPDATE_PENDING_REMINDER, return an updates object whose field values are primitive values directly, for example: {"operation":"UPDATE_PENDING_REMINDER","updates":{"task":"pay rent","date_local":"2026-11-05","hour":2,"meridiem":"pm","date_explicit":true,"certainty":"CLEAR","evidence":{"task":"pay rent","date_local":"November 5","hour":"2 PM","meridiem":"PM","date_explicit":"November 5"}}}. Do not wrap any updates field in a value/certainty/evidence object; evidence belongs only in the updates.evidence mapping. Include only fields explicitly supplied by the user; do not infer omitted fields or defaults.
+
                 If required fields are missing or ambiguous, return NEEDS_CLARIFICATION with relevant pending fields and a focused question.
 
                 Use provided local time and timezone. Never invent tasks, dates, times, or recurrence rules. Use timezone-naive ISO-8601 local datetimes.

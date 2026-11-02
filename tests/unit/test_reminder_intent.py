@@ -1203,10 +1203,11 @@ def test_openai_compatible_interpreter_accepts_structured_response(monkeypatch) 
 def test_openai_compatible_interpreter_returns_only_provider_field_updates_for_context(
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(
-        httpx,
-        "post",
-        lambda *args, **kwargs: httpx.Response(
+    captured_prompt = {}
+
+    def fake_post(*args, **kwargs):
+        captured_prompt["value"] = kwargs["json"]["messages"][0]["content"]
+        return httpx.Response(
             200,
             request=httpx.Request("POST", args[0]),
             json={
@@ -1221,7 +1222,12 @@ def test_openai_compatible_interpreter_returns_only_provider_field_updates_for_c
                     }
                 ]
             },
-        ),
+        )
+
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        fake_post,
     )
     context = PendingReminder(
         task="call the bank",
@@ -1237,6 +1243,9 @@ def test_openai_compatible_interpreter_returns_only_provider_field_updates_for_c
     assert result.intent is None
     assert result.clarification is None
     assert result.field_updates == PendingReminderFieldUpdate(meridiem="pm")
+    assert "field values are primitive values directly" in captured_prompt["value"]
+    assert "Do not wrap any updates field in a value/certainty/evidence object" in captured_prompt["value"]
+    assert '"evidence":{"task":"pay rent"' in captured_prompt["value"]
 
     # The service-side state manager, not the provider, combines this patch
     # with the pending task/date/time and only then validates completion.
