@@ -21,7 +21,9 @@ def upgrade() -> None:
             column["name"]: column for column in sa.inspect(bind).get_columns("alembic_version")
         }
         version_column = version_columns.get("version_num")
-        if version_column is not None and getattr(version_column["type"], "length", 0) < 64:
+        if version_column is not None and (
+            getattr(version_column["type"], "length", None) or 0
+        ) < 64:
             op.alter_column(
                 "alembic_version",
                 "version_num",
