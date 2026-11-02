@@ -100,14 +100,24 @@ class HttpTelegramClient:
     def __init__(self, token: str, timeout_seconds: float = 10.0) -> None:
         if not token:
             raise TelegramAPIError("Telegram bot token is not configured")
+        self._token = token
         self._url = f"https://api.telegram.org/bot{token}/sendMessage"
         self._timeout = timeout_seconds
+
+    def _redact_text(self, value: str) -> str:
+        """Remove the configured token from provider-controlled diagnostic text."""
+
+        redacted = value.replace(self._token, "<redacted>")
+        return re.sub(r"/bot[^/\s]+", "/bot<redacted>", redacted)
 
     def _safe_cause(self, error: Exception) -> str | None:
         cause = str(error)
         if not cause:
             return None
-        return re.sub(r"/bot[^/\s]+", "/bot<redacted>", cause)
+        return self._redact_text(cause)
+
+    def _safe_description(self, value: object) -> str | None:
+        return self._redact_text(value) if isinstance(value, str) else None
 
     def send_message(
         self, chat_id: int, text: str, *, reply_markup: dict[str, Any] | None = None
@@ -270,8 +280,8 @@ class HttpTelegramClient:
             ) from exc
 
         try:
-            payload: dict[str, Any] = response.json()
-        except ValueError as exc:
+            payload = response.json()
+        except (TypeError, ValueError) as exc:
             log_event(
                 logger,
                 logging.ERROR,
@@ -286,6 +296,12 @@ class HttpTelegramClient:
                 failure_kind="invalid_response",
                 cause=safe_cause(exc),
             ) from exc
+        if not isinstance(payload, dict):
+            raise TelegramAPIError(
+                "Telegram returned an invalid response",
+                status_code=response.status_code,
+                failure_kind="invalid_response",
+            )
 
         log_event(
             logger,
@@ -307,7 +323,7 @@ class HttpTelegramClient:
             raise TelegramAPIError(
                 "Telegram rejected the message",
                 status_code=response.status_code,
-                telegram_description=payload.get("description"),
+                telegram_description=self._safe_description(payload.get("description")),
                 failure_kind="rate_limited" if response.status_code == 429 else "http_error",
                 retry_after_seconds=retry_after,
             )
@@ -321,11 +337,17 @@ class HttpTelegramClient:
             raise TelegramAPIError(
                 "Telegram message delivery was rejected",
                 status_code=response.status_code,
-                telegram_description=payload.get("description"),
+                telegram_description=self._safe_description(payload.get("description")),
                 failure_kind="rate_limited" if response.status_code == 429 else "api_error",
                 retry_after_seconds=retry_after,
             )
-        result = payload.get("result") or {}
+        result = payload.get("result")
+        if not isinstance(result, dict) or result.get("message_id") is None:
+            raise TelegramAPIError(
+                "Telegram returned an invalid response",
+                status_code=response.status_code,
+                failure_kind="invalid_response",
+            )
         provider_message_id = result.get("message_id")
         log_event(
             logger,
