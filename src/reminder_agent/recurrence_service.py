@@ -11,7 +11,13 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
-from reminder_agent.db.models import ChannelIdentity, Notification, Reminder, ReminderOccurrence
+from reminder_agent.db.models import (
+    ChannelIdentity,
+    Notification,
+    Reminder,
+    ReminderOccurrence,
+    ReminderRecurrenceException,
+)
 from reminder_agent.observability import get_logger, log_event
 from reminder_agent.recurrence import iter_recurrence_occurrences, parse_recurrence_rule
 
@@ -63,6 +69,14 @@ def materialize_recurring_reminder(
     if identity is None:
         return 0
 
+    skipped_dates = set(
+        db.scalars(
+            select(ReminderRecurrenceException.occurrence_date).where(
+                ReminderRecurrenceException.reminder_id == reminder.id
+            )
+        ).all()
+    )
+
     insert = _insert_for_dialect(db)
     created = 0
     for _local_date, local_due, due_at in iter_recurrence_occurrences(
@@ -72,6 +86,8 @@ def materialize_recurring_reminder(
         timezone_name=reminder.timezone,
         horizon_days=horizon_days,
     ):
+        if _local_date in skipped_dates:
+            continue
         recurrence_key = local_due.replace(tzinfo=None).isoformat(timespec="minutes")
         statement = (
             insert(ReminderOccurrence)
