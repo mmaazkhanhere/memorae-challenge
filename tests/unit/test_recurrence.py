@@ -9,6 +9,7 @@ from reminder_agent.recurrence import (
     WeeklyRecurrence,
     parse_recurrence_rule,
     parse_weekly_rule,
+    recurrence_due_for_local_date,
     resolve_local_datetime,
 )
 
@@ -129,6 +130,26 @@ def test_weekly_rule_round_trips_canonically() -> None:
     recurrence = WeeklyRecurrence((0, 2), 8, 5)
     assert recurrence.canonical_rule == "FREQ=WEEKLY;BYDAY=MO,WE;BYHOUR=08;BYMINUTE=05"
     assert parse_weekly_rule(recurrence.canonical_rule) == recurrence
+
+
+def test_recurrence_due_for_local_date_validates_schedule_and_preserves_dst_policy() -> None:
+    recurrence = WeeklyRecurrence((6,), 8, 0)
+
+    due = recurrence_due_for_local_date(
+        recurrence,
+        start_local=datetime(2027, 3, 7, 8),
+        occurrence_date=date(2027, 3, 14),
+        timezone_name="America/New_York",
+    )
+
+    assert due is not None
+    assert due[0].utcoffset().total_seconds() == -4 * 60 * 60
+    assert recurrence_due_for_local_date(
+        recurrence,
+        start_local=datetime(2027, 3, 7, 8),
+        occurrence_date=date(2027, 3, 15),
+        timezone_name="America/New_York",
+    ) is None
 
 
 def test_recurring_intent_rejects_out_of_range_weekdays() -> None:
