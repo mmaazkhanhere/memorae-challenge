@@ -25,7 +25,11 @@ from reminder_agent.db.models import (
     Reminder,
     ReminderOccurrence,
 )
-from reminder_agent.recurrence import parse_recurrence_rule, resolve_local_datetime
+from reminder_agent.recurrence import (
+    WeeklyRecurrence,
+    parse_recurrence_rule,
+    resolve_local_datetime,
+)
 
 
 ACTIVE = "ACTIVE"
@@ -67,6 +71,7 @@ class PendingReschedule(BaseModel):
     candidate_ids: tuple[UUID, ...] = ()
     scope: RescheduleScope | None = None
     occurrence_date: date | None = None
+    destination_weekday: int | None = Field(default=None, ge=0, le=6)
 
     @field_validator("target_text")
     @classmethod
@@ -163,6 +168,9 @@ class RescheduleRequest:
     scope: RescheduleScope | None = None
     source_text: str | None = None
     occurrence_date: date | None = None
+    # A named destination weekday is a cadence change only for a series.  A
+    # relative or ISO destination date merely selects the first new due date.
+    destination_weekday: int | None = None
 
 
 @dataclass(frozen=True)
@@ -222,6 +230,12 @@ _OCCURRENCE_SELECTOR = re.compile(
     r"thursday|friday|saturday|sunday)'s\s+",
     re.IGNORECASE,
 )
+_UNSUPPORTED_SERIES_CADENCE = re.compile(
+    r"\b(?:on\s+)?(?:the\s+)?(?:\d{1,2}(?:st|nd|rd|th)|first|second|third|"
+    r"fourth|last|january|february|march|april|may|june|july|august|september|"
+    r"october|november|december)\b",
+    re.IGNORECASE,
+)
 
 
 def is_reschedule_command(text: str) -> bool:
@@ -235,9 +249,25 @@ def is_reschedule_command(text: str) -> bool:
     )
 
 
+def has_unsupported_series_cadence_change(text: str) -> bool:
+    """Recognize calendar-cadence requests that this narrow API cannot model.
+
+    Named weekdays are supported for weekly series.  Month/day and ordinal
+    requests must not reach an LLM proposal that can only express a timestamp,
+    because that would turn a cadence request into a silent time-only update.
+    """
+
+    if not is_reschedule_command(text) or not re.search(r"\b(?:series|all\s+future|every)\b", text, re.I):
+        return False
+    destination = re.split(r"\s+(?:to|until|for|at)\s+", text, maxsplit=1, flags=re.I)
+    return len(destination) == 2 and bool(_UNSUPPORTED_SERIES_CADENCE.search(destination[1]))
+
+
 def _scope_from_text(text: str) -> RescheduleScope | None:
     normalized = text.lower()
     if normalized.strip() in {"all", "all of them", "everything"}:
+        return RescheduleScope.SERIES
+    if normalized.strip() in {"all future ones", "all the future ones"}:
         return RescheduleScope.SERIES
     if re.search(
         r"\b(?:whole\s+)?series\b|\ball\s+(?:future\s+)?(?:reminders?|occurrences?)\b|"
@@ -252,6 +282,8 @@ def _scope_from_text(text: str) -> RescheduleScope | None:
         r"\b(?:only\s+)?(?:this|coming)\s+one\b|\bthis\s+(?:occurrence|reminder)\b",
         normalized,
     ):
+        return RescheduleScope.OCCURRENCE
+    if normalized.strip() in {"just tomorrow", "only tomorrow", "just the next one"}:
         return RescheduleScope.OCCURRENCE
     return None
 
@@ -287,6 +319,8 @@ def _extract_target_and_occurrence(
         # instance; "only" reinforces rather than creates that scope.
         scope = RescheduleScope.OCCURRENCE
         target = target[:selector.start()] + target[selector.end():]
+    if scope is RescheduleScope.SERIES:
+        target = re.sub(r"^(?:every\s+)?(?:daily\s+)?", "", target, flags=re.I)
     target = re.sub(
         r"\b(?:all\s+future\s+reminders?|all\s+reminders?|this\s+occurrence|this\s+reminder|"
         r"the\s+whole\s+series|the\s+series|whole\s+series|series|next\s+occurrence|"
@@ -358,6 +392,7 @@ def parse_reschedule_request(text: str, *, timezone_name: str, now: datetime) ->
         date_explicit=when.group("day") is not None,
         scope=scope,
         occurrence_date=occurrence_date,
+        destination_weekday=_DAY_INDEX.get((when.group("day") or "").lower()),
     )
 
 
@@ -550,6 +585,7 @@ def decide_reschedule(
                     scope=scope,
                     source_text=pending.source_text,
                     occurrence_date=pending.occurrence_date,
+                    destination_weekday=pending.destination_weekday,
                 ),
                 candidate_ids=pending.candidate_ids,
             )
@@ -572,6 +608,7 @@ def decide_reschedule(
                         date_explicit=pending.date_explicit,
                         scope=scope,
                         occurrence_date=pending.occurrence_date,
+                        destination_weekday=pending.destination_weekday,
                     ),
                     candidate_ids,
                 )
@@ -593,6 +630,7 @@ def decide_reschedule(
                     offset_minutes=pending.offset_minutes,
                     scope=scope,
                     occurrence_date=pending.occurrence_date,
+                    destination_weekday=pending.destination_weekday,
                 ),
                 candidate,
                 timezone_name=timezone_name,
@@ -663,6 +701,7 @@ def _resolve_candidate_due(
             scope=request.scope,
             source_text=request.source_text,
             occurrence_date=request.occurrence_date,
+            destination_weekday=request.destination_weekday,
         )
     if request.offset_minutes is None:
         raise ValueError("reschedule request is missing a time target")
@@ -676,6 +715,7 @@ def _resolve_candidate_due(
         scope=request.scope,
         source_text=request.source_text,
         occurrence_date=request.occurrence_date,
+        destination_weekday=request.destination_weekday,
     )
 
 
@@ -869,6 +909,7 @@ def apply_reschedule(
     scope: RescheduleScope | None,
     now: datetime,
     occurrence_id: UUID | None = None,
+    destination_weekday: int | None = None,
 ) -> tuple[Reminder, datetime]:
     """Atomically update one owned reminder and its pending notification(s)."""
 
@@ -899,25 +940,50 @@ def apply_reschedule(
     if reminder.schedule_type == RECURRING and scope is RescheduleScope.SERIES:
         recurrence = parse_recurrence_rule(reminder.recurrence_rule or "")
         local_due = due_at.astimezone(zone)
-        # VS-09 changes the series time while retaining its cadence and dates.
-        if hasattr(recurrence, "hour"):
-            fields = reminder.recurrence_rule.split(";")
-            fields = [
-                (f"BYHOUR={local_due.hour:02d}" if field.startswith("BYHOUR=") else field)
-                for field in fields
-            ]
-            fields = [
-                (f"BYMINUTE={local_due.minute:02d}" if field.startswith("BYMINUTE=") else field)
-                for field in fields
-            ]
-            reminder.recurrence_rule = ";".join(fields)
+        cadence_changed = destination_weekday is not None
+        if cadence_changed:
+            if not isinstance(recurrence, WeeklyRecurrence) or len(recurrence.weekdays) != 1:
+                raise RescheduleConflict(
+                    "Changing this recurrence cadence is not supported; change only its time."
+                )
+            recurrence = WeeklyRecurrence(
+                (destination_weekday,),
+                local_due.hour,
+                local_due.minute,
+                recurrence.interval,
+            )
+            # The named destination day establishes the new weekly anchor.
+            start_local = local_due.replace(tzinfo=None)
+        else:
+            # Time-only series changes retain the existing cadence and anchor
+            # date for weekly, monthly, and yearly rules.
+            if isinstance(recurrence, WeeklyRecurrence):
+                recurrence = WeeklyRecurrence(
+                    recurrence.weekdays,
+                    local_due.hour,
+                    local_due.minute,
+                    recurrence.interval,
+                )
+            else:
+                recurrence = type(recurrence)(
+                    *(
+                        (recurrence.day_of_month,)
+                        if not hasattr(recurrence, "month")
+                        else (recurrence.month, recurrence.day_of_month)
+                    ),
+                    local_due.hour,
+                    local_due.minute,
+                    recurrence.interval,
+                )
             start_local = datetime.fromisoformat(reminder.start_local).replace(
                 hour=local_due.hour, minute=local_due.minute
             )
-            reminder.start_local = start_local.isoformat(timespec="minutes")
+        reminder.recurrence_rule = recurrence.canonical_rule
+        reminder.start_local = start_local.isoformat(timespec="minutes")
         occurrences = db.scalars(
             select(ReminderOccurrence)
             .where(ReminderOccurrence.reminder_id == reminder.id, ReminderOccurrence.status == PENDING)
+            .order_by(ReminderOccurrence.next_due_at, ReminderOccurrence.id)
             .with_for_update()
         ).all()
         if occurrences:
@@ -931,8 +997,12 @@ def apply_reschedule(
             )
             if sending_exists:
                 raise RescheduleConflict("A reminder notification is already being sent")
-        for occurrence in occurrences:
-            local_date = occurrence.scheduled_at.astimezone(zone).date()
+        for index, occurrence in enumerate(occurrences):
+            local_date = (
+                local_due.date() + timedelta(weeks=index * recurrence.interval)
+                if cadence_changed
+                else occurrence.scheduled_at.astimezone(zone).date()
+            )
             shifted = resolve_local_datetime(local_date, time(local_due.hour, local_due.minute), zone)
             occurrence.scheduled_at = shifted.astimezone(timezone.utc)
             occurrence.next_due_at = occurrence.scheduled_at

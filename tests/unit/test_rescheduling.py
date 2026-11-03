@@ -209,6 +209,20 @@ def test_parse_reschedule_request_extracts_series_scope() -> None:
     assert isinstance(result, RescheduleRequest)
     assert result.scope is RescheduleScope.SERIES
     assert result.target_text == "standup"
+    assert result.destination_weekday == 0
+
+
+def test_parse_daily_series_target_excludes_scope_and_cadence_words() -> None:
+    result = parse_reschedule_request(
+        "Move every daily exercise reminder to 9 AM",
+        timezone_name="UTC",
+        now=NOW,
+    )
+
+    assert isinstance(result, RescheduleRequest)
+    assert result.scope is RescheduleScope.SERIES
+    assert result.target_text == "exercise reminder"
+    assert result.destination_weekday is None
 
 
 def test_parse_reschedule_request_extracts_upcoming_occurrence_scope() -> None:

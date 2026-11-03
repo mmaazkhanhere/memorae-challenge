@@ -678,6 +678,186 @@ def test_recurring_reschedule_can_update_only_the_upcoming_reminder(
     ] == original_future_occurrences
 
 
+def test_recurring_series_weekday_change_updates_rule_and_future_occurrences(
+    api_client, telegram_client, db, update_factory, session_factory
+) -> None:
+    """A series move from Monday to Tuesday must change cadence, not only clock time."""
+    onboard(api_client, update_factory)
+    assert post_update(
+        api_client,
+        update_factory(9290, text="Remind me every Monday at 10 AM to review the report"),
+    ).status_code == 200
+
+    response = post_update(
+        api_client,
+        update_factory(9291, text="Move the report series to Tuesday at 9 AM"),
+    )
+
+    assert response.status_code == 200
+    db.expire_all()
+    reminder = db.scalar(select(Reminder))
+    assert reminder is not None
+    assert "BYDAY=TU" in (reminder.recurrence_rule or "")
+    assert "every Tuesday at 09:00 UTC" in telegram_client.messages[-1][1]
+    occurrences = db.scalars(
+        select(ReminderOccurrence)
+        .where(ReminderOccurrence.reminder_id == reminder.id)
+        .order_by(ReminderOccurrence.next_due_at)
+    ).all()
+    assert occurrences
+    assert all(item.next_due_at.replace(tzinfo=timezone.utc).weekday() == 1 for item in occurrences)
+    assert all(
+        [item.status for item in db.scalars(
+            select(Notification)
+            .where(Notification.occurrence_id == occurrence.id)
+            .order_by(Notification.sequence)
+        )] == ["CANCELED", "PENDING"]
+        for occurrence in occurrences
+    )
+    notification_count = db.scalar(select(func.count()).select_from(Notification))
+
+    NotificationWorker(
+        session_factory,
+        telegram_client=None,
+        clock=lambda: datetime(2026, 10, 30, 12, tzinfo=timezone.utc),
+    ).run_once()
+    db.expire_all()
+    assert db.scalar(select(func.count()).select_from(Notification)) == notification_count
+    assert all(
+        item.next_due_at.replace(tzinfo=timezone.utc).weekday() == 1
+        for item in db.scalars(select(ReminderOccurrence).where(ReminderOccurrence.status == "PENDING"))
+    )
+
+
+def test_daily_occurrence_reschedule_preserves_following_recurrence_instance(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory)
+    assert post_update(
+        api_client,
+        update_factory(9292, text="Remind me every day at 8 AM to exercise"),
+    ).status_code == 200
+    reminder = db.scalar(select(Reminder))
+    assert reminder is not None
+    original_rule = reminder.recurrence_rule
+    occurrences_before = db.scalars(
+        select(ReminderOccurrence)
+        .where(ReminderOccurrence.reminder_id == reminder.id)
+        .order_by(ReminderOccurrence.next_due_at)
+    ).all()
+    tomorrow, following_day = occurrences_before[:2]
+
+    assert post_update(
+        api_client,
+        update_factory(9293, text="Move only tomorrow's exercise reminder to 10 AM"),
+    ).status_code == 200
+    db.expire_all()
+
+    reminder = db.get(Reminder, reminder.id)
+    assert reminder is not None and reminder.recurrence_rule == original_rule
+    moved = db.get(ReminderOccurrence, tomorrow.id)
+    unchanged = db.get(ReminderOccurrence, following_day.id)
+    assert moved is not None and unchanged is not None
+    assert moved.next_due_at.replace(tzinfo=timezone.utc) == datetime(
+        2026, 10, 31, 10, tzinfo=timezone.utc
+    )
+    assert unchanged.next_due_at.replace(tzinfo=timezone.utc) == datetime(
+        2026, 11, 1, 8, tzinfo=timezone.utc
+    )
+    assert [item.status for item in db.scalars(
+        select(Notification).where(Notification.occurrence_id == moved.id).order_by(Notification.sequence)
+    )] == ["CANCELED", "PENDING"]
+
+
+def test_daily_series_time_change_updates_all_future_occurrences(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory)
+    assert post_update(
+        api_client,
+        update_factory(9294, text="Remind me every day at 8 AM to exercise"),
+    ).status_code == 200
+
+    assert post_update(
+        api_client,
+        update_factory(9295, text="Move every daily exercise reminder to 9 AM"),
+    ).status_code == 200
+    db.expire_all()
+
+    reminder = db.scalar(select(Reminder))
+    assert reminder is not None
+    assert reminder.recurrence_rule == (
+        "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR,SA,SU;BYHOUR=09;BYMINUTE=00"
+    )
+    assert "09:00 UTC" in telegram_client.messages[-1][1]
+    occurrences = db.scalars(
+        select(ReminderOccurrence).where(ReminderOccurrence.reminder_id == reminder.id)
+    ).all()
+    assert occurrences and {item.next_due_at.replace(tzinfo=timezone.utc).hour for item in occurrences} == {9}
+
+
+@pytest.mark.parametrize(
+    ("scope_reply", "expected_hours"),
+    [
+        ("just tomorrow", {8, 9}),
+        ("all future ones", {9}),
+    ],
+)
+def test_natural_language_scope_follow_up_is_applied_without_guessing(
+    api_client, telegram_client, db, update_factory, scope_reply, expected_hours
+) -> None:
+    onboard(api_client, update_factory)
+    assert post_update(
+        api_client,
+        update_factory(9298, text="Remind me every day at 8 AM to exercise"),
+    ).status_code == 200
+    assert post_update(
+        api_client,
+        update_factory(9299, text="Move the exercise reminder to 9 AM"),
+    ).status_code == 200
+    assert "upcoming reminder" in telegram_client.messages[-1][1]
+
+    assert post_update(api_client, update_factory(9300, text=scope_reply)).status_code == 200
+    db.expire_all()
+    occurrences = db.scalars(select(ReminderOccurrence).order_by(ReminderOccurrence.next_due_at)).all()
+    assert {item.next_due_at.replace(tzinfo=timezone.utc).hour for item in occurrences} == expected_hours
+    if scope_reply == "just tomorrow":
+        assert occurrences[0].next_due_at.replace(tzinfo=timezone.utc).hour == 9
+        assert all(item.next_due_at.replace(tzinfo=timezone.utc).hour == 8 for item in occurrences[1:])
+
+
+@pytest.mark.parametrize(
+    ("create_text", "move_text"),
+    [
+        ("Remind me every month on the 15th at 8 AM to pay rent", "Move the rent series to the 20th at 9 AM"),
+        ("Remind me every year on March 10 at 8 AM to renew insurance", "Move the insurance series to April 11 at 9 AM"),
+    ],
+)
+def test_unsupported_calendar_cadence_change_is_rejected_without_mutation(
+    api_client, telegram_client, db, update_factory, create_text, move_text
+) -> None:
+    onboard(api_client, update_factory)
+    assert post_update(api_client, update_factory(9296, text=create_text)).status_code == 200
+    reminder = db.scalar(select(Reminder))
+    assert reminder is not None
+    original = (reminder.recurrence_rule, reminder.start_local, reminder.version)
+    original_occurrences = [
+        (item.id, item.next_due_at, item.recurrence_instance_key)
+        for item in db.scalars(select(ReminderOccurrence).order_by(ReminderOccurrence.next_due_at))
+    ]
+
+    assert post_update(api_client, update_factory(9297, text=move_text)).status_code == 200
+    db.expire_all()
+    reminder = db.scalar(select(Reminder))
+    assert reminder is not None
+    assert (reminder.recurrence_rule, reminder.start_local, reminder.version) == original
+    assert "not supported" in telegram_client.messages[-1][1].lower()
+    assert [
+        (item.id, item.next_due_at, item.recurrence_instance_key)
+        for item in db.scalars(select(ReminderOccurrence).order_by(ReminderOccurrence.next_due_at))
+    ] == original_occurrences
+
+
 def test_recurring_reschedule_can_select_tomorrows_named_occurrence(
     api_client, telegram_client, db, update_factory
 ) -> None:

@@ -84,6 +84,7 @@ from reminder_agent.rescheduling import (
     pending_candidates,
     select_pending_candidate_ids,
     is_reschedule_command,
+    has_unsupported_series_cadence_change,
     parse_reschedule_request,
     parse_pending_reschedule_parameters,
 )
@@ -338,6 +339,10 @@ def _handle_reschedule_text(
     if not force and not is_reschedule_command(text) and pending is None:
         return None
 
+    unsupported_cadence_change = (
+        pending is None and has_unsupported_series_cadence_change(text)
+    )
+
     parsed_request = None
     if pending is None:
         parsed_request = parse_reschedule_request(
@@ -397,6 +402,10 @@ def _handle_reschedule_text(
             parsed_request if isinstance(parsed_request, RescheduleRequest) else None
         ),
     )
+    if unsupported_cadence_change:
+        decision = RescheduleDecision(
+            "RESPONSE", "Changing monthly or yearly recurrence dates is not supported yet."
+        )
     pending_proposal: PendingRescheduleProposal | None = deterministic_pending_proposal
     # Pending replies are deterministic first.  Only an unresolved reply is
     # sent to the contextual extractor, and the result remains a proposal.
@@ -454,7 +463,11 @@ def _handle_reschedule_text(
             update_id=update.update_id,
             accepted=pending_proposal is not None,
         )
-    if isinstance(parsed_request, str) and reschedule_interpreter is not None:
+    if (
+        isinstance(parsed_request, str)
+        and not unsupported_cadence_change
+        and reschedule_interpreter is not None
+    ):
         db.rollback()
         candidate_context = [
             {
@@ -675,6 +688,7 @@ def _handle_reschedule_text(
                         scope=effective_pending.scope,
                         source_text=effective_pending.source_text,
                         occurrence_date=effective_pending.occurrence_date,
+                        destination_weekday=effective_pending.destination_weekday,
                     )
                 if request is None:
                     return _store_response(
@@ -695,6 +709,7 @@ def _handle_reschedule_text(
                     candidate_ids=decision.candidate_ids,
                     scope=request.scope,
                     occurrence_date=request.occurrence_date,
+                    destination_weekday=request.destination_weekday,
                 )
                 _save_reschedule_session(
                     db,
@@ -741,6 +756,7 @@ def _handle_reschedule_text(
                 due_at=_required_due_at(decision.request),
                 scope=decision.request.scope,
                 now=now,
+                destination_weekday=decision.request.destination_weekday,
             )
             log_event(
                 logger,
@@ -754,8 +770,13 @@ def _handle_reschedule_text(
                 end_session(locked_session, now=now)
             if decision.request.scope is RescheduleScope.SERIES:
                 local_time = due_at.astimezone(ZoneInfo(locked_user.timezone or "UTC"))
+                cadence = (
+                    f"every {local_time:%A} at "
+                    if decision.request.destination_weekday is not None
+                    else ""
+                )
                 confirmation = (
-                    f"Updated all future '{reminder.task}' reminders to "
+                    f"Updated all future '{reminder.task}' reminders to {cadence}"
                     f"{local_time:%H:%M %Z} via Telegram."
                 )
             else:
