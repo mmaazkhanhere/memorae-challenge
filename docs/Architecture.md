@@ -2,6 +2,8 @@
 
 > Cleaned and formatted version of the original challenge planning document. Architecture choices, workflows, open questions, diagrams, and data definitions are preserved; obvious typographical errors and duplicate lines have been tidied.
 
+> **Implementation status:** Sections 1–8 preserve the original design; Section 9 is authoritative for the implementation through VS-10.
+
 ## 1. Overview and Scope
 
 ### Communication Channels
@@ -1014,3 +1016,211 @@ flowchart TB
     class G,H,I database
 
 ```
+
+## 9. Implemented Architecture: VS-01 through VS-10
+
+This section records the architecture implemented for VS-01 through VS-10 only. It is an implementation supplement to the original design material above: it does not change the existing requirements, workflows, or designs for later slices.
+
+### 9.1 Current Component Architecture
+
+The running system consists of a Telegram webhook adapter, shared reminder application services, PostgreSQL persistence, and a separate worker process. The implemented Telegram path supports onboarding and verified phone linking, one-time and recurring reminders, clarification, unsupported-request responses, listing, rescheduling, and cancellation.
+
+`api.telegram.telegram_webhook` verifies Telegram's webhook secret, validates the incoming `TelegramUpdate`, and calls `onboarding.handle_update`. Once onboarding is active, that function delegates text requests to `reminders.handle_reminder_text`. The handler resolves the trusted Telegram identity, checks idempotency, applies request policy, and then invokes the appropriate service. It does not accept user-supplied identifiers as authority.
+
+**Current system architecture.** This view shows the deployed containers and external dependencies, not the internal request sequence.
+
+```mermaid
+flowchart LR
+    TG[Telegram]
+    LLM[Configured LLM service]
+    DB[(PostgreSQL)]
+    WORKER[Notification and confirmation worker]
+
+    subgraph APP["FastAPI application"]
+        INTERPRET[Interpretation]
+        SERVICES[Reminder services]
+    end
+
+    TG -->|webhook| INTERPRET
+    INTERPRET -->|validated request| SERVICES
+    SERVICES -->|responses| TG
+    SERVICES -->|read and write| DB
+    INTERPRET -->|optional fallback| LLM
+    WORKER -->|claim and record| DB
+    WORKER -->|deliver| TG
+```
+
+The FastAPI application contains deterministic interpretation with optional LLM fallback and the shared reminder application services. PostgreSQL holds operational, session, and delivery state; the worker handles durable confirmation retries and scheduled delivery.
+
+Implemented service boundaries are deliberately small and operation-specific:
+
+- `onboarding.py` creates Telegram identities, collects time zones, and verifies self-shared phone contacts.
+- `reminders.py` is the Telegram orchestration boundary for creation, clarification, listing, rescheduling, and cancellation.
+- `reminder_listing.py`, `rescheduling.py`, and `cancellation.py` implement owned-reminder lookup, candidate selection, grounding, and transactional change rules.
+- `recurrence_service.py` materializes upcoming recurring instances.
+- `worker.py` contains `NotificationWorker` and `ConfirmationWorker`.
+
+### 9.2 Deterministic-First Natural-Language Processing
+
+Natural-language processing is a deterministic-first hybrid, not a generic command interpreter. The LLM, when configured, proposes a narrow typed classification or parameter result; it never authorizes an operation or writes data itself.
+
+The primary execution order for a Telegram text request is:
+
+1. The webhook authenticates and validates the update; `handle_update` resolves the Telegram identity.
+2. `handle_reminder_text` verifies the active user, linked Telegram identity, idempotency key, onboarding state, and saved IANA time zone.
+3. `conversation_router.route_message` makes a deterministic routing decision from the text and any pending creation context.
+4. Only a `MODEL_FALLBACK` route calls `OpenAICompatibleIntentRouter.classify`, when a router is configured.
+5. The selected route reaches the applicable deterministic parser: `RuleBasedIntentInterpreter`, listing parsing, `parse_reschedule_request`, or `parse_cancellation_request`.
+6. If that parser permits fallback, `ReminderIntentInterpreter` can ask its configured extraction adapter for a structured proposal. Rescheduling and cancellation first parse and find owned candidates deterministically; their contextual model proposals remain non-authoritative.
+7. Parsers, grounding functions, typed Pydantic schemas, and application services validate the result before a transaction changes data. Insufficient information becomes a clarification; unsupported or unsafe input becomes a non-mutating response.
+
+There is no single centralized verifier. Verification is distributed across the parsers and typed schemas in `intent.py`, `restrict_to_explicit_field_updates`, candidate and grounding functions in `rescheduling.py` and `cancellation.py`, identity/ownership checks in `reminders.py`, and eligibility checks in `worker.py`.
+
+**Telegram message interpretation flow.** This is the primary request-processing view. The LLM paths are fallback branches; a deterministic result does not call either LLM.
+
+```mermaid
+flowchart TD
+    MSG[Telegram message] --> ROUTER[Deterministic intent router]
+    ROUTER -->|recognized command| PARSE[Deterministic parameter parser]
+    ROUTER -->|ambiguous command| ROUTE{Intent LLM enabled?}
+    ROUTER -->|social or unrelated| SAFE[Safe non-mutating response]
+    ROUTE -->|yes| INTENT[Intent LLM]
+    ROUTE -->|no| RESP[Clarify or reject]
+    INTENT -->|supported intent| PARSE
+    INTENT -->|unclear or invalid| RESP
+
+    PARSE --> PARAMS{Typed parameters found?}
+    PARAMS -->|yes| VALIDATE[Validate and ground]
+    PARAMS -->|no, fallback enabled| EXTRACT[Extraction LLM]
+    PARAMS -->|no, fallback unavailable| RESP
+    EXTRACT -->|proposal| VALIDATE
+    EXTRACT -->|invalid or failed| RESP
+
+    VALIDATE -->|valid and authorized| EXECUTE[Execute operation]
+    VALIDATE -->|missing, unsafe, or unsupported| RESP
+```
+
+`conversation_router.py` performs the first routing decision. `intent.py` provides the deterministic parser and optional OpenAI-compatible classifiers/extractors. Grounding and authorization remain distributed across `reminders.py`, `rescheduling.py`, `cancellation.py`, and the worker checks; no single verifier is implied.
+
+### 9.3 LLM Configuration and Failure Boundaries
+
+The integration uses OpenAI-compatible chat-completion endpoints. `Settings.llm_base_url`, `Settings.llm_api_key`, `Settings.llm_intent_model`, and `Settings.llm_extract_model` keep the architecture provider-flexible. A configured API key creates both adapters in `main.create_app`; without it, the system continues with deterministic behavior and clarification responses.
+
+The current default models are:
+
+| Responsibility | Setting | Default |
+| --- | --- | --- |
+| Intent classification | `llm_intent_model` | `openai/gpt-oss-20b` |
+| Parameter extraction | `llm_extract_model` | `gpt-5.4-mini-2026-03-17` |
+
+These defaults are configuration values, not a permanent provider or model commitment. Classification selects an operation route only. Extraction proposes parameters for that selected route only. Provider failures, malformed JSON, unsupported proposed operations, invalid typed values, ungrounded fields, missing details, ambiguous targets, and unsafe state changes produce a clarification or a scoped response; they do not execute a mutation.
+
+### 9.4 Persistent Clarification Sessions
+
+`ConversationSession` persists multi-turn state in PostgreSQL. Telegram identifies a session with `telegram_session_id(chat_id)` and stores it under the `(user_id, channel_type, external_session_id)` uniqueness constraint. `conversations.load_session` applies the configured TTL (`conversation_session_ttl_seconds`, default 900 seconds). Expired sessions are ended by the locked path through `end_session`, which clears the payload and active reminder reference.
+
+`pending_clarification` is JSON storage for typed, validated Pydantic contexts:
+
+- `PendingReminder` for one-time reminder creation;
+- `PendingReschedule` for a reminder move, including trusted candidate reminder IDs; and
+- `PendingCancellation` for reminder cancellation, including candidate reminder IDs and scope/date context.
+
+`pending_from_session`, `pending_reschedule_from_session`, and `pending_cancellation_from_session` validate the stored operation discriminator before using it. `active_reminder_id` is available for a durable active reminder reference. Candidate IDs never grant authorization: the service reloads candidates for the current user and active state.
+
+Session rows are locked when ending or updating a clarification. Creation clarification uses an upsert that increments `version`; rescheduling also compares the observed version before overwriting state. A conflicting or stale update is rejected rather than silently replacing newer context. An explicit new reminder or rescheduling command can supersede an older pending flow, while a list request does not consume an unfinished rescheduling clarification.
+
+**Multi-turn clarification.** This view shows how a follow-up is connected to durable pending context rather than treated as an unrelated command.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant App as Telegram application
+    participant Session as Persistent session
+    participant DB as PostgreSQL
+
+    User->>App: Incomplete request
+    App->>Session: Save pending context
+    Session->>DB: Persist session
+    App-->>User: Clarification question
+    User->>App: Follow-up
+    App->>Session: Load and update context
+    Session->>DB: Read session
+    App->>App: Validate follow-up
+    alt Complete and valid
+        App->>Session: Clear session
+        Session->>DB: Clear pending state
+        App-->>User: Result
+    else Still incomplete or invalid
+        App-->>User: Clarification
+    end
+```
+
+`conversations.py` owns expiry and versioned session access; `reminders.py` uses the typed pending context during validation and execution.
+
+### 9.5 Implemented Persistence and Recurrence Model
+
+The current SQLAlchemy schema and Alembic migrations provide these implemented tables:
+
+- `users`: onboarding status, display name, optional IANA time zone, and optional phone region.
+- `channel_identities`: a user-owned `TELEGRAM` or `PHONE` external identity, its link status, verification time, and Telegram chat ID where applicable. Partial unique indexes prevent a linked external identity—and a linked phone identity per user—from being active more than once.
+- `reminders`: the user-owned task, one-time or recurring schedule, local start, time zone, recurrence rule, state, and version. Check constraints require a recurrence rule exactly for recurring schedules.
+- `reminder_occurrences`: individual due instances with `scheduled_at`, `next_due_at`, state, and, for recurring rows, a stable `recurrence_instance_key`. Both `(reminder_id, scheduled_at)` and `(reminder_id, recurrence_instance_key)` are unique.
+- `reminder_recurrence_exceptions`: one durable local-calendar date per recurring reminder, unique by `(reminder_id, occurrence_date)`, used to skip an unmaterialized future instance.
+- `notifications`: a due Telegram delivery linked to an occurrence and destination identity, with sequence, status, attempts, provider result, and lease fields.
+- `conversation_sessions`: typed pending clarification payloads, channel/session identity, status, optional active reminder reference, version, and update time.
+- `idempotency_records`: a unique `(source, idempotency_key)` record with request hash, durable response, business outcome, and confirmation-delivery state.
+
+The implemented relationships are user-to-identities/reminders/sessions, reminder-to-occurrences/recurrence-exceptions, occurrence-to-notifications, and notification-to-a destination identity. Foreign keys cascade from user to owned rows and from reminder to occurrences/exceptions; notification destinations use `RESTRICT` to preserve delivery ownership. Application transactions persist a state change and its idempotency response together. Outbound Telegram calls occur only after the transaction commits. Rescheduling and cancellation lock the target reminder, relevant occurrences, and pending notifications; they fail safely if a notification is already `SENDING`.
+
+Recurring materialization uses the local wall-clock instant as `recurrence_instance_key`. `materialize_recurring_reminder` skips dates recorded in `ReminderRecurrenceException` and inserts occurrences with conflict-ignore semantics, so repeated or concurrent materialization converges on one logical instance. The exception mechanism implements cancellation/skipping of a specified future occurrence without cancelling the whole series.
+
+For cancellation, an unqualified recurring target defaults to `SERIES`; a one-time target defaults to its occurrence. Series cancellation cancels the reminder and its pending occurrences/notifications. Occurrence cancellation leaves a recurring parent active; if the requested future occurrence has not been materialized, `apply_cancellation` records a recurrence exception instead. For rescheduling, a recurring target without an explicit scope always asks whether to change the upcoming occurrence or all future series instances. An occurrence move replaces its pending notification; a series move updates the recurring schedule and its pending materialized work under locks.
+
+### 9.6 Delivery Architecture
+
+#### Confirmation delivery
+
+Every durable Telegram result is stored in an `IdempotencyRecord` with its response before the request is returned. The webhook then claims the stored response with `onboarding.claim_delivery` and attempts immediate Telegram delivery. `api.telegram._send_reply_with_retry` retries only a 429 response synchronously; other delivery failure results are recorded by `record_delivery_outcome` after the transaction.
+
+`ConfirmationWorker` later leases `UNKNOWN` confirmations that have become due, retries eligible records, and finalizes `SENT`, `FAILED`, or `UNKNOWN` based on the delivery outcome. Expired confirmation leases are recovered as `UNKNOWN`. This preserves a quick synchronous response path while keeping a durable retry path for failed confirmations.
+
+**Reminder creation and confirmation.** The transaction commits the reminder and durable response before Telegram delivery is attempted.
+
+```mermaid
+flowchart LR
+    REQUEST[Request] --> OPERATION[Validated operation]
+    OPERATION -->|commit reminder and response| DB[(PostgreSQL)]
+    DB -->|after commit| SEND[Immediate confirmation]
+    SEND --> TG[Telegram]
+    SEND -->|failed or uncertain| DB
+    DB -->|claim eligible retry| RETRY[Confirmation worker]
+    RETRY --> TG
+```
+
+`reminders.py` and `onboarding.py` persist the operation response with its idempotency record. `api/telegram.py` sends the immediate reply, while `ConfirmationWorker` in `worker.py` retries durable failed confirmations.
+
+#### Scheduled reminder delivery and recurrence materialization
+
+`NotificationWorker.run_once` first materializes active recurring reminders inside a short transaction, then recovers expired notification leases, claims due notifications, and delivers them. `claim_due_notifications` joins notification, occurrence, reminder, and destination identity; it only claims a `PENDING` notification whose due time has arrived and whose reminder, occurrence, and linked Telegram destination remain eligible and belong to the same user. The selection uses `FOR UPDATE SKIP LOCKED`, then marks each row `SENDING` with `claimed_by`, `claimed_until`, attempt count, and attempt time in the committed claim transaction.
+
+Telegram is called after claiming commits. A successful call marks the notification `SENT` and its occurrence `NOTIFIED`. Retryable connection failures and rate limits return a row to `PENDING` at a backoff-adjusted due time while attempts remain. Uncertain network or provider outcomes are limited and can become `UNKNOWN`; non-retryable outcomes become `FAILED`. On restart or lease expiry, in-flight `SENDING` work is recovered as `UNKNOWN` instead of being assumed unsent.
+
+This is durable, leased, at-least-once-oriented processing, not a strict exactly-once external Telegram guarantee. A provider may accept a message while the response is lost or a worker may stop after the external send and before finalization; retrying uncertain work can therefore produce a duplicate or remain `UNKNOWN`.
+
+**Scheduled reminder delivery.** The worker materializes recurring work when needed, then delivers only eligible claimed notifications.
+
+```mermaid
+flowchart TD
+    MATERIALIZE[Materialize recurrence] -->|when recurring| PENDING[(Pending notifications)]
+    PENDING --> CLAIM[Worker claim]
+    CLAIM --> CHECK[Eligibility recheck]
+    CHECK --> DELIVER[Telegram delivery]
+    DELIVER --> OUTCOME{Outcome}
+    OUTCOME -->|sent| SENT[Record sent]
+    OUTCOME -->|retry| RETRY[Schedule retry]
+    OUTCOME -->|uncertain| UNKNOWN[Record unknown]
+    OUTCOME -->|permanent failure| FAILED[Record failed]
+    RETRY --> PENDING
+```
+
+`recurrence_service.py` creates future work. `NotificationWorker` in `worker.py` claims due notifications with leases, rechecks eligibility, and records `SENT`, retryable, `FAILED`, or `UNKNOWN` outcomes. `UNKNOWN` preserves provider uncertainty rather than claiming exactly-once delivery.
