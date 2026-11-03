@@ -31,8 +31,30 @@ from reminder_agent.conversations import (
     load_session,
     pending_from_session,
     pending_reschedule_from_session,
+    pending_cancellation_from_session,
     session_expired,
     telegram_session_id,
+)
+from reminder_agent.cancellation import (
+    CancellationConflict,
+    CancellationDecision,
+    CancellationResolution,
+    CancellationRequest,
+    CancellationScope,
+    PendingCancellation,
+    apply_cancellation,
+    decide_cancellation,
+    bounded_cancellation_context,
+    classify_cancellation_resolution,
+    find_candidates,
+    find_partial_candidates,
+    find_unmaterialized_occurrence_candidates,
+    format_candidates,
+    ground_model_cancellation_request,
+    is_cancel_command,
+    is_semantically_uncertain_cancellation_target,
+    _request_occurrence_date,
+    parse_cancellation_request,
 )
 from reminder_agent.conversation_router import (
     ConversationRoute,
@@ -314,6 +336,451 @@ def _save_reschedule_session(
         session.version += 1
         session.updated_at = _now_utc(now)
     return session
+
+
+def _save_cancellation_session(
+    db: Session,
+    *,
+    user_id: UUID,
+    external_session_id: str,
+    pending: PendingCancellation,
+    now: datetime,
+) -> ConversationSession:
+    session = db.scalar(
+        select(ConversationSession)
+        .where(
+            ConversationSession.user_id == user_id,
+            ConversationSession.channel_type == TELEGRAM,
+            ConversationSession.external_session_id == external_session_id,
+        )
+        .with_for_update()
+    )
+    if session is None:
+        session = ConversationSession(
+            user_id=user_id,
+            channel_type=TELEGRAM,
+            external_session_id=external_session_id,
+            pending_clarification=pending.model_dump(mode="json"),
+            status=AWAITING_CLARIFICATION,
+            version=1,
+            updated_at=_now_utc(now),
+        )
+        db.add(session)
+    else:
+        session.pending_clarification = pending.model_dump(mode="json")
+        session.status = AWAITING_CLARIFICATION
+        session.active_reminder_id = None
+        session.version += 1
+        session.updated_at = _now_utc(now)
+    return session
+
+
+def _handle_cancellation_text(
+    db: Session,
+    update: TelegramUpdate,
+    *,
+    user_id: UUID,
+    identity_id: UUID,
+    telegram_user_id: int,
+    user: User,
+    pending: PendingCancellation | None,
+    now: datetime,
+    session_ttl_seconds: int = 900,
+    request_override: CancellationRequest | None = None,
+    cancellation_interpreter: IntentInterpreter | None = None,
+    recent_messages: list[str] | None = None,
+    force: bool = False,
+) -> ReminderReply | None:
+    """Resolve and apply VS-10 cancellation requests through one transaction."""
+
+    assert update.message is not None
+    text = update.message.text or ""
+    cancellation_context = bounded_cancellation_context(recent_messages or [])
+    log_event(
+        logger,
+        logging.INFO,
+        "cancellation_command_started",
+        update_id=update.update_id,
+        input_length=len(text.strip()),
+        has_pending=pending is not None,
+    )
+    if pending is None and request_override is None and not is_cancel_command(text):
+        if not force:
+            return None
+
+    parsed_request = None
+    if pending is None or is_cancel_command(text):
+        parsed = parse_cancellation_request(
+            text, timezone_name=user.timezone or "UTC", now=now
+        )
+        parsed_request = None if isinstance(parsed, str) else parsed
+        pending_for_decision = None
+    else:
+        pending_for_decision = pending
+
+    db.rollback()
+    if pending_for_decision is not None:
+        decision = decide_cancellation(
+            db,
+            user_id=user_id,
+            text=text,
+            timezone_name=user.timezone or "UTC",
+            now=now,
+            pending=pending_for_decision,
+        )
+    elif parsed_request is not None:
+        decision = decide_cancellation(
+            db,
+            user_id=user_id,
+            text=text,
+            timezone_name=user.timezone or "UTC",
+            now=now,
+            request_override=parsed_request,
+        )
+    else:
+        decision = None
+
+    partial_candidates = []
+    if decision is not None and decision.kind == "RESPONSE" and parsed_request is not None:
+        partial_candidates = find_partial_candidates(
+            db,
+            user_id=user_id,
+            target_text=parsed_request.target_text,
+            occurrence_date=parsed_request.occurrence_date,
+            timezone_name=user.timezone or "UTC",
+            include_empty_series=(
+                parsed_request.scope is not CancellationScope.OCCURRENCE
+            ),
+        )
+
+    if len(partial_candidates) > 1 and parsed_request is not None:
+        decision = CancellationDecision(
+            "CLARIFY",
+            "I found multiple possible reminder matches. Which one should I cancel?\n"
+            + format_candidates(partial_candidates, timezone_name=user.timezone or "UTC"),
+            request=parsed_request,
+            candidate_ids=tuple(candidate.reminder_id for candidate in partial_candidates),
+            scope=parsed_request.scope,
+        )
+        partial_candidates = []
+
+    resolution = classify_cancellation_resolution(
+        decision, parsed_request, partial_candidates
+    )
+    if (
+        resolution is CancellationResolution.UNCERTAIN_EXTRACTION
+        and pending_for_decision is None
+    ):
+        proposal = request_override
+        interpreter_method = getattr(cancellation_interpreter, "interpret_cancellation", None)
+        if interpreter_method is not None:
+            occurrence_date = (
+                parsed_request.occurrence_date
+                if parsed_request is not None
+                else _request_occurrence_date(
+                    text, now=now, timezone_name=user.timezone or "UTC"
+                )
+            )
+            candidates = find_candidates(
+                db,
+                user_id=user_id,
+                target_text=None,
+                occurrence_date=occurrence_date,
+                timezone_name=user.timezone or "UTC",
+                include_empty_series=(
+                    occurrence_date is None
+                    and (
+                        parsed_request is None
+                        or parsed_request.scope is not CancellationScope.OCCURRENCE
+                    )
+                ),
+            )
+            if occurrence_date is not None:
+                seen_reminders = {candidate.reminder_id for candidate in candidates}
+                candidates.extend(
+                    candidate
+                    for candidate in find_unmaterialized_occurrence_candidates(
+                        db,
+                        user_id=user_id,
+                        target_text=None,
+                        occurrence_date=occurrence_date,
+                        timezone_name=user.timezone or "UTC",
+                        now=now,
+                    )
+                    if candidate.reminder_id not in seen_reminders
+                )
+            candidates = candidates[:12]
+            candidate_context = [
+                {
+                    "task": candidate.task,
+                    "schedule_type": candidate.schedule_type,
+                    "due_at": candidate.due_at.isoformat() if candidate.due_at else "",
+                }
+                for candidate in candidates
+            ]
+            kwargs = {
+                "timezone_name": user.timezone or "UTC",
+                "now": now,
+                "recent_messages": cancellation_context,
+                "cancellation_candidates": candidate_context,
+            }
+            try:
+                parameters = inspect.signature(interpreter_method).parameters
+                accepts_kwargs = any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters.values()
+                )
+                proposal = interpreter_method(
+                    text,
+                    **{
+                        key: value
+                        for key, value in kwargs.items()
+                        if key in parameters or accepts_kwargs
+                    },
+                )
+            except Exception as exc:  # model failures must leave cancellation unchanged
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "cancellation_target_fallback_failed",
+                    reason_type=type(exc).__name__,
+                )
+                proposal = None
+        if isinstance(proposal, CancellationRequest):
+            try:
+                proposal = ground_model_cancellation_request(
+                    text,
+                    proposal,
+                    timezone_name=user.timezone or "UTC",
+                    now=now,
+                    recent_messages=cancellation_context,
+                )
+            except ValueError as exc:
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "cancellation_target_fallback_rejected",
+                    reason_type=type(exc).__name__,
+                )
+                proposal = None
+        if isinstance(proposal, CancellationRequest):
+            decision = decide_cancellation(
+                db,
+                user_id=user_id,
+                text=text,
+                timezone_name=user.timezone or "UTC",
+                now=now,
+                request_override=proposal,
+            )
+        elif decision is None:
+            decision = CancellationDecision(
+                "RESPONSE", "Please tell me which reminder to cancel."
+            )
+        elif partial_candidates:
+            decision = CancellationDecision(
+                "RESPONSE",
+                "I found a possible reminder match. Please use more of the reminder's task.",
+            )
+    elif (
+        resolution is CancellationResolution.NO_MATCH
+        and decision is not None
+        and decision.kind == "RESPONSE"
+        and is_semantically_uncertain_cancellation_target(parsed_request)
+    ):
+        decision = CancellationDecision(
+            "RESPONSE",
+            "I couldn't confidently match that description. Please use more of the reminder's task.",
+        )
+    db.rollback()
+
+    try:
+        with db.begin():
+            existing = _existing_record(db, update)
+            if existing is not None:
+                return _reply_from_record(existing)
+            locked_user = db.get(User, user_id)
+            locked_identity = db.get(ChannelIdentity, identity_id)
+            if not _authorized_telegram_identity(
+                locked_user,
+                locked_identity,
+                telegram_user_id=telegram_user_id,
+                chat_id=update.message.chat.id,
+            ):
+                return _store_response(
+                    db,
+                    update=update,
+                    user_id=user_id,
+                    text="I couldn't verify your Telegram account.",
+                    response_kind="authorization_failure",
+                    operation="CANCEL_REMINDER",
+                )
+            assert locked_user is not None
+            session = load_session(
+                db,
+                user_id=user_id,
+                external_session_id=telegram_session_id(update.message.chat.id),
+                now=now,
+                ttl_seconds=session_ttl_seconds,
+                for_update=True,
+            )
+            locked_pending = pending_cancellation_from_session(session)
+            if pending_for_decision is not None and locked_pending is not None:
+                decision = decide_cancellation(
+                    db,
+                    user_id=user_id,
+                    text=text,
+                    timezone_name=locked_user.timezone or "UTC",
+                    now=now,
+                    pending=locked_pending,
+                )
+
+            if decision.kind == "CANCEL":
+                if session is not None:
+                    end_session(session, now=now)
+                return _store_response(
+                    db,
+                    update=update,
+                    user_id=user_id,
+                    text=decision.text,
+                    response_kind="cancellation_abandoned",
+                    operation="CANCEL_REMINDER",
+                )
+
+            if decision.kind == "RESPONSE":
+                if session is not None and (locked_pending is not None or parsed_request is not None):
+                    end_session(session, now=now)
+                return _store_response(
+                    db,
+                    update=update,
+                    user_id=user_id,
+                    text=decision.text,
+                    response_kind="cancellation_response",
+                    operation="CANCEL_REMINDER",
+                )
+
+            if decision.kind == "CLARIFY":
+                request = decision.request
+                if request is None:
+                    return _store_response(
+                        db,
+                        update=update,
+                        user_id=user_id,
+                        text=decision.text,
+                        response_kind="cancellation_clarification",
+                        operation="CANCEL_REMINDER",
+                    )
+                pending_record = PendingCancellation(
+                    target_text=request.target_text,
+                    candidate_ids=decision.candidate_ids,
+                    scope=request.scope,
+                    occurrence_date=request.occurrence_date,
+                    timezone_name=locked_user.timezone or "UTC",
+                )
+                _save_cancellation_session(
+                    db,
+                    user_id=user_id,
+                    external_session_id=telegram_session_id(update.message.chat.id),
+                    pending=pending_record,
+                    now=now,
+                )
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "cancellation_clarification_saved",
+                    update_id=update.update_id,
+                    candidate_count=len(decision.candidate_ids),
+                )
+                return _store_response(
+                    db,
+                    update=update,
+                    user_id=user_id,
+                    text=decision.text,
+                    response_kind="cancellation_clarification",
+                    operation="CANCEL_REMINDER",
+                )
+
+            if len(decision.candidate_ids) != 1 or decision.scope is None:
+                return _store_response(
+                    db,
+                    update=update,
+                    user_id=user_id,
+                    text="Please tell me which reminder to cancel.",
+                    response_kind="cancellation_clarification",
+                    operation="CANCEL_REMINDER",
+                )
+            reminder, occurrence_count = apply_cancellation(
+                db,
+                user_id=user_id,
+                reminder_id=decision.candidate_ids[0],
+                occurrence_id=decision.occurrence_id,
+                scope=decision.scope,
+                now=now,
+                occurrence_date=decision.request.occurrence_date if decision.request else None,
+            )
+            log_event(
+                logger,
+                logging.INFO,
+                "reminder_canceled",
+                update_id=update.update_id,
+                reminder_id=str(reminder.id),
+                scope=decision.scope.value,
+                occurrence_count=occurrence_count,
+            )
+            if session is not None:
+                end_session(session, now=now)
+            if decision.scope is CancellationScope.SERIES:
+                confirmation = (
+                    f"Canceled the recurring reminder '{reminder.task}' and its "
+                    f"{occurrence_count} pending future occurrence(s) via Telegram."
+                )
+            elif reminder.schedule_type == ONE_TIME:
+                confirmation = f"Canceled '{reminder.task}' via Telegram."
+            else:
+                confirmation = (
+                    f"Canceled the selected upcoming '{reminder.task}' occurrence. "
+                    "The recurring series remains active."
+                )
+            return _store_response(
+                db,
+                update=update,
+                user_id=user_id,
+                text=confirmation,
+                response_kind="cancellation_confirmation",
+                operation="CANCEL_REMINDER",
+            )
+    except IntegrityError:
+        duplicate = _recover_from_idempotency_race(db, update)
+        if duplicate is not None:
+            return duplicate
+        raise
+    except CancellationConflict as exc:
+        log_event(
+            logger,
+            logging.WARNING,
+            "reminder_cancellation_conflict",
+            update_id=update.update_id,
+            reason_type=type(exc).__name__,
+        )
+        db.rollback()
+        with db.begin():
+            session = load_session(
+                db,
+                user_id=user_id,
+                external_session_id=telegram_session_id(update.message.chat.id),
+                now=now,
+                ttl_seconds=session_ttl_seconds,
+                for_update=True,
+            )
+            if parsed_request is not None and session is not None:
+                end_session(session, now=now)
+            return _store_response(
+                db,
+                update=update,
+                user_id=user_id,
+                text=f"I couldn't cancel that reminder safely: {exc}.",
+                response_kind="cancellation_conflict",
+                operation="CANCEL_REMINDER",
+            )
 
 
 def _handle_reschedule_text(
@@ -973,6 +1440,8 @@ def _route_and_interpret(
             route = ConversationRoute.LIST_REQUEST
         elif suggestion is IntentRoute.RESCHEDULE_REQUEST:
             route = ConversationRoute.RESCHEDULE_REQUEST
+        elif suggestion is IntentRoute.CANCEL_REQUEST:
+            route = ConversationRoute.CANCEL_REQUEST
         elif suggestion is IntentRoute.NEW_REQUEST:
             route = ConversationRoute.NEW_REQUEST
         elif suggestion is IntentRoute.UPDATE_PENDING and pending is not None:
@@ -1015,6 +1484,11 @@ def _route_and_interpret(
             fallback_allowed=False,
         )
     elif route is ConversationRoute.RESCHEDULE_REQUEST:
+        interpretation = Interpretation(fallback_allowed=False)
+    elif route is ConversationRoute.CANCEL_REQUEST:
+        # Deterministic parsing and candidate matching run before an optional
+        # model proposal. The cancellation service invokes that fallback only
+        # after a zero-match result, with owned active candidates as context.
         interpretation = Interpretation(fallback_allowed=False)
     else:
         selected_route = _selected_intent_route(route, pending=pending)
@@ -1243,6 +1717,9 @@ def handle_reminder_text(
     )
     pending = None if session_is_expired else pending_from_session(session)
     pending_reschedule = None if session_is_expired else pending_reschedule_from_session(session)
+    pending_cancellation = (
+        None if session_is_expired else pending_cancellation_from_session(session)
+    )
     text = update.message.text or ""
     recent_messages = _recent_messages(db, user_id=user.id)
     log_event(
@@ -1257,6 +1734,7 @@ def handle_reminder_text(
             if pending is not None
             else 0
         ),
+        has_pending_cancellation=pending_cancellation is not None,
         recent_message_count=len(recent_messages),
     )
     observed_session_version = None if session_is_expired or session is None else session.version
@@ -1275,6 +1753,47 @@ def handle_reminder_text(
         # requests continue to use durable idempotency below.
         db.rollback()
         return ReminderReply(update.message.chat.id, OUT_OF_SCOPE_RESPONSE)
+    if pending_cancellation is not None and (
+        is_list_request_command(text)
+        or is_new_reminder_command(text)
+        or is_reschedule_command(text)
+    ):
+        db.rollback()
+        with db.begin():
+            locked_session = load_session(
+                db,
+                user_id=user.id,
+                external_session_id=telegram_session_id(update.message.chat.id),
+                now=now,
+                ttl_seconds=session_ttl_seconds,
+                for_update=True,
+            )
+            if pending_cancellation_from_session(locked_session) is not None:
+                end_session(locked_session, now=now)
+        session = None
+        pending_cancellation = None
+        log_event(
+            logger,
+            logging.INFO,
+            "cancellation_clarification_superseded",
+            update_id=update.update_id,
+        )
+    if is_cancel_command(text) or pending_cancellation is not None:
+        cancellation_reply = _handle_cancellation_text(
+            db,
+            update,
+            user_id=user.id,
+            identity_id=identity.id,
+            telegram_user_id=telegram_user_id,
+            user=user,
+            pending=pending_cancellation,
+            now=now,
+            session_ttl_seconds=session_ttl_seconds,
+            cancellation_interpreter=interpreter,
+            recent_messages=recent_messages,
+        )
+        if cancellation_reply is not None:
+            return cancellation_reply
     if pending_reschedule is not None and is_list_request_command(text):
         # A read-only schedule query is not an answer to the old reschedule
         # question. Leave that clarification available for a later reply and
@@ -1359,6 +1878,23 @@ def handle_reminder_text(
             )
             if reschedule_reply is not None:
                 return reschedule_reply
+        elif route is ConversationRoute.CANCEL_REQUEST:
+            cancellation_reply = _handle_cancellation_text(
+                db,
+                update,
+                user_id=user.id,
+                identity_id=identity.id,
+                telegram_user_id=telegram_user_id,
+                user=user,
+                pending=pending_cancellation,
+                now=now,
+                session_ttl_seconds=session_ttl_seconds,
+                cancellation_interpreter=interpreter,
+                recent_messages=recent_messages,
+                force=True,
+            )
+            if cancellation_reply is not None:
+                return cancellation_reply
     if interpretation is None:
         interpretation = Interpretation(
             response_text="That clarification expired. Please send the complete reminder again.",
