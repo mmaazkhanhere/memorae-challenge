@@ -159,6 +159,35 @@ def test_parse_reschedule_request_accepts_indirect_shift_wording() -> None:
     assert result.target_text == "bank reminder"
 
 
+def test_parse_recurring_occurrence_selector_is_not_part_of_task_target() -> None:
+    result = parse_reschedule_request(
+        "Move only tomorrow's exercise reminder to 10 AM", timezone_name="UTC", now=NOW
+    )
+
+    assert isinstance(result, RescheduleRequest)
+    assert result.target_text == "exercise reminder"
+    assert result.scope is RescheduleScope.OCCURRENCE
+    assert result.occurrence_date.isoformat() == "2026-10-31"
+    assert result.date_explicit is False
+
+
+@pytest.mark.parametrize(
+    ("text", "target", "scope", "occurrence_date"),
+    [
+        ("Move Friday's exercise occurrence to 7 PM", "exercise", RescheduleScope.OCCURRENCE, "2026-11-06"),
+        ("Move all future exercise reminders to 10 AM", "all future exercise reminders", RescheduleScope.SERIES, None),
+        ("Move the next occurrence exercise reminder to 11 AM", "exercise reminder", RescheduleScope.OCCURRENCE, None),
+    ],
+)
+def test_parse_recurring_scope_and_occurrence_selection(text, target, scope, occurrence_date) -> None:
+    result = parse_reschedule_request(text, timezone_name="UTC", now=NOW)
+
+    assert isinstance(result, RescheduleRequest)
+    assert result.target_text == target
+    assert result.scope is scope
+    assert (result.occurrence_date.isoformat() if result.occurrence_date else None) == occurrence_date
+
+
 def test_parse_reschedule_request_requires_am_pm_for_ambiguous_clock() -> None:
     result = parse_reschedule_request(
         "Move the bank reminder to 10",

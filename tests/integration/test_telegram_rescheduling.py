@@ -678,6 +678,58 @@ def test_recurring_reschedule_can_update_only_the_upcoming_reminder(
     ] == original_future_occurrences
 
 
+def test_recurring_reschedule_can_select_tomorrows_named_occurrence(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory)
+    assert post_update(
+        api_client,
+        update_factory(9280, text="Remind me every Saturday at 9 AM to exercise"),
+    ).status_code == 200
+    reminder = db.scalar(select(Reminder))
+    assert reminder is not None
+    original_rule = reminder.recurrence_rule
+    occurrences_before = db.scalars(
+        select(ReminderOccurrence)
+        .where(ReminderOccurrence.reminder_id == reminder.id)
+        .order_by(ReminderOccurrence.scheduled_at)
+    ).all()
+    assert occurrences_before
+    selected = occurrences_before[0]
+    original_other = [
+        (item.id, item.scheduled_at, item.next_due_at, item.recurrence_instance_key)
+        for item in occurrences_before[1:]
+    ]
+
+    response = post_update(
+        api_client,
+        update_factory(9281, text="Move only tomorrow's exercise reminder to 10 AM"),
+    )
+
+    assert response.status_code == 200
+    assert "Moved 'exercise'" in telegram_client.messages[-1][1]
+    db.expire_all()
+    reminder = db.get(Reminder, reminder.id)
+    occurrences_after = db.scalars(
+        select(ReminderOccurrence)
+        .where(ReminderOccurrence.reminder_id == selected.reminder_id)
+        .order_by(ReminderOccurrence.scheduled_at)
+    ).all()
+    assert reminder is not None and reminder.recurrence_rule == original_rule
+    updated = db.get(ReminderOccurrence, selected.id)
+    assert updated is not None
+    assert updated.next_due_at.replace(tzinfo=timezone.utc) == datetime(2026, 10, 31, 10, 0, tzinfo=timezone.utc)
+    assert [
+        (item.id, item.scheduled_at, item.next_due_at, item.recurrence_instance_key)
+        for item in occurrences_after
+        if item.id != selected.id
+    ] == original_other
+    notifications = db.scalars(
+        select(Notification).where(Notification.occurrence_id == selected.id).order_by(Notification.sequence)
+    ).all()
+    assert [item.status for item in notifications] == ["CANCELED", "PENDING"]
+
+
 @pytest.mark.parametrize(
     ("replacement", "expected_response"),
     [

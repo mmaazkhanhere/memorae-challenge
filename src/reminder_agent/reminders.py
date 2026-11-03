@@ -674,6 +674,7 @@ def _handle_reschedule_text(
                         offset_minutes=effective_pending.offset_minutes,
                         scope=effective_pending.scope,
                         source_text=effective_pending.source_text,
+                        occurrence_date=effective_pending.occurrence_date,
                     )
                 if request is None:
                     return _store_response(
@@ -693,6 +694,7 @@ def _handle_reschedule_text(
                     timezone_name=locked_user.timezone or "UTC",
                     candidate_ids=decision.candidate_ids,
                     scope=request.scope,
+                    occurrence_date=request.occurrence_date,
                 )
                 _save_reschedule_session(
                     db,
@@ -735,6 +737,7 @@ def _handle_reschedule_text(
                 user_id=user_id,
                 destination_identity_id=identity_id,
                 reminder_id=decision.candidate_ids[0],
+                occurrence_id=decision.occurrence_id,
                 due_at=_required_due_at(decision.request),
                 scope=decision.request.scope,
                 now=now,

@@ -66,6 +66,7 @@ class PendingReschedule(BaseModel):
     timezone_name: str = Field(min_length=1, max_length=150)
     candidate_ids: tuple[UUID, ...] = ()
     scope: RescheduleScope | None = None
+    occurrence_date: date | None = None
 
     @field_validator("target_text")
     @classmethod
@@ -161,6 +162,7 @@ class RescheduleRequest:
     offset_minutes: int | None = None
     scope: RescheduleScope | None = None
     source_text: str | None = None
+    occurrence_date: date | None = None
 
 
 @dataclass(frozen=True)
@@ -180,6 +182,7 @@ class RescheduleDecision:
     text: str
     request: RescheduleRequest | None = None
     candidate_ids: tuple[UUID, ...] = ()
+    occurrence_id: UUID | None = None
 
 
 _COMMAND = re.compile(
@@ -214,6 +217,11 @@ _DAY_INDEX = {
     "saturday": 5,
     "sunday": 6,
 }
+_OCCURRENCE_SELECTOR = re.compile(
+    r"\b(?:(?P<only>only)\s+)?(?P<day>today|tomorrow|monday|tuesday|wednesday|"
+    r"thursday|friday|saturday|sunday)'s\s+",
+    re.IGNORECASE,
+)
 
 
 def is_reschedule_command(text: str) -> bool:
@@ -233,6 +241,7 @@ def _scope_from_text(text: str) -> RescheduleScope | None:
         return RescheduleScope.SERIES
     if re.search(
         r"\b(?:whole\s+)?series\b|\ball\s+(?:future\s+)?(?:reminders?|occurrences?)\b|"
+        r"\ball\s+future\b.*\b(?:reminders?|occurrences?)\b|"
         r"\bupdate\s+all\b|\bevery\b",
         normalized,
     ):
@@ -262,6 +271,31 @@ def _parse_date(raw: str | None, *, now: datetime, zone: ZoneInfo) -> date:
     return date.fromisoformat(value)
 
 
+def _extract_target_and_occurrence(
+    target: str, *, timezone_name: str, now: datetime
+) -> tuple[str, RescheduleScope | None, date | None]:
+    """Remove an explicit occurrence selector before matching the task."""
+
+    scope = _scope_from_text(target)
+    occurrence_date = None
+    selector = _OCCURRENCE_SELECTOR.search(target)
+    if selector is not None:
+        occurrence_date = _parse_date(
+            selector.group("day"), now=now, zone=ZoneInfo(timezone_name)
+        )
+        # A possessive day selector identifies one concrete recurrence
+        # instance; "only" reinforces rather than creates that scope.
+        scope = RescheduleScope.OCCURRENCE
+        target = target[:selector.start()] + target[selector.end():]
+    target = re.sub(
+        r"\b(?:all\s+future\s+reminders?|all\s+reminders?|this\s+occurrence|this\s+reminder|"
+        r"the\s+whole\s+series|the\s+series|whole\s+series|series|next\s+occurrence|"
+        r"upcoming\s+reminder|only\s+this\s+one|only\s+the\s+next|coming\s+one|occurrence)\b",
+        " ", target, flags=re.I,
+    )
+    return " ".join(target.split()).strip(" .,!?"), scope, occurrence_date
+
+
 def parse_reschedule_request(text: str, *, timezone_name: str, now: datetime) -> RescheduleRequest | str:
     """Parse the deliberately small, unambiguous VS-09 command language."""
 
@@ -273,16 +307,9 @@ def parse_reschedule_request(text: str, *, timezone_name: str, now: datetime) ->
     target = re.sub(r"^(?:my\s+)?(?:a\s+)?reminders?\s+to\s+", "", target, flags=re.I)
     if not target:
         return "Please tell me which reminder to move."
-    scope = _scope_from_text(target)
-    target = re.sub(
-        r"\b(?:all\s+future\s+reminders?|all\s+reminders?|this\s+occurrence|this\s+reminder|"
-        r"the\s+whole\s+series|the\s+series|whole\s+series|series|next\s+occurrence|"
-        r"upcoming\s+reminder|only\s+this\s+one|only\s+the\s+next|coming\s+one|occurrence)\b",
-        " ",
-        target,
-        flags=re.I,
+    target, scope, occurrence_date = _extract_target_and_occurrence(
+        target, timezone_name=timezone_name, now=now
     )
-    target = " ".join(target.split()).strip(" .,!?")
     if not target:
         return "Please tell me which reminder to move."
 
@@ -296,15 +323,9 @@ def parse_reschedule_request(text: str, *, timezone_name: str, now: datetime) ->
                 target = " ".join(match.group("target").split())
                 target = re.sub(r"^my\s+", "", target, flags=re.I)
                 target = re.sub(r"^(?:my\s+)?(?:a\s+)?reminders?\s+to\s+", "", target, flags=re.I)
-                target = re.sub(
-                    r"\b(?:all\s+future\s+reminders?|all\s+reminders?|this\s+occurrence|this\s+reminder|"
-                    r"the\s+whole\s+series|the\s+series|whole\s+series|series|next\s+occurrence|"
-                    r"upcoming\s+reminder|only\s+this\s+one|only\s+the\s+next|coming\s+one|occurrence)\b",
-                    " ",
-                    target,
-                    flags=re.I,
+                target, scope, occurrence_date = _extract_target_and_occurrence(
+                    target, timezone_name=timezone_name, now=now
                 )
-                target = " ".join(target.split()).strip(" .,!?")
                 when = fallback_when
     if when is None:
         return "Please give the new time as a future date and time, for example tomorrow at 10 AM."
@@ -336,6 +357,7 @@ def parse_reschedule_request(text: str, *, timezone_name: str, now: datetime) ->
         due_at=due_at,
         date_explicit=when.group("day") is not None,
         scope=scope,
+        occurrence_date=occurrence_date,
     )
 
 
@@ -405,7 +427,10 @@ def _candidate_match(target: str, task: str) -> bool:
     return wanted <= actual
 
 
-def find_candidates(db: Session, *, user_id: UUID, target_text: str) -> list[RescheduleCandidate]:
+def find_candidates(
+    db: Session, *, user_id: UUID, target_text: str,
+    occurrence_date: date | None = None, timezone_name: str = "UTC",
+) -> list[RescheduleCandidate]:
     rows = db.execute(
         select(Reminder, ReminderOccurrence)
         .join(ReminderOccurrence, ReminderOccurrence.reminder_id == Reminder.id)
@@ -416,6 +441,7 @@ def find_candidates(db: Session, *, user_id: UUID, target_text: str) -> list[Res
         )
         .order_by(ReminderOccurrence.next_due_at, Reminder.id, ReminderOccurrence.id)
     ).all()
+    zone = ZoneInfo(timezone_name)
     candidates = [
         RescheduleCandidate(
             reminder_id=reminder.id,
@@ -426,6 +452,10 @@ def find_candidates(db: Session, *, user_id: UUID, target_text: str) -> list[Res
         )
         for reminder, occurrence in rows
         if _candidate_match(target_text, reminder.task)
+        and (
+            occurrence_date is None
+            or occurrence.next_due_at.astimezone(zone).date() == occurrence_date
+        )
     ]
     # A recurring series may have many materialized occurrences; candidate
     # selection is by reminder, with its next pending occurrence as the anchor.
@@ -519,6 +549,7 @@ def decide_reschedule(
                     offset_minutes=pending.offset_minutes,
                     scope=scope,
                     source_text=pending.source_text,
+                    occurrence_date=pending.occurrence_date,
                 ),
                 candidate_ids=pending.candidate_ids,
             )
@@ -540,6 +571,7 @@ def decide_reschedule(
                         due_at=pending.due_at,
                         date_explicit=pending.date_explicit,
                         scope=scope,
+                        occurrence_date=pending.occurrence_date,
                     ),
                     candidate_ids,
                 )
@@ -560,11 +592,13 @@ def decide_reschedule(
                     date_explicit=pending.date_explicit,
                     offset_minutes=pending.offset_minutes,
                     scope=scope,
+                    occurrence_date=pending.occurrence_date,
                 ),
                 candidate,
                 timezone_name=timezone_name,
             ),
             candidate_ids,
+            candidate.occurrence_id,
         )
 
     parsed = request_override or parse_reschedule_request(
@@ -572,7 +606,10 @@ def decide_reschedule(
     )
     if isinstance(parsed, str):
         return RescheduleDecision("RESPONSE", parsed)
-    candidates = find_candidates(db, user_id=user_id, target_text=parsed.target_text)
+    candidates = find_candidates(
+        db, user_id=user_id, target_text=parsed.target_text,
+        occurrence_date=parsed.occurrence_date, timezone_name=timezone_name,
+    )
     if not candidates:
         return RescheduleDecision("RESPONSE", "I couldn't find an active reminder matching that description.")
     if len(candidates) > 1:
@@ -596,6 +633,7 @@ def decide_reschedule(
         "",
         _resolve_candidate_due(parsed, candidate, timezone_name=timezone_name),
         (candidate.reminder_id,),
+        candidate.occurrence_id,
     )
 
 
@@ -624,6 +662,7 @@ def _resolve_candidate_due(
             date_explicit=False,
             scope=request.scope,
             source_text=request.source_text,
+            occurrence_date=request.occurrence_date,
         )
     if request.offset_minutes is None:
         raise ValueError("reschedule request is missing a time target")
@@ -636,6 +675,7 @@ def _resolve_candidate_due(
         date_explicit=request.date_explicit,
         scope=request.scope,
         source_text=request.source_text,
+        occurrence_date=request.occurrence_date,
     )
 
 
@@ -680,7 +720,13 @@ def pending_candidates(
     allowed = set(pending.candidate_ids)
     return [
         candidate
-        for candidate in find_all_candidates(db, user_id=user_id)
+        for candidate in find_candidates(
+            db,
+            user_id=user_id,
+            target_text=pending.target_text,
+            occurrence_date=pending.occurrence_date,
+            timezone_name=pending.timezone_name,
+        )
         if candidate.reminder_id in allowed
     ]
 
@@ -697,7 +743,12 @@ def select_pending_candidate_ids(
     """Resolve ordinal or clock-based natural candidate references safely."""
     # Keep matching deliberately narrow for deterministic text selection;
     # IDs are still constrained to the durable pending candidate list below.
-    candidates = find_candidates(db, user_id=user_id, target_text=pending.target_text)
+    candidate_kwargs = {"user_id": user_id, "target_text": pending.target_text}
+    if pending.occurrence_date is not None:
+        candidate_kwargs.update(
+            occurrence_date=pending.occurrence_date, timezone_name=timezone_name
+        )
+    candidates = find_candidates(db, **candidate_kwargs)
     candidate_ids = list(pending.candidate_ids)
     normalized = text.strip().lower().rstrip(".!?")
     clock = re.fullmatch(
@@ -817,6 +868,7 @@ def apply_reschedule(
     due_at: datetime,
     scope: RescheduleScope | None,
     now: datetime,
+    occurrence_id: UUID | None = None,
 ) -> tuple[Reminder, datetime]:
     """Atomically update one owned reminder and its pending notification(s)."""
 
@@ -896,19 +948,17 @@ def apply_reschedule(
         reminder.updated_at = now
         return reminder, due_at
 
-    occurrence = db.scalar(
-        select(ReminderOccurrence)
-        .where(
-            ReminderOccurrence.id.in_(
-                select(ReminderOccurrence.id).where(
-                    ReminderOccurrence.reminder_id == reminder.id,
-                    ReminderOccurrence.status == PENDING,
-                )
-            )
-        )
-        .order_by(ReminderOccurrence.next_due_at, ReminderOccurrence.id)
-        .with_for_update()
+    occurrence_query = select(ReminderOccurrence).where(
+        ReminderOccurrence.reminder_id == reminder.id,
+        ReminderOccurrence.status == PENDING,
     )
+    if occurrence_id is not None:
+        occurrence_query = occurrence_query.where(ReminderOccurrence.id == occurrence_id)
+    else:
+        occurrence_query = occurrence_query.order_by(
+            ReminderOccurrence.next_due_at, ReminderOccurrence.id
+        )
+    occurrence = db.scalar(occurrence_query.with_for_update())
     if occurrence is None:
         raise RescheduleConflict("Reminder has no pending occurrence")
     sending_exists = db.scalar(
