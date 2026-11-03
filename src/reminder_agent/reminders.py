@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
@@ -29,11 +30,14 @@ from reminder_agent.conversations import (
     end_session,
     load_session,
     pending_from_session,
+    pending_reschedule_from_session,
     session_expired,
     telegram_session_id,
 )
 from reminder_agent.conversation_router import (
     ConversationRoute,
+    is_new_reminder_command,
+    is_list_request_command,
     route_message,
     social_response,
     unrelated_response,
@@ -65,6 +69,25 @@ from reminder_agent.request_policy import (
     assess_request,
     is_supported_operation,
 )
+from reminder_agent.rescheduling import (
+    PendingReschedule,
+    PendingRescheduleOperation,
+    PendingRescheduleProposal,
+    RescheduleDecision,
+    RescheduleRequest,
+    RescheduleConflict,
+    RescheduleScope,
+    apply_reschedule,
+    apply_pending_reschedule_proposal,
+    decide_reschedule,
+    find_all_candidates,
+    pending_candidates,
+    select_pending_candidate_ids,
+    is_reschedule_command,
+    has_unsupported_series_cadence_change,
+    parse_reschedule_request,
+    parse_pending_reschedule_parameters,
+)
 from reminder_agent.telegram import TelegramUpdate
 
 TELEGRAM = "TELEGRAM"
@@ -74,6 +97,13 @@ ONE_TIME = "ONE_TIME"
 RECURRING = "RECURRING"
 PENDING = "PENDING"
 logger = get_logger()
+
+
+def _required_due_at(request: RescheduleRequest) -> datetime:
+    """Return the application-resolved due time immediately before mutation."""
+    if request.due_at is None:
+        raise ValueError("reschedule time could not be resolved")
+    return request.due_at
 
 
 def _recurrence_for_intent(intent: CreateRecurringReminderIntent):
@@ -209,6 +239,7 @@ def _store_response(
     user_id: UUID,
     text: str,
     response_kind: str = "clarification",
+    operation: str = "CREATE_REMINDER",
 ) -> ReminderReply:
     assert update.message is not None
     reply = ReminderReply(
@@ -222,7 +253,7 @@ def _store_response(
             source=TELEGRAM,
             idempotency_key=str(update.update_id),
             user_id=user_id,
-            operation="CREATE_REMINDER",
+            operation=operation,
             request_hash=_request_hash(update),
             status="SUCCEEDED",
             delivery_status="PENDING",
@@ -246,6 +277,563 @@ def _store_response(
         response_kind=response_kind,
     )
     return reply
+
+
+def _save_reschedule_session(
+    db: Session,
+    *,
+    user_id: UUID,
+    external_session_id: str,
+    pending: PendingReschedule,
+    now: datetime,
+) -> ConversationSession:
+    session = db.scalar(
+        select(ConversationSession)
+        .where(
+            ConversationSession.user_id == user_id,
+            ConversationSession.channel_type == TELEGRAM,
+            ConversationSession.external_session_id == external_session_id,
+        )
+        .with_for_update()
+    )
+    if session is None:
+        session = ConversationSession(
+            user_id=user_id,
+            channel_type=TELEGRAM,
+            external_session_id=external_session_id,
+            pending_clarification=pending.model_dump(mode="json"),
+            status=AWAITING_CLARIFICATION,
+            version=1,
+            updated_at=_now_utc(now),
+        )
+        db.add(session)
+    else:
+        session.pending_clarification = pending.model_dump(mode="json")
+        session.status = AWAITING_CLARIFICATION
+        session.active_reminder_id = None
+        session.version += 1
+        session.updated_at = _now_utc(now)
+    return session
+
+
+def _handle_reschedule_text(
+    db: Session,
+    update: TelegramUpdate,
+    *,
+    user_id: UUID,
+    identity_id: UUID,
+    telegram_user_id: int,
+    user: User,
+    pending: PendingReschedule | None,
+    now: datetime,
+    session_ttl_seconds: int,
+    force: bool = False,
+    reschedule_interpreter: ReminderIntentInterpreter | None = None,
+    recent_messages: list[str] | None = None,
+    pending_session_version: int | None = None,
+) -> ReminderReply | None:
+    """Handle VS-09 before the creation interpreter is invoked."""
+
+    assert update.message is not None
+    text = update.message.text or ""
+    if not force and not is_reschedule_command(text) and pending is None:
+        return None
+
+    unsupported_cadence_change = (
+        pending is None and has_unsupported_series_cadence_change(text)
+    )
+
+    parsed_request = None
+    if pending is None:
+        parsed_request = parse_reschedule_request(
+            text,
+            timezone_name=user.timezone or "UTC",
+            now=now,
+        )
+        log_event(
+            logger,
+            logging.INFO,
+            "reschedule_deterministic_parse",
+            update_id=update.update_id,
+            parsed=isinstance(parsed_request, RescheduleRequest),
+            result_type=type(parsed_request).__name__,
+            result_length=len(parsed_request) if isinstance(parsed_request, str) else None,
+            due_at=(
+                parsed_request.due_at.isoformat()
+                if isinstance(parsed_request, RescheduleRequest) and parsed_request.due_at is not None
+                else None
+            ),
+            offset_minutes=(
+                parsed_request.offset_minutes
+                if isinstance(parsed_request, RescheduleRequest)
+                else None
+            ),
+            scope=(
+                parsed_request.scope.value
+                if isinstance(parsed_request, RescheduleRequest)
+                and parsed_request.scope is not None
+                else None
+            ),
+        )
+    deterministic_pending_proposal = (
+        parse_pending_reschedule_parameters(
+            text, timezone_name=user.timezone or "UTC", now=now
+        )
+        if pending is not None
+        else None
+    )
+    pending_for_decision = (
+        apply_pending_reschedule_proposal(
+            pending,
+            deterministic_pending_proposal,
+            timezone_name=user.timezone or "UTC",
+        )
+        if pending is not None and deterministic_pending_proposal is not None
+        else pending
+    )
+    decision = decide_reschedule(
+        db,
+        user_id=user.id,
+        text=text,
+        timezone_name=user.timezone or "UTC",
+        now=now,
+        pending=pending_for_decision,
+        request_override=(
+            parsed_request if isinstance(parsed_request, RescheduleRequest) else None
+        ),
+    )
+    if unsupported_cadence_change:
+        decision = RescheduleDecision(
+            "RESPONSE", "Changing monthly or yearly recurrence dates is not supported yet."
+        )
+    pending_proposal: PendingRescheduleProposal | None = deterministic_pending_proposal
+    # Pending replies are deterministic first.  Only an unresolved reply is
+    # sent to the contextual extractor, and the result remains a proposal.
+    if (
+        pending is not None
+        and decision.kind == "CLARIFY"
+        and deterministic_pending_proposal is None
+        and not (
+            decision.request is not None
+            and decision.request.scope is not pending.scope
+        )
+        and reschedule_interpreter is not None
+        and hasattr(reschedule_interpreter, "interpret_pending_reschedule")
+    ):
+        db.rollback()
+        candidate_context = [
+            {
+                "candidate_id": str(candidate.reminder_id),
+                "task": candidate.task,
+                "due_local": candidate.due_at.astimezone(
+                    ZoneInfo(user.timezone or "UTC")
+                ).isoformat(timespec="minutes"),
+                "schedule_type": candidate.schedule_type,
+            }
+            for candidate in pending_candidates(db, user_id=user.id, pending=pending)
+        ]
+        proposal_kwargs = {
+            "timezone_name": user.timezone or "UTC",
+            "now": now,
+            "pending_reschedule": pending.model_dump(mode="json"),
+            "reschedule_candidates": candidate_context,
+            "recent_messages": (recent_messages or [])[-6:],
+        }
+        try:
+            method = reschedule_interpreter.interpret_pending_reschedule
+            parameters = inspect.signature(method).parameters
+            proposal = method(
+                text,
+                **{key: value for key, value in proposal_kwargs.items() if key in parameters},
+            )
+            if isinstance(proposal, PendingRescheduleProposal):
+                pending_proposal = proposal
+        except Exception as exc:  # provider errors always fall back to clarification
+            log_event(
+                logger,
+                logging.WARNING,
+                "reschedule_pending_llm_proposal_rejected",
+                update_id=update.update_id,
+                reason_type=type(exc).__name__,
+            )
+        log_event(
+            logger,
+            logging.INFO,
+            "reschedule_pending_llm_proposal",
+            update_id=update.update_id,
+            accepted=pending_proposal is not None,
+        )
+    if (
+        isinstance(parsed_request, str)
+        and not unsupported_cadence_change
+        and reschedule_interpreter is not None
+    ):
+        db.rollback()
+        candidate_context = [
+            {
+                "candidate_id": str(candidate.reminder_id),
+                "task": candidate.task,
+                "due_local": candidate.due_at.astimezone(
+                    ZoneInfo(user.timezone or "UTC")
+                ).isoformat(timespec="minutes"),
+                "schedule_type": candidate.schedule_type,
+            }
+            for candidate in find_all_candidates(db, user_id=user.id)
+        ]
+        proposal_kwargs = {
+            "timezone_name": user.timezone or "UTC",
+            "now": now,
+        }
+        if "reschedule_candidates" in inspect.signature(
+            reschedule_interpreter.interpret_reschedule
+        ).parameters:
+            proposal_kwargs["reschedule_candidates"] = candidate_context
+        proposal = reschedule_interpreter.interpret_reschedule(text, **proposal_kwargs)
+        log_event(
+            logger,
+            logging.INFO,
+            "reschedule_llm_proposal",
+            update_id=update.update_id,
+            result_type=type(proposal).__name__,
+            accepted=isinstance(proposal, RescheduleRequest),
+            response_length=len(proposal) if isinstance(proposal, str) else None,
+            due_at=(
+                proposal.due_at.isoformat()
+                if isinstance(proposal, RescheduleRequest) and proposal.due_at is not None
+                else None
+            ),
+            offset_minutes=(
+                proposal.offset_minutes if isinstance(proposal, RescheduleRequest) else None
+            ),
+            scope=(
+                proposal.scope.value
+                if isinstance(proposal, RescheduleRequest) and proposal.scope is not None
+                else None
+            ),
+        )
+        if isinstance(proposal, RescheduleRequest):
+            decision = decide_reschedule(
+                db,
+                user_id=user.id,
+                text=text,
+                timezone_name=user.timezone or "UTC",
+                now=now,
+                pending=pending,
+                request_override=proposal,
+            )
+        elif isinstance(proposal, str) and proposal.strip():
+            decision = RescheduleDecision("RESPONSE", proposal.strip())
+    db.rollback()
+    try:
+        with db.begin():
+            existing = _existing_record(db, update)
+            if existing is not None:
+                return _reply_from_record(existing)
+            locked_user = db.get(User, user_id)
+            locked_identity = db.get(ChannelIdentity, identity_id)
+            if not _authorized_telegram_identity(
+                locked_user,
+                locked_identity,
+                telegram_user_id=telegram_user_id,
+                chat_id=update.message.chat.id,
+            ):
+                return _store_response(
+                    db,
+                    update=update,
+                    user_id=user_id,
+                    text="I couldn't verify your Telegram account.",
+                    response_kind="authorization_failure",
+                    operation="RESCHEDULE_REMINDER",
+                )
+            assert locked_user is not None and locked_identity is not None
+            locked_session = load_session(
+                db,
+                user_id=user_id,
+                external_session_id=telegram_session_id(update.message.chat.id),
+                now=now,
+                ttl_seconds=session_ttl_seconds,
+                for_update=True,
+            )
+            locked_pending = pending_reschedule_from_session(locked_session)
+            if locked_pending is not None:
+                candidate_id_override = None
+                effective_pending = locked_pending
+                proposal_is_current = (
+                    pending_proposal is not None
+                    and pending is not None
+                    and locked_session is not None
+                    and pending_session_version is not None
+                    and locked_session.version == pending_session_version
+                )
+                if proposal_is_current and pending_proposal is not None:
+                    if (
+                        pending_proposal.candidate_id is not None
+                        and pending_proposal.candidate_id not in locked_pending.candidate_ids
+                    ):
+                        decision = RescheduleDecision(
+                            "CLARIFY",
+                            "Which reminder should I move?",
+                            candidate_ids=locked_pending.candidate_ids,
+                        )
+                    elif pending_proposal.operation is PendingRescheduleOperation.CANCEL_PENDING:
+                        decision = RescheduleDecision(
+                            "CANCEL", "Okay, I won't move that reminder."
+                        )
+                    elif pending_proposal.operation in {
+                        PendingRescheduleOperation.UPDATE_PENDING_PARAMETERS,
+                        PendingRescheduleOperation.SELECT_AND_UPDATE,
+                    }:
+                        effective_pending = apply_pending_reschedule_proposal(
+                            locked_pending,
+                            pending_proposal,
+                            timezone_name=locked_user.timezone or "UTC",
+                        )
+                        candidate_id_override = pending_proposal.candidate_id
+                        decision = decide_reschedule(
+                            db,
+                            user_id=user_id,
+                            text=text,
+                            timezone_name=locked_user.timezone or "UTC",
+                            now=now,
+                            pending=effective_pending,
+                            candidate_id_override=candidate_id_override,
+                        )
+                    elif pending_proposal.operation is PendingRescheduleOperation.SELECT_CANDIDATE:
+                        candidate_id_override = pending_proposal.candidate_id
+                        decision = decide_reschedule(
+                            db,
+                            user_id=user_id,
+                            text=text,
+                            timezone_name=locked_user.timezone or "UTC",
+                            now=now,
+                            pending=effective_pending,
+                            candidate_id_override=candidate_id_override,
+                        )
+                    else:
+                        # START_NEW_OPERATION and NEEDS_CLARIFICATION cannot
+                        # clear or replace a trusted pending reschedule.
+                        decision = decide_reschedule(
+                            db,
+                            user_id=user_id,
+                            text=text,
+                            timezone_name=locked_user.timezone or "UTC",
+                            now=now,
+                            pending=effective_pending,
+                        )
+                else:
+                    decision = decide_reschedule(
+                        db,
+                        user_id=user_id,
+                        text=text,
+                        timezone_name=locked_user.timezone or "UTC",
+                        now=now,
+                        pending=effective_pending,
+                    )
+                ordinal_match = re.search(
+                    r"\b(?:the\s+)?(first|one|second|two|third|three|1|2|3)\b",
+                    text.strip().lower().rstrip(".!?"),
+                )
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "reschedule_pending_clarification_resolved",
+                    update_id=update.update_id,
+                    candidate_count=len(locked_pending.candidate_ids),
+                    ordinal=ordinal_match.group(1) if ordinal_match is not None else None,
+                    selected_candidate_count=len(decision.candidate_ids),
+                    decision=decision.kind,
+                    pending_due_at=(
+                        effective_pending.due_at.isoformat()
+                        if effective_pending.due_at is not None
+                        else None
+                    ),
+                    pending_offset_minutes=effective_pending.offset_minutes,
+                    pending_scope=(
+                        effective_pending.scope.value
+                        if effective_pending.scope is not None
+                        else None
+                    ),
+                )
+
+            if decision.kind == "CANCEL":
+                if locked_session is not None:
+                    end_session(locked_session, now=now)
+                return _store_response(
+                    db,
+                    update=update,
+                    user_id=user_id,
+                    text=decision.text,
+                    response_kind="reschedule_canceled",
+                    operation="RESCHEDULE_REMINDER",
+                )
+
+            if decision.kind == "RESPONSE":
+                return _store_response(
+                    db,
+                    update=update,
+                    user_id=user_id,
+                    text=decision.text,
+                    response_kind="reschedule_rejected",
+                    operation="RESCHEDULE_REMINDER",
+                )
+
+            if decision.kind == "CLARIFY":
+                request = decision.request
+                if request is None and effective_pending is not None:
+                    request = RescheduleRequest(
+                        target_text=effective_pending.target_text,
+                        due_at=effective_pending.due_at,
+                        date_explicit=effective_pending.date_explicit,
+                        offset_minutes=effective_pending.offset_minutes,
+                        scope=effective_pending.scope,
+                        source_text=effective_pending.source_text,
+                        occurrence_date=effective_pending.occurrence_date,
+                        destination_weekday=effective_pending.destination_weekday,
+                    )
+                if request is None:
+                    return _store_response(
+                        db,
+                        update=update,
+                        user_id=user_id,
+                        text=decision.text,
+                        response_kind="reschedule_clarification",
+                        operation="RESCHEDULE_REMINDER",
+                    )
+                pending_record = PendingReschedule(
+                    target_text=request.target_text,
+                    due_at=request.due_at,
+                    date_explicit=request.date_explicit,
+                    offset_minutes=request.offset_minutes,
+                    source_text=request.source_text,
+                    timezone_name=locked_user.timezone or "UTC",
+                    candidate_ids=decision.candidate_ids,
+                    scope=request.scope,
+                    occurrence_date=request.occurrence_date,
+                    destination_weekday=request.destination_weekday,
+                )
+                _save_reschedule_session(
+                    db,
+                    user_id=user_id,
+                    external_session_id=telegram_session_id(update.message.chat.id),
+                    pending=pending_record,
+                    now=now,
+                )
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "reschedule_clarification_saved",
+                    update_id=update.update_id,
+                    candidate_count=len(decision.candidate_ids),
+                    due_at=request.due_at.isoformat() if request.due_at is not None else None,
+                    offset_minutes=request.offset_minutes,
+                    scope=request.scope.value if request.scope is not None else None,
+                )
+                return _store_response(
+                    db,
+                    update=update,
+                    user_id=user_id,
+                    text=decision.text,
+                    response_kind="reschedule_clarification",
+                    operation="RESCHEDULE_REMINDER",
+                )
+
+            assert decision.kind == "MUTATE" and decision.request is not None
+            if len(decision.candidate_ids) != 1:
+                return _store_response(
+                    db,
+                    update=update,
+                    user_id=user_id,
+                    text="Please tell me which reminder to move.",
+                    response_kind="reschedule_clarification",
+                    operation="RESCHEDULE_REMINDER",
+                )
+            reminder, due_at = apply_reschedule(
+                db,
+                user_id=user_id,
+                destination_identity_id=identity_id,
+                reminder_id=decision.candidate_ids[0],
+                occurrence_id=decision.occurrence_id,
+                due_at=_required_due_at(decision.request),
+                scope=decision.request.scope,
+                now=now,
+                destination_weekday=decision.request.destination_weekday,
+            )
+            log_event(
+                logger,
+                logging.INFO,
+                "reschedule_mutation_applied",
+                update_id=update.update_id,
+                due_at=due_at.isoformat(),
+                scope=decision.request.scope.value if decision.request.scope is not None else None,
+            )
+            if locked_session is not None:
+                end_session(locked_session, now=now)
+            if decision.request.scope is RescheduleScope.SERIES:
+                local_time = due_at.astimezone(ZoneInfo(locked_user.timezone or "UTC"))
+                cadence = (
+                    f"every {local_time:%A} at "
+                    if decision.request.destination_weekday is not None
+                    else ""
+                )
+                confirmation = (
+                    f"Updated all future '{reminder.task}' reminders to {cadence}"
+                    f"{local_time:%H:%M %Z} via Telegram."
+                )
+            else:
+                local_display = _local_display(due_at, locked_user.timezone or "UTC")
+                confirmation = f"Moved '{reminder.task}' to {local_display} via Telegram."
+            return _store_response(
+                db,
+                update=update,
+                user_id=user_id,
+                text=confirmation,
+                response_kind="reschedule_confirmation",
+                operation="RESCHEDULE_REMINDER",
+            )
+    except IntegrityError:
+        duplicate = _recover_from_idempotency_race(db, update)
+        if duplicate is not None:
+            return duplicate
+        raise
+    except (RescheduleConflict, ValueError) as exc:
+        log_event(
+            logger,
+            logging.WARNING,
+            "reschedule_rejected",
+            update_id=update.update_id,
+            reason_type=type(exc).__name__,
+            reason=str(exc),
+        )
+        db.rollback()
+        with db.begin():
+            failed_session = load_session(
+                db,
+                user_id=user_id,
+                external_session_id=telegram_session_id(update.message.chat.id),
+                now=now,
+                ttl_seconds=session_ttl_seconds,
+                for_update=True,
+            )
+            if (
+                failed_session is not None
+                and pending_reschedule_from_session(failed_session) is not None
+            ):
+                end_session(failed_session, now=now)
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "reschedule_clarification_cleared_after_rejection",
+                    update_id=update.update_id,
+                    reason_type=type(exc).__name__,
+                )
+            return _store_response(
+                db,
+                update=update,
+                user_id=user_id,
+                text=f"I couldn't move that reminder safely: {exc}.",
+                response_kind="reschedule_conflict",
+                operation="RESCHEDULE_REMINDER",
+            )
 
 
 def _recover_from_idempotency_race(
@@ -383,6 +971,8 @@ def _route_and_interpret(
         )
         if suggestion is IntentRoute.LIST_REQUEST:
             route = ConversationRoute.LIST_REQUEST
+        elif suggestion is IntentRoute.RESCHEDULE_REQUEST:
+            route = ConversationRoute.RESCHEDULE_REQUEST
         elif suggestion is IntentRoute.NEW_REQUEST:
             route = ConversationRoute.NEW_REQUEST
         elif suggestion is IntentRoute.UPDATE_PENDING and pending is not None:
@@ -424,6 +1014,8 @@ def _route_and_interpret(
             response_text=unrelated_response(text, pending=pending),
             fallback_allowed=False,
         )
+    elif route is ConversationRoute.RESCHEDULE_REQUEST:
+        interpretation = Interpretation(fallback_allowed=False)
     else:
         selected_route = _selected_intent_route(route, pending=pending)
         interpretation = _interpret(
@@ -650,6 +1242,7 @@ def handle_reminder_text(
         session, now=now, ttl_seconds=session_ttl_seconds
     )
     pending = None if session_is_expired else pending_from_session(session)
+    pending_reschedule = None if session_is_expired else pending_reschedule_from_session(session)
     text = update.message.text or ""
     recent_messages = _recent_messages(db, user_id=user.id)
     log_event(
@@ -682,7 +1275,60 @@ def handle_reminder_text(
         # requests continue to use durable idempotency below.
         db.rollback()
         return ReminderReply(update.message.chat.id, OUT_OF_SCOPE_RESPONSE)
-    elif session_is_expired:
+    if pending_reschedule is not None and is_list_request_command(text):
+        # A read-only schedule query is not an answer to the old reschedule
+        # question. Leave that clarification available for a later reply and
+        # let the normal listing flow handle this message.
+        pending_reschedule = None
+    elif pending_reschedule is not None and (
+        is_new_reminder_command(text) or is_reschedule_command(text)
+    ):
+        # An explicit reminder or reschedule command starts a separate request.
+        # It must not be treated as an ordinal/scope answer to an older
+        # clarification, or that clarification will hijack the new request.
+        db.rollback()
+        with db.begin():
+            locked_session = load_session(
+                db,
+                user_id=user.id,
+                external_session_id=telegram_session_id(update.message.chat.id),
+                now=now,
+                ttl_seconds=session_ttl_seconds,
+                for_update=True,
+            )
+            if pending_reschedule_from_session(locked_session) is not None:
+                end_session(locked_session, now=now)
+        session = None
+        pending_reschedule = None
+        observed_session_version = None
+        log_event(
+            logger,
+            logging.INFO,
+            "reschedule_clarification_superseded",
+            update_id=update.update_id,
+                replacement_route=(
+                    "RESCHEDULE_REQUEST"
+                    if is_reschedule_command(text)
+                    else "NEW_REQUEST"
+                ),
+        )
+    reschedule_reply = _handle_reschedule_text(
+        db,
+        update,
+        user_id=user.id,
+        identity_id=identity.id,
+        telegram_user_id=telegram_user_id,
+        user=user,
+        pending=pending_reschedule,
+        now=now,
+        session_ttl_seconds=session_ttl_seconds,
+        reschedule_interpreter=interpreter,
+        recent_messages=recent_messages,
+        pending_session_version=observed_session_version,
+    )
+    if reschedule_reply is not None:
+        return reschedule_reply
+    if session_is_expired:
         interpretation = None
     else:
         route, interpretation = _route_and_interpret(
@@ -695,6 +1341,24 @@ def handle_reminder_text(
             intent_router=intent_router,
             recent_messages=recent_messages,
         )
+        if route is ConversationRoute.RESCHEDULE_REQUEST:
+            reschedule_reply = _handle_reschedule_text(
+                db,
+                update,
+                user_id=user.id,
+                identity_id=identity.id,
+                telegram_user_id=telegram_user_id,
+                user=user,
+                pending=pending_reschedule,
+                now=now,
+                session_ttl_seconds=session_ttl_seconds,
+                force=True,
+                reschedule_interpreter=interpreter,
+                recent_messages=recent_messages,
+                pending_session_version=observed_session_version,
+            )
+            if reschedule_reply is not None:
+                return reschedule_reply
     if interpretation is None:
         interpretation = Interpretation(
             response_text="That clarification expired. Please send the complete reminder again.",
@@ -845,6 +1509,7 @@ def handle_reminder_text(
                     user_id=user.id,
                     start_date=list_intent.start_date,
                     end_date=list_intent.end_date,
+                    task_query=list_intent.task_query,
                     timezone_name=user.timezone,
                     now=now,
                 )
@@ -855,6 +1520,7 @@ def handle_reminder_text(
                         start_date=list_intent.start_date,
                         end_date=list_intent.end_date,
                         timezone_name=user.timezone,
+                        task_query=list_intent.task_query,
                     ),
                 )
 

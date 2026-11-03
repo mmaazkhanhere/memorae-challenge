@@ -58,12 +58,14 @@ _OUT_OF_SCOPE_PATTERNS = (
         re.IGNORECASE,
     ),
     # Reminder operations delivered by later vertical slices must not be
-    # misread by a model as a new reminder.
+    # misread by a model as a new reminder. Rescheduling is now an in-scope
+    # VS-09 operation; the remaining operations stay rejected until their
+    # slices are implemented.
     re.compile(
-        r"\b(?:cancel|delete|remove|snooze|complete|finish|done|move|reschedule)\b.*\b"
+        r"\b(?:cancel|delete|remove|snooze|complete|finish|done)\b.*\b"
         r"(?:reminder|reminders|standup|meeting|task)\b|"
         r"\b(?:reminder|reminders)\b.*\b(?:cancel|delete|remove|snooze|complete|finish|"
-        r"done|move|reschedule)\b",
+        r"done)\b",
         re.IGNORECASE,
     ),
     re.compile(r"\bremember\b", re.IGNORECASE),
@@ -96,8 +98,12 @@ def assess_request(text: str, *, has_pending: bool = False) -> RequestAssessment
 def is_supported_operation(operation: object) -> bool:
     """Return whether an application service may execute a parsed operation."""
 
-    return operation in {
+    # This boundary receives data from model output. Require a plain, canonical
+    # string rather than allowing enum subclasses, containers, or other values
+    # with surprising equality/hash behavior.
+    return type(operation) is str and operation in {
         "CREATE_ONE_TIME_REMINDER",
         "CREATE_RECURRING_REMINDER",
         "LIST_REMINDERS",
+        "RESCHEDULE_REMINDER",
     }

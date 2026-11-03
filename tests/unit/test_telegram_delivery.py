@@ -6,7 +6,11 @@ import httpx
 import pytest
 
 from reminder_agent.telegram import HttpTelegramClient, TelegramAPIError, _connect_failure_kind
-from reminder_agent.api.telegram import _send_reply_with_retry, _split_telegram_text
+from reminder_agent.api.telegram import (
+    _send_reply_with_retry,
+    _split_telegram_text,
+    _telegram_error_is_retryable,
+)
 from reminder_agent.reminders import ReminderReply
 
 
@@ -89,3 +93,160 @@ def test_long_reply_is_delivered_as_ordered_chunks():
     assert "".join(message[1] for message in client.messages).replace(" ", "").strip() == (
         reply.text.replace(" ", "").strip()
     )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {"ok": True},
+        {"ok": True, "result": []},
+        {"ok": True, "result": {}},
+    ],
+)
+def test_malformed_telegram_success_response_is_rejected(monkeypatch, payload) -> None:
+    response = SimpleNamespace(status_code=200, is_success=True, json=lambda: payload)
+    monkeypatch.setattr("reminder_agent.telegram.httpx.post", lambda *args, **kwargs: response)
+
+    with pytest.raises(TelegramAPIError) as raised:
+        HttpTelegramClient("secret-token").send_message(2001, "Reminder")
+
+    assert raised.value.status_code == 200
+    assert raised.value.failure_kind == "invalid_response"
+
+
+def test_telegram_ok_false_http_success_is_treated_as_provider_rejection(monkeypatch) -> None:
+    response = SimpleNamespace(
+        status_code=200,
+        is_success=True,
+        json=lambda: {"ok": False, "description": "chat is unavailable"},
+    )
+    monkeypatch.setattr("reminder_agent.telegram.httpx.post", lambda *args, **kwargs: response)
+
+    with pytest.raises(TelegramAPIError) as raised:
+        HttpTelegramClient("secret-token").send_message(2001, "Reminder")
+
+    assert raised.value.status_code == 200
+    assert raised.value.failure_kind == "api_error"
+    assert raised.value.telegram_description == "chat is unavailable"
+
+
+@pytest.mark.parametrize(
+    ("exception", "failure_kind"),
+    [
+        (httpx.ConnectTimeout("connect timeout"), "connect_timeout"),
+        (httpx.ReadTimeout("read timeout"), "read_timeout"),
+        (httpx.WriteTimeout("write timeout"), "write_timeout"),
+        (httpx.ConnectError("connection refused"), "connect_error"),
+    ],
+)
+def test_transport_failures_are_classified(monkeypatch, exception, failure_kind) -> None:
+    def raise_transport_error(*args, **kwargs):
+        raise exception
+
+    monkeypatch.setattr("reminder_agent.telegram.httpx.post", raise_transport_error)
+
+    with pytest.raises(TelegramAPIError) as raised:
+        HttpTelegramClient("secret-token").send_message(2001, "Reminder")
+
+    assert raised.value.failure_kind == failure_kind
+    assert raised.value.status_code is None
+
+
+@pytest.mark.parametrize(
+    ("status_code", "payload", "failure_kind", "retryable"),
+    [
+        (403, {"ok": False, "description": "bot was blocked"}, "http_error", False),
+        (429, {"ok": False, "description": "slow down"}, "rate_limited", True),
+        (500, {"ok": False, "description": "upstream error"}, "http_error", False),
+    ],
+)
+def test_http_failure_classification_distinguishes_retryable_rate_limits(
+    monkeypatch, status_code, payload, failure_kind, retryable
+) -> None:
+    response = httpx.Response(
+        status_code,
+        request=httpx.Request("POST", "https://api.telegram.org/botsecret-token/sendMessage"),
+        json=payload,
+    )
+    monkeypatch.setattr("reminder_agent.telegram.httpx.post", lambda *args, **kwargs: response)
+
+    with pytest.raises(TelegramAPIError) as raised:
+        HttpTelegramClient("secret-token").send_message(2001, "Reminder")
+
+    assert raised.value.failure_kind == failure_kind
+    assert _telegram_error_is_retryable(raised.value) is retryable
+
+
+@pytest.mark.parametrize(
+    "exception",
+    [
+        httpx.ConnectTimeout("https://api.telegram.org/botsecret-token/sendMessage"),
+        httpx.ReadTimeout("Bearer secret-token"),
+        httpx.WriteTimeout("request body includes secret-token"),
+        httpx.ConnectError("POST /botsecret-token/sendMessage failed"),
+        httpx.RequestError("telegram rejected secret-token"),
+    ],
+)
+def test_transport_exception_causes_redact_tokens_in_all_supported_formats(
+    monkeypatch, exception
+) -> None:
+    def raise_transport_error(*args, **kwargs):
+        raise exception
+
+    monkeypatch.setattr("reminder_agent.telegram.httpx.post", raise_transport_error)
+
+    with pytest.raises(TelegramAPIError) as raised:
+        HttpTelegramClient("secret-token").send_message(2001, "Reminder")
+
+    assert "secret-token" not in (raised.value.cause or "")
+    assert "secret-token" not in str(raised.value)
+
+
+def test_provider_descriptions_and_invalid_json_causes_redact_tokens(monkeypatch) -> None:
+    rejected = SimpleNamespace(
+        status_code=200,
+        is_success=True,
+        json=lambda: {"ok": False, "description": "invalid botsecret-token credential"},
+    )
+    monkeypatch.setattr("reminder_agent.telegram.httpx.post", lambda *args, **kwargs: rejected)
+
+    with pytest.raises(TelegramAPIError) as provider_error:
+        HttpTelegramClient("secret-token").send_message(2001, "Reminder")
+    assert "secret-token" not in (provider_error.value.telegram_description or "")
+
+    def malformed_json():
+        raise ValueError("response contains secret-token")
+
+    malformed = SimpleNamespace(status_code=200, is_success=True, json=malformed_json)
+    monkeypatch.setattr("reminder_agent.telegram.httpx.post", lambda *args, **kwargs: malformed)
+    with pytest.raises(TelegramAPIError) as invalid_response:
+        HttpTelegramClient("secret-token").send_message(2001, "Reminder")
+    assert "secret-token" not in (invalid_response.value.cause or "")
+
+
+def test_long_reply_stops_after_a_permanent_chunk_failure():
+    class FailsOnSecondChunk:
+        def __init__(self):
+            self.attempted_chunks: list[str] = []
+
+        def send_message(self, chat_id, text, **kwargs):
+            self.attempted_chunks.append(text)
+            if len(self.attempted_chunks) == 2:
+                raise TelegramAPIError("forbidden", status_code=403, failure_kind="http_error")
+
+    reply = ReminderReply(chat_id=42, text="word " * 2_000)
+    expected_chunks = _split_telegram_text(reply.text)
+    client = FailsOnSecondChunk()
+
+    with pytest.raises(TelegramAPIError, match="forbidden"):
+        _send_reply_with_retry(
+            client,
+            reply,
+            update_id=124,
+            max_attempts=3,
+            retry_delay_seconds=0,
+        )
+
+    assert len(expected_chunks) > 2
+    assert client.attempted_chunks == expected_chunks[:2]

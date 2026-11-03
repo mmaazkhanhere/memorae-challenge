@@ -1,9 +1,17 @@
+from enum import StrEnum
+
+import pytest
+
 from reminder_agent.request_policy import (
     OUT_OF_SCOPE_RESPONSE,
     RequestDisposition,
     assess_request,
     is_supported_operation,
 )
+
+
+class OperationAlias(StrEnum):
+    CREATE_ONE_TIME_REMINDER = "CREATE_ONE_TIME_REMINDER"
 
 
 def test_potentially_supported_incomplete_request_is_not_rejected() -> None:
@@ -30,9 +38,59 @@ def test_prompt_injection_is_rejected_as_untrusted_input() -> None:
     assert OUT_OF_SCOPE_RESPONSE.startswith("I can only help")
 
 
-def test_only_currently_implemented_operation_is_supported() -> None:
-    assert is_supported_operation("CREATE_ONE_TIME_REMINDER") is True
-    assert is_supported_operation("CANCEL_REMINDER") is False
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "CREATE_ONE_TIME_REMINDER",
+        "CREATE_RECURRING_REMINDER",
+        "LIST_REMINDERS",
+        "RESCHEDULE_REMINDER",
+    ],
+)
+def test_every_supported_operation_is_explicitly_allowed(operation: str) -> None:
+    assert is_supported_operation(operation) is True
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "CANCEL_REMINDER",
+        "COMPLETE_REMINDER",
+        "SNOOZE_REMINDER",
+        "SAVE_MEMORY",
+        "RETRIEVE_MEMORY",
+    ],
+)
+def test_every_currently_deferred_operation_is_rejected(operation: str) -> None:
+    assert is_supported_operation(operation) is False
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "create_one_time_reminder",
+        "Create_One_Time_Reminder",
+        " CREATE_ONE_TIME_REMINDER ",
+        b"CREATE_ONE_TIME_REMINDER",
+        OperationAlias.CREATE_ONE_TIME_REMINDER,
+        None,
+        1,
+        True,
+        ["CREATE_ONE_TIME_REMINDER"],
+        {"operation": "CREATE_ONE_TIME_REMINDER"},
+    ],
+)
+def test_operation_case_and_type_variations_are_rejected(operation: object) -> None:
+    assert is_supported_operation(operation) is False
+
+
+@pytest.mark.parametrize("text", ["", "   ", "\t\n  "])
+def test_empty_or_whitespace_only_request_needs_clarification(text: str) -> None:
+    assessment = assess_request(text)
+
+    assert assessment.disposition is RequestDisposition.NEEDS_CLARIFICATION
+    assert assessment.reason == "empty_request"
+    assert assessment.is_rejected is False
 
 
 def test_listing_is_in_scope_and_read_only_operation_is_supported() -> None:

@@ -20,6 +20,7 @@ from reminder_agent.recurrence import (
 ACTIVE = "ACTIVE"
 PENDING = "PENDING"
 RECURRING = "RECURRING"
+_TASK_STOP_WORDS = {"my", "the", "a", "an", "reminder", "reminders"}
 
 
 @dataclass(frozen=True)
@@ -43,12 +44,31 @@ def _local_bounds(start_date: date, end_date: date, zone: ZoneInfo) -> tuple[dat
     return start, end
 
 
+def _task_tokens(value: str) -> set[str]:
+    tokens: set[str] = set()
+    for raw_token in value.lower().replace("’", "'").split():
+        token = "".join(character for character in raw_token if character.isalnum())
+        if token.endswith("s") and len(token) > 3:
+            token = token[:-1]
+        if token and token not in _TASK_STOP_WORDS:
+            tokens.add(token)
+    return tokens
+
+
+def _matches_task_query(task: str, task_query: str) -> bool:
+    """Require every meaningful query term to occur in the stored task."""
+
+    query_tokens = _task_tokens(task_query)
+    return bool(query_tokens) and query_tokens <= _task_tokens(task)
+
+
 def list_reminders_in_range(
     db: Session,
     *,
     user_id: UUID,
     start_date: date | None,
     end_date: date | None,
+    task_query: str | None = None,
     timezone_name: str,
     now: datetime | None = None,
 ) -> list[ListedReminder]:
@@ -79,6 +99,10 @@ def list_reminders_in_range(
         .where(Reminder.user_id == user_id, Reminder.status == ACTIVE)
         .order_by(Reminder.id)
     ).all()
+    if task_query is not None:
+        reminders = [
+            reminder for reminder in reminders if _matches_task_query(reminder.task, task_query)
+        ]
     if not reminders:
         return []
 
@@ -134,24 +158,26 @@ def list_reminders_in_range(
 
 
 def format_reminder_list(
-    reminders: list[ListedReminder], *, start_date: date | None, end_date: date | None, timezone_name: str
+    reminders: list[ListedReminder], *, start_date: date | None, end_date: date | None,
+    timezone_name: str, task_query: str | None = None,
 ) -> str:
     """Format a compact, user-facing local-time listing."""
 
+    subject = f' matching "{task_query}"' if task_query is not None else ""
     if start_date is None:
         if not reminders:
-            return "You have no upcoming active reminders."
-        heading = f"All upcoming active reminders ({timezone_name}):"
+            return f"You have no upcoming active reminders{subject}."
+        heading = f"All upcoming active reminders{subject} ({timezone_name}):"
     elif start_date == end_date:
         period = start_date.isoformat()
         if not reminders:
-            return f"You have no active reminders on {period}."
-        heading = f"Reminders for {period} ({timezone_name}):"
+            return f"You have no active reminders{subject} on {period}."
+        heading = f"Reminders{subject} for {period} ({timezone_name}):"
     else:
         period = f"{start_date.isoformat()} to {end_date.isoformat()}"
         if not reminders:
-            return f"You have no active reminders from {period}."
-        heading = f"Reminders from {period} ({timezone_name}):"
+            return f"You have no active reminders{subject} from {period}."
+        heading = f"Reminders{subject} from {period} ({timezone_name}):"
 
     zone = ZoneInfo(timezone_name)
     lines = [heading]

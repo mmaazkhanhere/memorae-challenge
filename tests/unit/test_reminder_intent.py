@@ -22,6 +22,7 @@ from reminder_agent.intent import (
     resolve_pending_due_at,
 )
 from reminder_agent.reminders import _route_and_interpret
+from reminder_agent.rescheduling import RescheduleRequest, RescheduleScope
 from reminder_agent.settings import Settings
 from reminder_agent.request_policy import OUT_OF_SCOPE_RESPONSE
 
@@ -157,6 +158,7 @@ def test_intent_router_classifies_only_the_operation_and_limits_history(monkeypa
 
     assert suggestion.operation is IntentRoute.NEW_REQUEST
     assert "LIST_REQUEST" in captured["messages"][0]["content"]
+    assert "RESCHEDULE_REQUEST" in captured["messages"][0]["content"]
     context = json.loads(captured["messages"][1]["content"])
     assert context["active_pending"]["task"] == "call Bilal"
     assert context["missing_fields"] == ["date"]
@@ -186,6 +188,26 @@ def test_intent_router_accepts_list_request_route(monkeypatch) -> None:
     assert suggestion.operation is IntentRoute.LIST_REQUEST
 
 
+def test_intent_router_accepts_reschedule_request_route(monkeypatch) -> None:
+    def fake_post(*args, **kwargs):
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={"choices": [{"message": {"content": '{"operation":"RESCHEDULE_REQUEST"}'}}]},
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    suggestion = OpenAICompatibleIntentRouter(
+        "https://api.groq.example/openai/v1", "secret", "openai/gpt-oss-20b"
+    ).classify(
+        "Could you shift the bank reminder to tomorrow at 10 AM?",
+        pending=None,
+        recent_messages=(),
+    )
+
+    assert suggestion.operation is IntentRoute.RESCHEDULE_REQUEST
+
+
 def test_list_request_route_from_classifier_reaches_interpreter() -> None:
     class ListRouter:
         def classify(self, *args, **kwargs):
@@ -213,6 +235,35 @@ def test_list_request_route_from_classifier_reaches_interpreter() -> None:
     assert route is ConversationRoute.LIST_REQUEST
     assert interpreter.called is True
     assert result.response_text == "listing"
+
+
+def test_classifier_reschedule_route_bypasses_reminder_extractor() -> None:
+    class RescheduleRouter:
+        def classify(self, *args, **kwargs):
+            return IntentRouteSuggestion(operation=IntentRoute.RESCHEDULE_REQUEST)
+
+    class RecordingInterpreter:
+        def __init__(self) -> None:
+            self.called = False
+
+        def interpret(self, *args, **kwargs):
+            self.called = True
+            return Interpretation(response_text="should not be called")
+
+    interpreter = RecordingInterpreter()
+    route, result = _route_and_interpret(
+        interpreter,
+        "Could you shift the bank reminder to tomorrow at 10 AM?",
+        timezone_name="UTC",
+        now=NOW,
+        pending=None,
+        user_name="Ada",
+        intent_router=RescheduleRouter(),
+    )
+
+    assert route is ConversationRoute.RESCHEDULE_REQUEST
+    assert interpreter.called is False
+    assert result.fallback_allowed is False
 
 
 @pytest.mark.parametrize(
@@ -303,6 +354,35 @@ def test_missing_task_is_clarified_without_an_intent() -> None:
 
     assert result.intent is None
     assert result.response_text == "What should I remind you about?"
+
+
+def test_missing_task_preserves_a_complete_tomorrow_schedule() -> None:
+    interpreter = RuleBasedIntentInterpreter()
+
+    initial = interpreter.interpret(
+        "Remind me tomorrow at 8 AM.",
+        timezone_name="Asia/Karachi",
+        now=NOW,
+    )
+
+    assert initial.clarification is not None
+    assert initial.clarification.pending.task is None
+    assert initial.clarification.pending.date_local == date(2026, 10, 31)
+    assert initial.clarification.pending.hour == 8
+    assert initial.clarification.pending.minute == 0
+    assert initial.clarification.pending.meridiem == "am"
+    assert initial.clarification.pending.date_explicit is True
+
+    completed = interpreter.interpret(
+        "Submit my assignment.",
+        timezone_name="Asia/Karachi",
+        now=NOW,
+        context=initial.clarification.pending,
+    )
+
+    assert completed.intent is not None
+    assert completed.intent.task == "Submit my assignment"
+    assert completed.intent.due_at == datetime(2026, 10, 31, 3, 0, tzinfo=timezone.utc)
 
 
 def test_task_only_request_uses_model_fallback_for_clarification() -> None:
@@ -1200,13 +1280,57 @@ def test_openai_compatible_interpreter_accepts_structured_response(monkeypatch) 
     assert result.intent.due_at == datetime(2026, 10, 31, 4, 0, tzinfo=timezone.utc)
 
 
+def test_openai_compatible_interpreter_accepts_structured_reschedule_response(
+    monkeypatch,
+) -> None:
+    def fake_post(*args, **kwargs):
+        prompt = kwargs["json"]["messages"][0]["content"]
+        assert "RESCHEDULE_REMINDER" in prompt
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"operation":"RESCHEDULE_REMINDER",'
+                                '"target_text":"bank reminder",'
+                                '"due_local":"2026-10-31T10:00:00",'
+                                '"scope":"OCCURRENCE"}'
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    result = OpenAICompatibleIntentInterpreter(
+        "https://llm.example/v1", "secret", "provider-model"
+    ).interpret(
+        "I need you to shift the bank reminder to tomorrow at 10 AM",
+        selected_route=IntentRoute.RESCHEDULE_REQUEST,
+        timezone_name="UTC",
+        now=NOW,
+    )
+
+    assert isinstance(result.reschedule_request, RescheduleRequest)
+    assert result.reschedule_request.target_text == "bank reminder"
+    assert result.reschedule_request.due_at == datetime(
+        2026, 10, 31, 10, 0, tzinfo=timezone.utc
+    )
+    assert result.reschedule_request.scope is RescheduleScope.OCCURRENCE
+
+
 def test_openai_compatible_interpreter_returns_only_provider_field_updates_for_context(
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(
-        httpx,
-        "post",
-        lambda *args, **kwargs: httpx.Response(
+    captured_prompt = {}
+
+    def fake_post(*args, **kwargs):
+        captured_prompt["value"] = kwargs["json"]["messages"][0]["content"]
+        return httpx.Response(
             200,
             request=httpx.Request("POST", args[0]),
             json={
@@ -1221,7 +1345,12 @@ def test_openai_compatible_interpreter_returns_only_provider_field_updates_for_c
                     }
                 ]
             },
-        ),
+        )
+
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        fake_post,
     )
     context = PendingReminder(
         task="call the bank",
@@ -1237,6 +1366,9 @@ def test_openai_compatible_interpreter_returns_only_provider_field_updates_for_c
     assert result.intent is None
     assert result.clarification is None
     assert result.field_updates == PendingReminderFieldUpdate(meridiem="pm")
+    assert "field values are primitive values directly" in captured_prompt["value"]
+    assert "Do not wrap any updates field in a value/certainty/evidence object" in captured_prompt["value"]
+    assert '"evidence":{"task":"pay rent"' in captured_prompt["value"]
 
     # The service-side state manager, not the provider, combines this patch
     # with the pending task/date/time and only then validates completion.

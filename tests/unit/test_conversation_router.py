@@ -1,6 +1,11 @@
 from datetime import date
 
-from reminder_agent.conversation_router import ConversationRoute, route_message, social_response
+from reminder_agent.conversation_router import (
+    ConversationRoute,
+    is_list_request_command,
+    route_message,
+    social_response,
+)
 from reminder_agent.intent import PendingReminder
 
 
@@ -27,9 +32,9 @@ def test_router_classifies_pending_conversation_before_parsing() -> None:
 
 
 def test_router_recognizes_read_only_listing_with_or_without_pending_draft() -> None:
-    assert route_message("What do I have tomorrow?", pending=None).route is (
-        ConversationRoute.LIST_REQUEST
-    )
+    for text in ("What do I have tomorrow?", "What reminders do I have tomorrow?"):
+        assert route_message(text, pending=None).route is ConversationRoute.LIST_REQUEST
+        assert route_message(text, pending=_pending()).route is ConversationRoute.LIST_REQUEST
 
 
 def test_router_recognizes_recurring_reminder_list_requests() -> None:
@@ -38,6 +43,13 @@ def test_router_recognizes_recurring_reminder_list_requests() -> None:
     assert route_message("Show my reminders this week", pending=_pending()).route is (
         ConversationRoute.LIST_REQUEST
     )
+
+
+def test_router_recognizes_schedule_list_wording() -> None:
+    for text in ("What's on my schedule tomorrow?", "Anything coming up this week?"):
+        assert is_list_request_command(text) is True
+        assert route_message(text, pending=None).route is ConversationRoute.LIST_REQUEST
+        assert route_message(text, pending=_pending()).route is ConversationRoute.LIST_REQUEST
 
 
 def test_router_does_not_start_a_reminder_from_unrelated_text() -> None:

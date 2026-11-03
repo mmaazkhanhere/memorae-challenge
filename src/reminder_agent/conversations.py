@@ -73,7 +73,21 @@ def load_session(
 def pending_from_session(session: ConversationSession | None) -> PendingReminder | None:
     if session is None or session.pending_clarification is None:
         return None
+    if session.pending_clarification.get("operation") != "CREATE_ONE_TIME_REMINDER":
+        return None
     return PendingReminder.model_validate(session.pending_clarification)
+
+
+def pending_reschedule_from_session(session: ConversationSession | None):
+    """Load VS-09 context without treating it as a reminder-creation draft."""
+
+    if session is None or session.pending_clarification is None:
+        return None
+    if session.pending_clarification.get("operation") != "RESCHEDULE_REMINDER":
+        return None
+    from reminder_agent.rescheduling import PendingReschedule
+
+    return PendingReschedule.model_validate(session.pending_clarification)
 
 
 def end_session(session: ConversationSession, *, now: datetime) -> None:
