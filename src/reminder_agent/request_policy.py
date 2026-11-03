@@ -58,13 +58,12 @@ _OUT_OF_SCOPE_PATTERNS = (
         re.IGNORECASE,
     ),
     # Reminder operations delivered by later vertical slices must not be
-    # misread by a model as a new reminder. Rescheduling is now an in-scope
-    # VS-09 operation; the remaining operations stay rejected until their
-    # slices are implemented.
+    # misread by a model as a new reminder. Rescheduling and cancellation are
+    # in scope; completion and snoozing remain deferred until their slices.
     re.compile(
-        r"\b(?:cancel|delete|remove|snooze|complete|finish|done)\b.*\b"
+        r"\b(?:snooze|complete|finish|done)\b.*\b"
         r"(?:reminder|reminders|standup|meeting|task)\b|"
-        r"\b(?:reminder|reminders)\b.*\b(?:cancel|delete|remove|snooze|complete|finish|"
+        r"\b(?:reminder|reminders)\b.*\b(?:snooze|complete|finish|"
         r"done)\b",
         re.IGNORECASE,
     ),
@@ -106,4 +105,5 @@ def is_supported_operation(operation: object) -> bool:
         "CREATE_RECURRING_REMINDER",
         "LIST_REMINDERS",
         "RESCHEDULE_REMINDER",
+        "CANCEL_REMINDER",
     }

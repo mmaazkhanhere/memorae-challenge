@@ -21,6 +21,31 @@ from reminder_agent.request_policy import OUT_OF_SCOPE_RESPONSE
 logger = get_logger()
 
 
+_STRICT_CANCELLATION_MODELS = {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}
+_CANCELLATION_JSON_SCHEMA = {
+    "name": "cancellation_request",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "operation": {"type": "string", "enum": ["CANCEL_REMINDER"]},
+            "target_text": {"type": "string", "minLength": 1},
+            "scope": {
+                "anyOf": [
+                    {"type": "string", "enum": ["OCCURRENCE", "SERIES"]},
+                    {"type": "null"},
+                ]
+            },
+            "occurrence_date": {
+                "anyOf": [{"type": "string"}, {"type": "null"}]
+            },
+        },
+        "required": ["operation", "target_text", "scope", "occurrence_date"],
+        "additionalProperties": False,
+    },
+}
+
+
 _LIST_TASK_PATTERNS = (
     re.compile(
         r"^\s*(?:when|what)\s+(?:are|is)\s+(?:my\s+)?(?P<task>.+?)(?:\s+(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday))?\s*[?!.]*\s*$",
@@ -62,6 +87,7 @@ class IntentRoute(StrEnum):
     NEW_REQUEST = "NEW_REQUEST"
     LIST_REQUEST = "LIST_REQUEST"
     RESCHEDULE_REQUEST = "RESCHEDULE_REQUEST"
+    CANCEL_REQUEST = "CANCEL_REQUEST"
     UPDATE_PENDING = "UPDATE_PENDING"
     CANCEL_PENDING = "CANCEL_PENDING"
     SOCIAL = "SOCIAL"
@@ -119,6 +145,7 @@ class OpenAICompatibleIntentRouter:
             - NEW_REQUEST: Separate reminder, even if one is pending.
             - LIST_REQUEST: Retrieve reminders.
             - RESCHEDULE_REQUEST: Move an existing reminder to a new time.
+            - CANCEL_REQUEST: Cancel an existing reminder or recurring series.
             - UPDATE_PENDING: Clarify or modify the pending reminder.
             - CANCEL_PENDING: Cancel the pending reminder.
             - SOCIAL: Casual chat.
@@ -490,6 +517,7 @@ class Interpretation:
     clarification: NeedsClarification | None = None
     field_updates: PendingReminderFieldUpdate | None = None
     reschedule_request: Any | None = None
+    cancellation_request: Any | None = None
     pending_reschedule_proposal: Any | None = None
     response_text: str | None = None
     fallback_allowed: bool = True
@@ -536,6 +564,7 @@ class IntentInterpreter(Protocol):
         context: PendingReminder | None = None,
         recent_messages: Sequence[str] = (),
         reschedule_candidates: Sequence[dict[str, str]] = (),
+        cancellation_candidates: Sequence[dict[str, str]] = (),
         pending_reschedule: Any | None = None,
     ) -> Interpretation: ...
 
@@ -2077,6 +2106,17 @@ class OpenAICompatibleIntentInterpreter:
         self._model = model
         self._timeout = timeout_seconds
 
+    def _response_format(self, route: IntentRoute) -> dict[str, Any]:
+        """Use constrained cancellation output only where the provider supports it."""
+
+        host = (urlsplit(self._url).hostname or "").lower()
+        supports_strict_schema = host == "api.openai.com" or (
+            host == "api.groq.com" and self._model in _STRICT_CANCELLATION_MODELS
+        )
+        if route is IntentRoute.CANCEL_REQUEST and supports_strict_schema:
+            return {"type": "json_schema", "json_schema": _CANCELLATION_JSON_SCHEMA}
+        return {"type": "json_object"}
+
     def interpret(
         self,
         text: str,
@@ -2087,6 +2127,7 @@ class OpenAICompatibleIntentInterpreter:
         context: PendingReminder | None = None,
         recent_messages: Sequence[str] = (),
         reschedule_candidates: Sequence[dict[str, str]] = (),
+        cancellation_candidates: Sequence[dict[str, str]] = (),
         pending_reschedule: Any | None = None,
     ) -> Interpretation:
         route = selected_route or (
@@ -2117,31 +2158,67 @@ class OpenAICompatibleIntentInterpreter:
             has_pending_context=context is not None,
         )
         prompt = (
+
             """
-                Extract structured reminder data from the latest message according to selected_route.
+                Extract structured reminder operations from the latest user message.
+                Use selected_route, recent conversation, current local time, timezone,
+                and supplied candidates as context. Return JSON only.
 
                 NEW_REQUEST:
                 - CREATE_ONE_TIME_REMINDER: task, due_local.
-                - CREATE_ONE_TIME_REMINDERS: separate intents array of {task, due_local}.
-                - CREATE_RECURRING_REMINDER: task, frequency (DAILY, WEEKLY, MONTHLY, YEARLY), interval, applicable schedule fields, and start_local.
+                - CREATE_ONE_TIME_REMINDERS: intents array of {task, due_local}.
+                - CREATE_RECURRING_REMINDER: task, frequency (DAILY/WEEKLY/MONTHLY/YEARLY),
+                interval, applicable schedule fields, start_local.
+
                 LIST_REQUEST:
-                - LIST_REMINDERS: return only query parameters. Use start_date and end_date as ISO-8601 dates for a requested date or inclusive date range; omit both to list all reminders. Use task_query only when the user explicitly names a reminder task or subject; preserve it with dates when both are requested. Never return reminder records, tasks, or due times: the application queries its own database.
+                - LIST_REMINDERS: optional start_date, end_date (inclusive ISO dates),
+                task_query (only if explicitly mentioned). Omit dates to list all.
+                Return query filters, never reminder records.
 
                 RESCHEDULE_REQUEST:
-                - RESCHEDULE_REMINDER: target_text, exactly one of due_local or offset_minutes, scope (OCCURRENCE or SERIES), and date_explicit. Set date_explicit true only when the user supplied a destination date/day; set it false for time-only changes. due_local must be a timezone-naive local ISO-8601 datetime. For relative requests, return offset_minutes instead: "back by N" means earlier/subtract N (negative offset), while "forward by N" means later/add N (positive offset). In this application, "push back" also means earlier/subtract N. Never use a positive offset for "back" or "push back". If multiple candidates match, return NEEDS_CLARIFICATION with a focused question, but still include target_text, one time target, and scope for the requested change. Never mutate data.
-                - When an existing pending reschedule is supplied, return exactly one of SELECT_CANDIDATE, UPDATE_PENDING_PARAMETERS, SELECT_AND_UPDATE, START_NEW_OPERATION, CANCEL_PENDING, or NEEDS_CLARIFICATION. Candidate IDs must be copied only from the supplied candidates. UPDATE_PENDING_PARAMETERS and SELECT_AND_UPDATE may include exactly one of due_local, destination_date (ISO date, retaining the pending clock), offset_minutes, and may include scope. Do not infer omitted fields. These are proposals only, never commands.
+                - RESCHEDULE_REMINDER: target_text, scope (OCCURRENCE/SERIES),
+                date_explicit, and exactly one of due_local or offset_minutes.
+                date_explicit is true only for an explicitly supplied destination date/day.
+                "back"/"push back" = negative offset; "forward" = positive.
+                For multiple matches, request clarification without choosing.
+                - With pending reschedule, use SELECT_CANDIDATE, UPDATE_PENDING_PARAMETERS,
+                SELECT_AND_UPDATE, START_NEW_OPERATION, CANCEL_PENDING, or NEEDS_CLARIFICATION.
+                Copy candidate IDs only from supplied candidates. Updates may contain
+                exactly one of due_local, destination_date, offset_minutes, plus scope.
+                Preserve omitted fields.
+
+                CANCEL_REQUEST:
+                - CANCEL_REMINDER: target_text; optional scope and occurrence_date (ISO date).
+                - Specific date/instance or "skip" = OCCURRENCE; all future = SERIES;
+                unqualified recurring cancellation defaults to SERIES.
+                - Resolve relative dates/weekday references using current local time and
+                timezone; verify weekday consistency. Do not guess ambiguous dates.
+                - Use conversation and candidates to resolve references, but never invent
+                targets or IDs. Leave multiple matches for application clarification.
 
                 UPDATE_PENDING:
-                - UPDATE_PENDING_REMINDER: extract only explicitly supplied changes (task, date_local, hour, minute, meridiem, date_explicit, recurrence_frequency, recurrence_interval, recurrence_day_of_month, recurrence_month), with certainty="CLEAR" and exact evidence for each field. Recurrence frequency is MONTHLY or YEARLY; interval is 1-60; day_of_month is 1-31 and month is 1-12. Do not repeat or change other pending fields.
+                - UPDATE_PENDING_REMINDER: include only explicitly provided fields:
+                task, date_local, hour, minute, meridiem, date_explicit,
+                recurrence_frequency, recurrence_interval, recurrence_day_of_month,
+                recurrence_month.
+                - recurrence_frequency: MONTHLY/YEARLY; interval: 1-60;
+                day_of_month: 1-31; month: 1-12.
+                - Include certainty="CLEAR" and exact evidence for each supplied field.
+                For UPDATE_PENDING_REMINDER, field values are primitive values directly;
+                Do not wrap any updates field in a value/certainty/evidence object;
+                evidence is a separate mapping, for example
+                {"evidence":{"task":"pay rent"}}.
 
-                For UPDATE_PENDING_REMINDER, return an updates object whose field values are primitive values directly, for example: {"operation":"UPDATE_PENDING_REMINDER","updates":{"task":"pay rent","date_local":"2026-11-05","hour":2,"meridiem":"pm","date_explicit":true,"certainty":"CLEAR","evidence":{"task":"pay rent","date_local":"November 5","hour":"2 PM","meridiem":"PM","date_explicit":"November 5"}}}. Do not wrap any updates field in a value/certainty/evidence object; evidence belongs only in the updates.evidence mapping. Include only fields explicitly supplied by the user; do not infer omitted fields or defaults.
-
-                If required fields are missing or ambiguous, return NEEDS_CLARIFICATION with relevant pending fields and a focused question.
-
-                Use provided local time and timezone. Never invent tasks, dates, times, or recurrence rules. Use timezone-naive ISO-8601 local datetimes.
-
-                Return JSON only. The operation must match selected_route.
+                GENERAL:
+                - Operation must match selected_route.
+                - Use timezone-naive ISO datetimes and ISO dates.
+                - Interpret relative dates using the user's local time, not UTC.
+                - Never invent missing tasks, times, dates, recurrence rules, or records.
+                - If required information is missing or ambiguous, return
+                NEEDS_CLARIFICATION with a focused question and relevant pending fields.
+                - Return proposals only; the application validates and executes them.
             """
+
         )
         prompt += f"\nSelected route: {route.value}."
         prompt += f" Current local date/time is {local_now.isoformat(timespec='minutes')} ({timezone_name})."
@@ -2159,6 +2236,12 @@ class OpenAICompatibleIntentInterpreter:
                 "when interpreting relative changes, and ask the user to choose a candidate "
                 "when more than one reminder matches."
             )
+        if route is IntentRoute.CANCEL_REQUEST and cancellation_candidates:
+            prompt += (
+                " Active cancellation candidates owned by the user are "
+                f"{json.dumps(list(cancellation_candidates))}. These are context only; "
+                "the application will independently resolve the target and enforce ownership."
+            )
         if pending_reschedule is not None:
             prompt += (
                 " Existing application-owned pending reschedule context is "
@@ -2171,7 +2254,7 @@ class OpenAICompatibleIntentInterpreter:
                 {"role": "user", "content": text},
             ],
             "temperature": 0,
-            "response_format": {"type": "json_object"},
+            "response_format": self._response_format(route),
         }
         log_event(
             logger,
@@ -2220,6 +2303,53 @@ class OpenAICompatibleIntentInterpreter:
                 "SHOW_REMINDERS",
             }:
                 operation = "LIST_REMINDERS"
+            if route is IntentRoute.CANCEL_REQUEST:
+                from reminder_agent.cancellation import (
+                    CancellationRequest,
+                    CancellationScope,
+                    ground_model_cancellation_request,
+                )
+
+                unexpected_fields = set(data) - {
+                    "operation", "target_text", "scope", "occurrence_date"
+                }
+                if unexpected_fields:
+                    raise ValueError("cancellation intent has unexpected fields")
+                if operation != "CANCEL_REMINDER":
+                    raise ValueError("provider returned an unsupported cancellation operation")
+                target_text = data.get("target_text")
+                if not isinstance(target_text, str) or not target_text.strip():
+                    raise ValueError("cancellation intent is missing target_text")
+                scope_value = data.get("scope")
+                if scope_value is not None:
+                    try:
+                        scope = CancellationScope(scope_value)
+                    except ValueError as exc:
+                        raise ValueError("cancellation intent has invalid scope") from exc
+                else:
+                    scope = None
+                occurrence_date_value = data.get("occurrence_date")
+                if occurrence_date_value is not None:
+                    if not isinstance(occurrence_date_value, str):
+                        raise ValueError("cancellation occurrence_date was not a string")
+                    occurrence_date = date.fromisoformat(occurrence_date_value)
+                else:
+                    occurrence_date = None
+                cancellation_request = CancellationRequest(
+                    target_text=target_text,
+                    scope=scope,
+                    occurrence_date=occurrence_date,
+                )
+                return Interpretation(
+                    cancellation_request=ground_model_cancellation_request(
+                        text,
+                        cancellation_request,
+                        timezone_name=timezone_name,
+                        now=now,
+                        recent_messages=recent_messages,
+                    ),
+                    fallback_allowed=False,
+                )
             if route is IntentRoute.RESCHEDULE_REQUEST:
                 from reminder_agent.rescheduling import (
                     PendingRescheduleOperation,
@@ -2687,6 +2817,50 @@ class ReminderIntentInterpreter:
     def __init__(self, model_interpreter: IntentInterpreter | None = None) -> None:
         self._rules = RuleBasedIntentInterpreter()
         self._model = model_interpreter
+
+    def interpret_cancellation(
+        self,
+        text: str,
+        *,
+        timezone_name: str,
+        now: datetime,
+        recent_messages: Sequence[str] = (),
+        cancellation_candidates: Sequence[dict[str, str]] = (),
+    ) -> Any:
+        """Return a typed, non-authoritative cancellation proposal."""
+
+        if isinstance(self._model, OpenAICompatibleIntentInterpreter):
+            result = self._model.interpret(
+                text,
+                selected_route=IntentRoute.CANCEL_REQUEST,
+                timezone_name=timezone_name,
+                now=now,
+                recent_messages=recent_messages,
+                cancellation_candidates=cancellation_candidates,
+            )
+            return result.cancellation_request
+        method = getattr(self._model, "interpret_cancellation", None)
+        if method is None:
+            return None
+        kwargs = {
+            "timezone_name": timezone_name,
+            "now": now,
+            "recent_messages": recent_messages,
+            "cancellation_candidates": cancellation_candidates,
+        }
+        parameters = inspect.signature(method).parameters
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        return method(
+            text,
+            **{
+                key: value
+                for key, value in kwargs.items()
+                if key in parameters or accepts_kwargs
+            },
+        )
 
     def interpret_reschedule(
         self,

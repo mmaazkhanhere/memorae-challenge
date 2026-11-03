@@ -208,6 +208,30 @@ def test_intent_router_accepts_reschedule_request_route(monkeypatch) -> None:
     assert suggestion.operation is IntentRoute.RESCHEDULE_REQUEST
 
 
+def test_intent_router_accepts_cancel_request_route_and_prompt(monkeypatch) -> None:
+    captured: dict = {}
+
+    def fake_post(*args, **kwargs):
+        captured.update(kwargs["json"])
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={"choices": [{"message": {"content": '{"operation":"CANCEL_REQUEST"}'}}]},
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    suggestion = OpenAICompatibleIntentRouter(
+        "https://api.groq.example/openai/v1", "secret", "openai/gpt-oss-20b"
+    ).classify(
+        "I do not need the bank reminder anymore",
+        pending=None,
+        recent_messages=(),
+    )
+
+    assert suggestion.operation is IntentRoute.CANCEL_REQUEST
+    assert "CANCEL_REQUEST" in captured["messages"][0]["content"]
+
+
 def test_list_request_route_from_classifier_reaches_interpreter() -> None:
     class ListRouter:
         def classify(self, *args, **kwargs):
@@ -264,6 +288,210 @@ def test_classifier_reschedule_route_bypasses_reminder_extractor() -> None:
     assert route is ConversationRoute.RESCHEDULE_REQUEST
     assert interpreter.called is False
     assert result.fallback_allowed is False
+
+
+def test_classifier_cancel_route_defers_target_extraction_to_cancellation_service() -> None:
+    class CancelRouter:
+        def classify(self, *args, **kwargs):
+            return IntentRouteSuggestion(operation=IntentRoute.CANCEL_REQUEST)
+
+    class CancelExtractor:
+        def interpret_cancellation(self, *args, **kwargs):  # pragma: no cover - must not be called
+            raise AssertionError("target extraction must wait for a zero-match lookup")
+
+        def interpret(self, *args, **kwargs):  # pragma: no cover - must not be called
+            raise AssertionError("cancel route must bypass reminder creation extraction")
+
+    route, result = _route_and_interpret(
+        CancelExtractor(),
+        "I do not need the bank reminder anymore",
+        timezone_name="UTC",
+        now=NOW,
+        pending=None,
+        user_name="Ada",
+        intent_router=CancelRouter(),
+    )
+
+    assert route is ConversationRoute.CANCEL_REQUEST
+    assert result.cancellation_request is None
+    assert result.fallback_allowed is False
+
+
+def test_custom_cancellation_extractor_receives_supported_variadic_context() -> None:
+    captured: dict = {}
+
+    class CustomExtractor:
+        def interpret_cancellation(self, text, **kwargs):
+            captured["text"] = text
+            captured.update(kwargs)
+            return None
+
+    ReminderIntentInterpreter(CustomExtractor()).interpret_cancellation(
+        "Cancel that",
+        timezone_name="UTC",
+        now=NOW,
+        recent_messages=("user: Remind me to call the bank",),
+        cancellation_candidates=(
+            {"task": "call the bank", "schedule_type": "ONE_TIME", "due_at": ""},
+        ),
+    )
+
+    assert captured["text"] == "Cancel that"
+    assert captured["recent_messages"] == ("user: Remind me to call the bank",)
+    assert captured["cancellation_candidates"][0]["task"] == "call the bank"
+
+
+def test_openai_interpreter_extracts_non_authoritative_cancellation_request(monkeypatch) -> None:
+    def fake_post(*args, **kwargs):
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"operation":"CANCEL_REMINDER","target_text":"bank reminder","scope":"SERIES"}'
+                        }
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    result = OpenAICompatibleIntentInterpreter(
+        "https://api.groq.example/openai/v1", "secret", "openai/gpt-oss-20b"
+    ).interpret(
+        "I do not need the bank reminder anymore",
+        selected_route=IntentRoute.CANCEL_REQUEST,
+        timezone_name="UTC",
+        now=NOW,
+    )
+
+    assert result.cancellation_request is not None
+    assert result.cancellation_request.target_text == "bank reminder"
+    assert result.cancellation_request.scope is None
+
+
+def test_cancellation_uses_strict_json_schema_on_supported_provider(monkeypatch) -> None:
+    captured: dict = {}
+
+    def fake_post(*args, **kwargs):
+        captured.update(kwargs["json"])
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={"choices": [{"message": {"content": json.dumps({
+                "operation": "CANCEL_REMINDER",
+                "target_text": "bank reminder",
+                "scope": None,
+                "occurrence_date": None,
+            })}}]},
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    result = OpenAICompatibleIntentInterpreter(
+        "https://api.groq.com/openai/v1", "secret", "openai/gpt-oss-20b"
+    ).interpret(
+        "Cancel the bank reminder",
+        selected_route=IntentRoute.CANCEL_REQUEST,
+        timezone_name="UTC",
+        now=NOW,
+    )
+
+    assert captured["response_format"]["type"] == "json_schema"
+    assert captured["response_format"]["json_schema"]["strict"] is True
+    assert result.cancellation_request is not None
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "{not json",
+        json.dumps({"cancellation": {"operation": "CANCEL_REMINDER"}}),
+        json.dumps({"operation": "CANCEL_REMINDER", "scope": None}),
+        json.dumps(
+            {
+                "operation": "CANCEL_REMINDER",
+                "target_text": "bank reminder",
+                "scope": "ALL",
+                "occurrence_date": None,
+            }
+        ),
+    ],
+    ids=["malformed", "nested", "missing-target", "invalid-enum"],
+)
+def test_invalid_cancellation_provider_responses_fail_closed(monkeypatch, content) -> None:
+    def fake_post(*args, **kwargs):
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={"choices": [{"message": {"content": content}}]},
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    result = OpenAICompatibleIntentInterpreter(
+        "https://api.groq.example/openai/v1", "secret", "openai/gpt-oss-20b"
+    ).interpret(
+        "Cancel the bank reminder",
+        selected_route=IntentRoute.CANCEL_REQUEST,
+        timezone_name="UTC",
+        now=NOW,
+    )
+
+    assert result.cancellation_request is None
+
+
+def test_openai_interpreter_grounds_contextual_cancellation_in_recent_messages(monkeypatch) -> None:
+    def fake_post(*args, **kwargs):
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={"choices": [{"message": {"content":
+                '{"operation":"CANCEL_REMINDER","target_text":"call Ahmed"}'
+            }}]},
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    result = OpenAICompatibleIntentInterpreter(
+        "https://api.groq.example/openai/v1", "secret", "openai/gpt-oss-20b"
+    ).interpret(
+        "Actually, cancel that",
+        selected_route=IntentRoute.CANCEL_REQUEST,
+        timezone_name="Asia/Karachi",
+        now=NOW,
+        recent_messages=(
+            "user: Remind me tomorrow at 9 AM to call Ahmed",
+            "assistant: I'll remind you to call Ahmed tomorrow at 09:00 PKT.",
+        ),
+    )
+
+    assert result.cancellation_request is not None
+    assert result.cancellation_request.target_text == "call Ahmed"
+
+
+def test_openai_interpreter_rejects_target_absent_from_current_and_recent_context(monkeypatch) -> None:
+    def fake_post(*args, **kwargs):
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={"choices": [{"message": {"content":
+                '{"operation":"CANCEL_REMINDER","target_text":"secret project"}'
+            }}]},
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    result = OpenAICompatibleIntentInterpreter(
+        "https://api.groq.example/openai/v1", "secret", "openai/gpt-oss-20b"
+    ).interpret(
+        "Actually, cancel that",
+        selected_route=IntentRoute.CANCEL_REQUEST,
+        timezone_name="UTC",
+        now=NOW,
+        recent_messages=("user: Remind me to call Ahmed",),
+    )
+
+    assert result.cancellation_request is None
+    assert result.fallback_allowed is True
 
 
 @pytest.mark.parametrize(
