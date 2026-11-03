@@ -40,6 +40,11 @@ _SCHEDULE_LIST_REQUEST = re.compile(
     r"what\s+is\s+scheduled|anything\s+coming\s+up)\b",
     re.IGNORECASE,
 )
+_TASK_LIST_REQUEST = re.compile(
+    r"^\s*(?:when\s+(?:are|is)\s+(?:my\s+)?\S+|when\s+do\s+i\s+have\s+to\s+\S+|"
+    r"(?:show|list)\s+(?:my\s+)?\S.+\s+reminders?)\b",
+    re.IGNORECASE,
+)
 _CLOCK_WITH_AT = re.compile(
     r"\bat\s+\d{1,2}(?::\d{2})?\s*(?:a\.m\.|p\.m\.|am|pm)?\b",
     re.IGNORECASE,
@@ -89,7 +94,11 @@ def is_new_reminder_command(text: str) -> bool:
 def is_list_request_command(text: str) -> bool:
     """Return whether text explicitly asks to view reminders or a schedule."""
     raw = text.strip()
-    return _LIST_REMINDERS.match(raw) is not None or _SCHEDULE_LIST_REQUEST.match(raw) is not None
+    return (
+        _LIST_REMINDERS.match(raw) is not None
+        or _SCHEDULE_LIST_REQUEST.match(raw) is not None
+        or _TASK_LIST_REQUEST.match(raw) is not None
+    )
 
 
 def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecision:

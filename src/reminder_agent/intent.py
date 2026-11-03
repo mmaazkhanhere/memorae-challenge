@@ -21,6 +21,43 @@ from reminder_agent.request_policy import OUT_OF_SCOPE_RESPONSE
 logger = get_logger()
 
 
+_LIST_TASK_PATTERNS = (
+    re.compile(
+        r"^\s*(?:when|what)\s+(?:are|is)\s+(?:my\s+)?(?P<task>.+?)(?:\s+(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday))?\s*[?!.]*\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(r"^\s*when\s+do\s+i\s+have\s+to\s+(?P<task>.+?)\s*[?!.]*\s*$", re.IGNORECASE),
+    re.compile(
+        r"^\s*(?:show|list)\s+(?:my\s+)?(?P<task>.+?)\s+reminders?(?:\s+(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday))?\s*[?!.]*\s*$",
+        re.IGNORECASE,
+    ),
+)
+
+
+def normalize_task_query(value: str) -> str:
+    """Normalize a user-supplied listing subject without widening it."""
+
+    normalized = " ".join(value.strip().split())
+    normalized = re.sub(r"^(?:all\s+)?(?:the\s+)?", "", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\s+reminders?$", "", normalized, flags=re.IGNORECASE)
+    return normalized.strip(" .,!?")
+
+
+def extract_listing_task_query(text: str) -> str | None:
+    """Return an explicit task/subject filter from supported listing wording."""
+
+    for pattern in _LIST_TASK_PATTERNS:
+        match = pattern.match(text)
+        if match is None:
+            continue
+        task_query = normalize_task_query(match.group("task"))
+        if task_query and task_query.lower() not in {
+            "all", "my", "reminder", "scheduled", "schedule",
+        }:
+            return task_query
+    return None
+
+
 class IntentRoute(StrEnum):
     NEW_REQUEST = "NEW_REQUEST"
     LIST_REQUEST = "LIST_REQUEST"
@@ -254,13 +291,14 @@ class CreateRecurringReminderIntent(BaseModel):
 
 
 class ListRemindersIntent(BaseModel):
-    """A read-only request for all reminders or an inclusive local-date range."""
+    """A read-only request with optional date and task/subject filters."""
 
     model_config = ConfigDict(extra="forbid")
 
     operation: Literal["LIST_REMINDERS"] = "LIST_REMINDERS"
     start_date: date | None = None
     end_date: date | None = None
+    task_query: str | None = Field(default=None, min_length=1, max_length=200)
     timezone_name: str = Field(min_length=1, max_length=150)
 
     @field_validator("timezone_name")
@@ -271,6 +309,16 @@ class ListRemindersIntent(BaseModel):
         except Exception as exc:
             raise ValueError("timezone_name must be a valid IANA timezone") from exc
         return value
+
+    @field_validator("task_query")
+    @classmethod
+    def task_query_must_not_be_blank(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = normalize_task_query(value)
+        if not normalized:
+            raise ValueError("task_query must not be blank")
+        return normalized
 
     @model_validator(mode="after")
     def date_range_must_be_ordered(self) -> "ListRemindersIntent":
@@ -1418,11 +1466,22 @@ class RuleBasedIntentInterpreter:
     def _interpret_listing(
         self, raw: str, *, timezone_name: str, now: datetime
     ) -> Interpretation | None:
-        if self._list_request.match(raw) is None:
+        if self._list_request.match(raw) is None and extract_listing_task_query(raw) is None:
             return None
         zone = ZoneInfo(timezone_name)
         local_today = _normalise_now(now).astimezone(zone).date()
         normalized = raw.lower()
+        task_query = extract_listing_task_query(raw)
+
+        def list_intent(
+            start_date: date | None = None, end_date: date | None = None
+        ) -> ListRemindersIntent:
+            return ListRemindersIntent(
+                start_date=start_date,
+                end_date=end_date,
+                task_query=task_query,
+                timezone_name=timezone_name,
+            )
 
         def resolve(value: str) -> date:
             if value == "today":
@@ -1438,21 +1497,13 @@ class RuleBasedIntentInterpreter:
         if "this week" in normalized:
             start = local_today - timedelta(days=local_today.weekday())
             return Interpretation(
-                intent=ListRemindersIntent(
-                    start_date=start,
-                    end_date=start + timedelta(days=6),
-                    timezone_name=timezone_name,
-                ),
+                intent=list_intent(start, start + timedelta(days=6)),
                 fallback_allowed=False,
             )
         if "next week" in normalized:
             start = local_today - timedelta(days=local_today.weekday()) + timedelta(days=7)
             return Interpretation(
-                intent=ListRemindersIntent(
-                    start_date=start,
-                    end_date=start + timedelta(days=6),
-                    timezone_name=timezone_name,
-                ),
+                intent=list_intent(start, start + timedelta(days=6)),
                 fallback_allowed=False,
             )
 
@@ -1460,19 +1511,15 @@ class RuleBasedIntentInterpreter:
         # next seven local days, which gives the user a useful projection of
         # every active recurring series without changing the read-only list
         # intent shape.
-        if "all" in normalized:
+        if "all" in normalized and task_query is None:
             return Interpretation(
-                intent=ListRemindersIntent(timezone_name=timezone_name),
+                intent=list_intent(),
                 fallback_allowed=False,
             )
 
         if "recurring" in normalized and ("all" in normalized or "every" in normalized):
             return Interpretation(
-                intent=ListRemindersIntent(
-                    start_date=local_today,
-                    end_date=local_today + timedelta(days=6),
-                    timezone_name=timezone_name,
-                ),
+                intent=list_intent(local_today, local_today + timedelta(days=6)),
                 fallback_allowed=False,
             )
 
@@ -1484,11 +1531,7 @@ class RuleBasedIntentInterpreter:
                 if end < start:
                     end += timedelta(days=7)
                 return Interpretation(
-                    intent=ListRemindersIntent(
-                        start_date=start,
-                        end_date=end,
-                        timezone_name=timezone_name,
-                    ),
+                    intent=list_intent(start, end),
                     fallback_allowed=False,
                 )
             except (TypeError, ValueError, ValidationError):
@@ -1501,11 +1544,7 @@ class RuleBasedIntentInterpreter:
             if phrase in normalized:
                 day = local_today + timedelta(days=offset)
                 return Interpretation(
-                    intent=ListRemindersIntent(
-                        start_date=day,
-                        end_date=day,
-                        timezone_name=timezone_name,
-                    ),
+                    intent=list_intent(day, day),
                     fallback_allowed=False,
                 )
 
@@ -1513,11 +1552,7 @@ class RuleBasedIntentInterpreter:
             if re.search(rf"\b{weekday}\b", normalized):
                 day = local_today + timedelta(days=(index - local_today.weekday()) % 7)
                 return Interpretation(
-                    intent=ListRemindersIntent(
-                        start_date=day,
-                        end_date=day,
-                        timezone_name=timezone_name,
-                    ),
+                    intent=list_intent(day, day),
                     fallback_allowed=False,
                 )
 
@@ -1526,11 +1561,7 @@ class RuleBasedIntentInterpreter:
             try:
                 day = date.fromisoformat(iso_dates[0])
                 return Interpretation(
-                    intent=ListRemindersIntent(
-                        start_date=day,
-                        end_date=day,
-                        timezone_name=timezone_name,
-                    ),
+                    intent=list_intent(day, day),
                     fallback_allowed=False,
                 )
             except ValueError:
@@ -1545,7 +1576,7 @@ class RuleBasedIntentInterpreter:
                 fallback_allowed=True,
             )
         return Interpretation(
-            intent=ListRemindersIntent(timezone_name=timezone_name),
+            intent=list_intent(),
             fallback_allowed=False,
         )
 
@@ -2094,7 +2125,7 @@ class OpenAICompatibleIntentInterpreter:
                 - CREATE_ONE_TIME_REMINDERS: separate intents array of {task, due_local}.
                 - CREATE_RECURRING_REMINDER: task, frequency (DAILY, WEEKLY, MONTHLY, YEARLY), interval, applicable schedule fields, and start_local.
                 LIST_REQUEST:
-                - LIST_REMINDERS: return only query parameters. Use start_date and end_date as ISO-8601 dates for a requested date or inclusive date range; omit both to list all reminders. Never return reminder records, tasks, or due times: the application queries its own database.
+                - LIST_REMINDERS: return only query parameters. Use start_date and end_date as ISO-8601 dates for a requested date or inclusive date range; omit both to list all reminders. Use task_query only when the user explicitly names a reminder task or subject; preserve it with dates when both are requested. Never return reminder records, tasks, or due times: the application queries its own database.
 
                 RESCHEDULE_REQUEST:
                 - RESCHEDULE_REMINDER: target_text, exactly one of due_local or offset_minutes, scope (OCCURRENCE or SERIES), and date_explicit. Set date_explicit true only when the user supplied a destination date/day; set it false for time-only changes. due_local must be a timezone-naive local ISO-8601 datetime. For relative requests, return offset_minutes instead: "back by N" means earlier/subtract N (negative offset), while "forward by N" means later/add N (positive offset). In this application, "push back" also means earlier/subtract N. Never use a positive offset for "back" or "push back". If multiple candidates match, return NEEDS_CLARIFICATION with a focused question, but still include target_text, one time target, and scope for the requested change. Never mutate data.
@@ -2542,10 +2573,20 @@ class OpenAICompatibleIntentInterpreter:
                     not isinstance(start_date_value, str) or not isinstance(end_date_value, str)
                 ):
                     raise ValueError("list intent has invalid date range")
+                raw_task_query = data.get("task_query")
+                explicit_task_query = extract_listing_task_query(text)
+                if raw_task_query is not None and not isinstance(raw_task_query, str):
+                    raise ValueError("list intent has invalid task query")
+                if explicit_task_query is not None:
+                    if not isinstance(raw_task_query, str) or not raw_task_query.strip():
+                        raise ValueError("list intent discarded an explicit task query")
+                    if normalize_task_query(raw_task_query).lower() != explicit_task_query.lower():
+                        raise ValueError("list intent changed an explicit task query")
                 return Interpretation(
                     intent=ListRemindersIntent(
                         start_date=(date.fromisoformat(start_date_value) if start_date_value else None),
                         end_date=(date.fromisoformat(end_date_value) if end_date_value else None),
+                        task_query=raw_task_query,
                         timezone_name=timezone_name,
                     )
                 )

@@ -1485,6 +1485,7 @@ def handle_reminder_text(
                     user_id=user.id,
                     start_date=list_intent.start_date,
                     end_date=list_intent.end_date,
+                    task_query=list_intent.task_query,
                     timezone_name=user.timezone,
                     now=now,
                 )
@@ -1495,6 +1496,7 @@ def handle_reminder_text(
                         start_date=list_intent.start_date,
                         end_date=list_intent.end_date,
                         timezone_name=user.timezone,
+                        task_query=list_intent.task_query,
                     ),
                 )
 

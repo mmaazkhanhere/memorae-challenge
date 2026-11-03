@@ -132,6 +132,51 @@ def test_listing_uses_local_midnight_boundaries_across_dst(session_factory):
     assert result[0].due_at == datetime(2027, 3, 14, 13, tzinfo=timezone.utc)
 
 
+def test_listing_task_filter_combines_with_date_and_owner_scope(session_factory):
+    with session_factory.begin() as db:
+        ada = User(name="Ada", timezone="UTC", onboarding_status="ACTIVE")
+        bob = User(name="Bob", timezone="UTC", onboarding_status="ACTIVE")
+        db.add_all([ada, bob])
+        db.flush()
+        rows = [
+            (ada, "doctor appointment", datetime(2026, 11, 1, 9, tzinfo=timezone.utc)),
+            (ada, "call John", datetime(2026, 11, 1, 10, tzinfo=timezone.utc)),
+            (ada, "gym workout", datetime(2026, 11, 2, 9, tzinfo=timezone.utc)),
+            (bob, "doctor appointment", datetime(2026, 11, 1, 8, tzinfo=timezone.utc)),
+        ]
+        for owner, task, due_at in rows:
+            reminder = Reminder(
+                user_id=owner.id, task=task, schedule_type="ONE_TIME",
+                start_local=due_at.isoformat(), timezone="UTC", status="ACTIVE",
+            )
+            db.add(reminder)
+            db.flush()
+            db.add(ReminderOccurrence(
+                reminder_id=reminder.id, scheduled_at=due_at, next_due_at=due_at, status="PENDING"
+            ))
+
+    with session_factory() as db:
+        doctors = list_reminders_in_range(
+            db, user_id=ada.id, start_date=date(2026, 11, 1), end_date=date(2026, 11, 1),
+            task_query="doctor's appointments", timezone_name="UTC",
+        )
+        gym = list_reminders_in_range(
+            db, user_id=ada.id, start_date=None, end_date=None, task_query="gym", timezone_name="UTC",
+            now=datetime(2026, 10, 30, tzinfo=timezone.utc),
+        )
+        missing = list_reminders_in_range(
+            db, user_id=ada.id, start_date=None, end_date=None, task_query="dentist", timezone_name="UTC",
+            now=datetime(2026, 10, 30, tzinfo=timezone.utc),
+        )
+
+    assert [item.task for item in doctors] == ["doctor appointment"]
+    assert [item.task for item in gym] == ["gym workout"]
+    assert missing == []
+    assert format_reminder_list(
+        missing, start_date=None, end_date=None, task_query="dentist", timezone_name="UTC"
+    ) == 'You have no upcoming active reminders matching "dentist".'
+
+
 def test_empty_listing_is_explicit_and_formatting_is_local():
     assert format_reminder_list(
         [], start_date=None, end_date=None, timezone_name="UTC"
