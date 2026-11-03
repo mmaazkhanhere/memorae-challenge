@@ -90,6 +90,18 @@ def pending_reschedule_from_session(session: ConversationSession | None):
     return PendingReschedule.model_validate(session.pending_clarification)
 
 
+def pending_cancellation_from_session(session: ConversationSession | None):
+    """Load VS-10 context without trusting it as an authorization source."""
+
+    if session is None or session.pending_clarification is None:
+        return None
+    if session.pending_clarification.get("operation") != "CANCEL_REMINDER":
+        return None
+    from reminder_agent.cancellation import PendingCancellation
+
+    return PendingCancellation.model_validate(session.pending_clarification)
+
+
 def end_session(session: ConversationSession, *, now: datetime) -> None:
     """Clear pending clarification state after completion, cancellation, or expiry."""
     session.status = ENDED

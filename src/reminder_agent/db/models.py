@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -7,6 +7,7 @@ from sqlalchemy import (
     BigInteger,
     CheckConstraint,
     DateTime,
+    Date,
     ForeignKey,
     Index,
     Integer,
@@ -160,6 +161,27 @@ class ReminderOccurrence(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class ReminderRecurrenceException(Base):
+    """A durable, local-calendar skip for one recurring instance."""
+
+    __tablename__ = "reminder_recurrence_exceptions"
+    __table_args__ = (
+        UniqueConstraint(
+            "reminder_id", "occurrence_date", name="uq_recurrence_exception_reminder_date"
+        ),
+        Index("ix_recurrence_exceptions_reminder_date", "reminder_id", "occurrence_date"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    reminder_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("reminders.id", ondelete="CASCADE"), nullable=False
+    )
+    occurrence_date: Mapped[date] = mapped_column(Date, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
     )
 
 

@@ -29,10 +29,11 @@ REQUIRED_SCHEMA_TABLES = (
     "idempotency_records",
     "reminders",
     "reminder_occurrences",
+    "reminder_recurrence_exceptions",
     "notifications",
     "conversation_sessions",
 )
-REQUIRED_SCHEMA_VERSION = "0013_recurring_occurrence_keys"
+REQUIRED_SCHEMA_VERSION = "0014_recurrence_exceptions"
 REQUIRED_SCHEMA_COLUMNS = {
     "notifications": {
         "claimed_by",
@@ -57,6 +58,7 @@ REQUIRED_SCHEMA_COLUMNS = {
         "updated_at",
     },
     "reminder_occurrences": {"recurrence_instance_key"},
+    "reminder_recurrence_exceptions": {"reminder_id", "occurrence_date"},
 }
 
 

@@ -45,6 +45,7 @@ def test_prompt_injection_is_rejected_as_untrusted_input() -> None:
         "CREATE_RECURRING_REMINDER",
         "LIST_REMINDERS",
         "RESCHEDULE_REMINDER",
+        "CANCEL_REMINDER",
     ],
 )
 def test_every_supported_operation_is_explicitly_allowed(operation: str) -> None:
@@ -54,7 +55,6 @@ def test_every_supported_operation_is_explicitly_allowed(operation: str) -> None
 @pytest.mark.parametrize(
     "operation",
     [
-        "CANCEL_REMINDER",
         "COMPLETE_REMINDER",
         "SNOOZE_REMINDER",
         "SAVE_MEMORY",

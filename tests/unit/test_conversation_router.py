@@ -52,6 +52,13 @@ def test_router_recognizes_schedule_list_wording() -> None:
         assert route_message(text, pending=_pending()).route is ConversationRoute.LIST_REQUEST
 
 
+def test_router_recognizes_explicit_cancellation_requests() -> None:
+    assert route_message("Cancel the standup", pending=None).route is ConversationRoute.CANCEL_REQUEST
+    assert route_message("Cancel only tomorrow's standup", pending=_pending()).route is (
+        ConversationRoute.CANCEL_REQUEST
+    )
+
+
 def test_router_does_not_start_a_reminder_from_unrelated_text() -> None:
     assert route_message("7 PM", pending=None).route is ConversationRoute.UNRELATED
     assert route_message("I have five tasks today", pending=None).route is (

@@ -86,6 +86,16 @@ responses use Telegram's `retry_after` value. Permanent errors become `FAILED`; 
 uncertain attempts become `UNKNOWN` for monitoring or manual recovery. Strict end-to-end
 exactly-once delivery cannot be guaranteed after an ambiguous provider outcome.
 
+VS-10 supports Telegram text cancellation. `Cancel the standup` cancels an active recurring
+series and all of its outstanding pending occurrences; `Cancel only Monday's standup` cancels
+just that pending occurrence and leaves the series active. Ambiguous task matches are clarified
+before any state changes. Cancellation locks the owned reminder and pending notifications in
+one transaction, preserves sent delivery history, and refuses to claim success if a notification
+is already `SENDING`. Canceled reminders and occurrences are excluded by the existing worker
+eligibility checks, so no stale pending notification is delivered after a committed cancellation.
+Indirect cancellation language can be routed by the configured intent model; the model may only
+propose target text and scope, while the backend resolves owned candidates and performs the write.
+
 The same worker also retries durable Telegram confirmations that failed after the inbound
 command was committed. Confirmation responses are stored with the idempotency record, retried
 after connectivity returns, and marked `SENT` only after Telegram confirms them. This prevents a
@@ -144,7 +154,9 @@ Set `LOG_INCLUDE_TRACEBACK=true` when a full traceback is needed. Useful events 
 codes, due-time lateness, parser/provider path, outcome, exception type, and sanitized network
 cause. Confirmation events include `confirmation_claimed`, `confirmation_delivery_attempt_started`,
 `confirmation_delivery_failed`, `confirmation_delivery_outcome_recorded`, and
-`confirmation_delivered`. Logs never contain tokens, secrets, prompts, reminder text, or personal
+`confirmation_delivered`. VS-10 adds `cancellation_command_started`,
+`cancellation_clarification_saved`, `cancellation_extraction_failed`, `reminder_canceled`, and
+`reminder_cancellation_conflict`. Logs never contain tokens, secrets, prompts, reminder text, or personal
 data.
 
 Telegram webhook updates are idempotent. Each update gets one logical outbound response. A

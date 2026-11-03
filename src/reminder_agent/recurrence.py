@@ -175,6 +175,48 @@ def resolve_local_datetime(local_date: date, local_time: time, zone: ZoneInfo) -
     return shifted.replace(tzinfo=zone, fold=0)
 
 
+def recurrence_due_for_local_date(
+    recurrence: WeeklyRecurrence | MonthlyRecurrence | YearlyRecurrence,
+    *,
+    start_local: datetime,
+    occurrence_date: date,
+    timezone_name: str,
+) -> tuple[datetime, datetime] | None:
+    """Return a recurrence's local/UTC due values for one valid local date."""
+
+    if occurrence_date < start_local.date():
+        return None
+    if isinstance(recurrence, WeeklyRecurrence):
+        weeks_since_start = (occurrence_date - start_local.date()).days // 7
+        matches = (
+            occurrence_date.weekday() in recurrence.weekdays
+            and weeks_since_start % recurrence.interval == 0
+        )
+    elif isinstance(recurrence, MonthlyRecurrence):
+        months_since_start = (
+            (occurrence_date.year - start_local.year) * 12
+            + occurrence_date.month
+            - start_local.month
+        )
+        matches = (
+            occurrence_date.day == recurrence.day_of_month
+            and months_since_start % recurrence.interval == 0
+        )
+    else:
+        years_since_start = occurrence_date.year - start_local.year
+        matches = (
+            occurrence_date.month == recurrence.month
+            and occurrence_date.day == recurrence.day_of_month
+            and years_since_start % recurrence.interval == 0
+        )
+    if not matches:
+        return None
+    local_due = resolve_local_datetime(
+        occurrence_date, time(recurrence.hour, recurrence.minute), ZoneInfo(timezone_name)
+    )
+    return local_due, local_due.astimezone(timezone.utc)
+
+
 def iter_weekly_occurrences(
     recurrence: WeeklyRecurrence,
     *,
