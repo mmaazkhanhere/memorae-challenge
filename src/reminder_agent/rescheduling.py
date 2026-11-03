@@ -15,7 +15,7 @@ from typing import Literal
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -41,6 +41,17 @@ class RescheduleScope(StrEnum):
     SERIES = "SERIES"
 
 
+class PendingRescheduleOperation(StrEnum):
+    """Non-authoritative interpretations of an unfinished reschedule."""
+
+    SELECT_CANDIDATE = "SELECT_CANDIDATE"
+    UPDATE_PENDING_PARAMETERS = "UPDATE_PENDING_PARAMETERS"
+    SELECT_AND_UPDATE = "SELECT_AND_UPDATE"
+    START_NEW_OPERATION = "START_NEW_OPERATION"
+    CANCEL_PENDING = "CANCEL_PENDING"
+    NEEDS_CLARIFICATION = "NEEDS_CLARIFICATION"
+
+
 class PendingReschedule(BaseModel):
     """Durable, non-authoritative context for a follow-up question."""
 
@@ -48,7 +59,10 @@ class PendingReschedule(BaseModel):
 
     operation: Literal["RESCHEDULE_REMINDER"] = "RESCHEDULE_REMINDER"
     target_text: str = Field(min_length=1, max_length=200)
-    due_at: datetime
+    due_at: datetime | None = None
+    date_explicit: bool = False
+    offset_minutes: int | None = Field(default=None, ge=-10080, le=10080)
+    source_text: str | None = Field(default=None, max_length=500)
     timezone_name: str = Field(min_length=1, max_length=150)
     candidate_ids: tuple[UUID, ...] = ()
     scope: RescheduleScope | None = None
@@ -63,10 +77,20 @@ class PendingReschedule(BaseModel):
 
     @field_validator("due_at")
     @classmethod
-    def due_at_must_be_aware(cls, value: datetime) -> datetime:
+    def due_at_must_be_aware(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("due_at must be timezone-aware")
         return value.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def has_exactly_one_time_target(self) -> "PendingReschedule":
+        if self.due_at is None and self.offset_minutes is None and not self.source_text:
+            raise ValueError("pending reschedule needs a time target or source request")
+        if self.due_at is not None and self.offset_minutes is not None:
+            raise ValueError("pending reschedule cannot have both absolute and relative targets")
+        return self
 
     @field_validator("timezone_name")
     @classmethod
@@ -75,11 +99,68 @@ class PendingReschedule(BaseModel):
         return value
 
 
+class PendingRescheduleProposal(BaseModel):
+    """Validated model proposal, never a command to mutate the database.
+
+    Candidate IDs are intentionally opaque UUIDs.  The application validates
+    membership in ``PendingReschedule.candidate_ids`` again while holding the
+    conversation lock before using one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    operation: PendingRescheduleOperation
+    candidate_id: UUID | None = None
+    due_at: datetime | None = None
+    destination_date: date | None = None
+    date_explicit: bool | None = None
+    offset_minutes: int | None = Field(default=None, ge=-10080, le=10080)
+    scope: RescheduleScope | None = None
+    question: str | None = Field(default=None, max_length=500)
+
+    @field_validator("due_at")
+    @classmethod
+    def proposal_due_at_must_be_aware(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("due_at must be timezone-aware")
+        return value.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def proposal_is_coherent(self) -> "PendingRescheduleProposal":
+        has_time = self.due_at is not None or self.offset_minutes is not None
+        has_update = has_time or self.destination_date is not None or self.scope is not None
+        if self.due_at is not None and self.offset_minutes is not None:
+            raise ValueError("proposal cannot have both absolute and relative targets")
+        if self.destination_date is not None and self.due_at is not None:
+            raise ValueError("proposal cannot have both a local date and absolute datetime")
+        if self.operation in {
+            PendingRescheduleOperation.SELECT_CANDIDATE,
+            PendingRescheduleOperation.SELECT_AND_UPDATE,
+        } and self.candidate_id is None:
+            raise ValueError("candidate selection proposal needs a candidate ID")
+        if self.operation is PendingRescheduleOperation.UPDATE_PENDING_PARAMETERS and not has_update:
+            raise ValueError("parameter update proposal needs an update")
+        if self.operation is PendingRescheduleOperation.SELECT_AND_UPDATE and not has_update:
+            raise ValueError("combined proposal needs an update")
+        if self.operation in {
+            PendingRescheduleOperation.CANCEL_PENDING,
+            PendingRescheduleOperation.START_NEW_OPERATION,
+            PendingRescheduleOperation.NEEDS_CLARIFICATION,
+        } and (self.candidate_id is not None or has_update):
+            raise ValueError("non-update proposal contains action fields")
+        return self
+
+
 @dataclass(frozen=True)
 class RescheduleRequest:
     target_text: str
-    due_at: datetime
+    due_at: datetime | None = None
+    date_explicit: bool = False
+    offset_minutes: int | None = None
     scope: RescheduleScope | None = None
+    source_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -107,6 +188,12 @@ _COMMAND = re.compile(
     r"(?P<separator>to|until|for|at)\s+(?P<when>.+?)\s*[.!?]*\s*$",
     re.IGNORECASE,
 )
+_COMMAND_GREEDY = re.compile(
+    r"^\s*(?:please\s+|can\s+you\s+|could\s+you\s+)?"
+    r"(?:move|reschedule|change|shift|push|postpone|delay)\s+(?:the\s+)?(?P<target>.+)\s+"
+    r"(?P<separator>to|until|for)\s+(?P<when>.+?)\s*[.!?]*\s*$",
+    re.IGNORECASE,
+)
 _WHEN = re.compile(
     r"^(?:(?P<day>today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
     r"\d{4}-\d{1,2}-\d{1,2})\s+)?(?:at\s+)?(?P<hour>\d{1,2})"
@@ -116,7 +203,7 @@ _WHEN = re.compile(
 _ORDINALS = {"first": 0, "one": 0, "1": 0, "second": 1, "two": 1, "2": 1, "third": 2, "three": 2, "3": 2}
 _STOP_WORDS = {
     "a", "an", "the", "reminder", "reminders", "this", "occurrence", "series",
-    "future", "all", "please", "one", "first", "second", "third", "1", "2", "3",
+    "future", "all", "my", "please", "one", "first", "second", "third", "1", "2", "3",
 }
 _DAY_INDEX = {
     "monday": 0,
@@ -182,6 +269,8 @@ def parse_reschedule_request(text: str, *, timezone_name: str, now: datetime) ->
     if match is None:
         return "Please say which reminder to move and give a new future time."
     target = " ".join(match.group("target").split())
+    target = re.sub(r"^my\s+", "", target, flags=re.I)
+    target = re.sub(r"^(?:my\s+)?(?:a\s+)?reminders?\s+to\s+", "", target, flags=re.I)
     if not target:
         return "Please tell me which reminder to move."
     scope = _scope_from_text(target)
@@ -198,6 +287,25 @@ def parse_reschedule_request(text: str, *, timezone_name: str, now: datetime) ->
         return "Please tell me which reminder to move."
 
     when = _WHEN.match(match.group("when"))
+    if when is None:
+        fallback_match = _COMMAND_GREEDY.match(text)
+        if fallback_match is not None:
+            fallback_when = _WHEN.match(fallback_match.group("when"))
+            if fallback_when is not None:
+                match = fallback_match
+                target = " ".join(match.group("target").split())
+                target = re.sub(r"^my\s+", "", target, flags=re.I)
+                target = re.sub(r"^(?:my\s+)?(?:a\s+)?reminders?\s+to\s+", "", target, flags=re.I)
+                target = re.sub(
+                    r"\b(?:all\s+future\s+reminders?|all\s+reminders?|this\s+occurrence|this\s+reminder|"
+                    r"the\s+whole\s+series|the\s+series|whole\s+series|series|next\s+occurrence|"
+                    r"upcoming\s+reminder|only\s+this\s+one|only\s+the\s+next|coming\s+one|occurrence)\b",
+                    " ",
+                    target,
+                    flags=re.I,
+                )
+                target = " ".join(target.split()).strip(" .,!?")
+                when = fallback_when
     if when is None:
         return "Please give the new time as a future date and time, for example tomorrow at 10 AM."
     hour = int(when.group("hour"))
@@ -223,7 +331,55 @@ def parse_reschedule_request(text: str, *, timezone_name: str, now: datetime) ->
         due_at = local_due.astimezone(timezone.utc)
     if due_at <= now.astimezone(timezone.utc):
         return "Please choose a future time for the reminder."
-    return RescheduleRequest(target, due_at, scope)
+    return RescheduleRequest(
+        target_text=target,
+        due_at=due_at,
+        date_explicit=when.group("day") is not None,
+        scope=scope,
+    )
+
+
+def parse_pending_reschedule_parameters(
+    text: str, *, timezone_name: str, now: datetime
+) -> PendingRescheduleProposal | None:
+    """Recognize only whole, unambiguous parameter-only follow-ups."""
+
+    normalized = text.strip().rstrip(".!?")
+    date_only = re.fullmatch(
+        r"(?:no,?\s+)?i\s+meant\s+"
+        r"(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)",
+        normalized,
+        re.IGNORECASE,
+    )
+    if date_only is not None:
+        try:
+            value = _parse_date(date_only.group(1), now=now, zone=ZoneInfo(timezone_name))
+        except ValueError:
+            return None
+        return PendingRescheduleProposal(
+            operation=PendingRescheduleOperation.UPDATE_PENDING_PARAMETERS,
+            destination_date=value,
+            date_explicit=True,
+        )
+    match = re.fullmatch(
+        r"(?:actually,?\s+)?(?:make|move|change)\s+(?:it|that)(?:\s+to)?\s+(.+)",
+        normalized,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    parsed = parse_reschedule_request(
+        f"Move placeholder to {match.group(1)}", timezone_name=timezone_name, now=now
+    )
+    if not isinstance(parsed, RescheduleRequest):
+        return None
+    return PendingRescheduleProposal(
+        operation=PendingRescheduleOperation.UPDATE_PENDING_PARAMETERS,
+        due_at=parsed.due_at,
+        offset_minutes=parsed.offset_minutes,
+        date_explicit=parsed.date_explicit,
+        scope=parsed.scope,
+    )
 
 
 def _tokens(value: str) -> set[str]:
@@ -279,6 +435,33 @@ def find_candidates(db: Session, *, user_id: UUID, target_text: str) -> list[Res
     return list(unique.values())
 
 
+def find_all_candidates(db: Session, *, user_id: UUID) -> list[RescheduleCandidate]:
+    """Return all active one-occurrence anchors for LLM disambiguation context."""
+    rows = db.execute(
+        select(Reminder, ReminderOccurrence)
+        .join(ReminderOccurrence, ReminderOccurrence.reminder_id == Reminder.id)
+        .where(
+            Reminder.user_id == user_id,
+            Reminder.status == ACTIVE,
+            ReminderOccurrence.status == PENDING,
+        )
+        .order_by(ReminderOccurrence.next_due_at, Reminder.id, ReminderOccurrence.id)
+    ).all()
+    unique: dict[UUID, RescheduleCandidate] = {}
+    for reminder, occurrence in rows:
+        unique.setdefault(
+            reminder.id,
+            RescheduleCandidate(
+                reminder_id=reminder.id,
+                occurrence_id=occurrence.id,
+                task=reminder.task,
+                due_at=occurrence.next_due_at,
+                schedule_type=reminder.schedule_type,
+            ),
+        )
+    return list(unique.values())
+
+
 def format_candidates(candidates: list[RescheduleCandidate], *, timezone_name: str) -> str:
     """Render stored UTC candidate times in the user's local timezone."""
     zone = ZoneInfo(timezone_name)
@@ -303,29 +486,65 @@ def decide_reschedule(
     now: datetime,
     pending: PendingReschedule | None = None,
     request_override: RescheduleRequest | None = None,
+    candidate_id_override: UUID | None = None,
 ) -> RescheduleDecision:
     normalized = text.strip().lower().rstrip(".!?")
     if pending is not None:
         if normalized in {"cancel", "never mind", "nevermind", "not now"}:
             return RescheduleDecision("CANCEL", "Okay, I won't move that reminder.")
         scope = _scope_from_text(text) or pending.scope
-        candidate_ids = pending.candidate_ids
-        ordinal = re.search(r"\b(?:the\s+)?(first|one|second|two|third|three|1|2|3)\b", normalized)
-        if ordinal is not None and len(candidate_ids) > 1:
-            selected = _ORDINALS.get(ordinal.group(1))
-            if selected is not None and selected < len(candidate_ids):
-                candidate_ids = (candidate_ids[selected],)
+        candidate_ids = (
+            (candidate_id_override,)
+            if candidate_id_override is not None and candidate_id_override in pending.candidate_ids
+            else select_pending_candidate_ids(
+                db,
+                user_id=user_id,
+                pending=pending,
+                text=text,
+                timezone_name=timezone_name,
+                now=now,
+            )
+        )
         if len(candidate_ids) != 1:
             return RescheduleDecision(
                 "CLARIFY",
                 "Which reminder should I move?\n" + format_candidates(
-                    find_candidates(db, user_id=user_id, target_text=pending.target_text),
+                    pending_candidates(db, user_id=user_id, pending=pending),
                     timezone_name=timezone_name,
+                ),
+                request=RescheduleRequest(
+                    target_text=pending.target_text,
+                    due_at=pending.due_at,
+                    date_explicit=pending.date_explicit,
+                    offset_minutes=pending.offset_minutes,
+                    scope=scope,
+                    source_text=pending.source_text,
                 ),
                 candidate_ids=pending.candidate_ids,
             )
-        candidate = db.get(Reminder, candidate_ids[0])
-        if candidate is not None and candidate.schedule_type == RECURRING and scope is None:
+        candidates_by_id = {
+            candidate.reminder_id: candidate
+            for candidate in pending_candidates(db, user_id=user_id, pending=pending)
+        }
+        candidate = candidates_by_id.get(candidate_ids[0])
+        if candidate is None:
+            # The write path locks and rechecks ownership/activity.  Returning
+            # a mutation proposal here preserves the existing user-facing
+            # conflict response if a candidate disappeared after clarification.
+            if pending.due_at is not None:
+                return RescheduleDecision(
+                    "MUTATE",
+                    "",
+                    RescheduleRequest(
+                        target_text=pending.target_text,
+                        due_at=pending.due_at,
+                        date_explicit=pending.date_explicit,
+                        scope=scope,
+                    ),
+                    candidate_ids,
+                )
+            return RescheduleDecision("RESPONSE", "That reminder is no longer active.")
+        if candidate.schedule_type == RECURRING and scope is None:
             return RescheduleDecision(
                 "CLARIFY",
                 "Should I move only the upcoming reminder, or update all future reminders in the series?",
@@ -334,7 +553,17 @@ def decide_reschedule(
         return RescheduleDecision(
             "MUTATE",
             "",
-            RescheduleRequest(pending.target_text, pending.due_at, scope),
+            _resolve_candidate_due(
+                RescheduleRequest(
+                    target_text=pending.target_text,
+                    due_at=pending.due_at,
+                    date_explicit=pending.date_explicit,
+                    offset_minutes=pending.offset_minutes,
+                    scope=scope,
+                ),
+                candidate,
+                timezone_name=timezone_name,
+            ),
             candidate_ids,
         )
 
@@ -362,7 +591,177 @@ def decide_reschedule(
             request=parsed,
             candidate_ids=(candidate.reminder_id,),
         )
-    return RescheduleDecision("MUTATE", "", parsed, (candidate.reminder_id,))
+    return RescheduleDecision(
+        "MUTATE",
+        "",
+        _resolve_candidate_due(parsed, candidate, timezone_name=timezone_name),
+        (candidate.reminder_id,),
+    )
+
+
+def _resolve_candidate_due(
+    request: RescheduleRequest,
+    candidate: RescheduleCandidate,
+    *,
+    timezone_name: str = "UTC",
+) -> RescheduleRequest:
+    """Resolve a model-provided relative offset against the selected occurrence."""
+    if request.due_at is not None:
+        if request.date_explicit:
+            return request
+        zone = ZoneInfo(timezone_name)
+        candidate_local = candidate.due_at
+        if candidate_local.tzinfo is None or candidate_local.utcoffset() is None:
+            candidate_local = candidate_local.replace(tzinfo=timezone.utc)
+        candidate_local = candidate_local.astimezone(zone)
+        requested_local = request.due_at.astimezone(zone)
+        preserved_local = resolve_local_datetime(
+            candidate_local.date(), requested_local.timetz().replace(tzinfo=None), zone
+        )
+        return RescheduleRequest(
+            target_text=request.target_text,
+            due_at=preserved_local.astimezone(timezone.utc),
+            date_explicit=False,
+            scope=request.scope,
+            source_text=request.source_text,
+        )
+    if request.offset_minutes is None:
+        raise ValueError("reschedule request is missing a time target")
+    candidate_due_at = candidate.due_at
+    if candidate_due_at.tzinfo is None or candidate_due_at.utcoffset() is None:
+        candidate_due_at = candidate_due_at.replace(tzinfo=timezone.utc)
+    return RescheduleRequest(
+        target_text=request.target_text,
+        due_at=candidate_due_at + timedelta(minutes=request.offset_minutes),
+        date_explicit=request.date_explicit,
+        scope=request.scope,
+        source_text=request.source_text,
+    )
+
+
+def apply_pending_reschedule_proposal(
+    pending: PendingReschedule,
+    proposal: PendingRescheduleProposal,
+    *,
+    timezone_name: str,
+) -> PendingReschedule:
+    """Merge explicit parameters into trusted pending state without selecting a row."""
+
+    values = pending.model_dump(mode="python")
+    if proposal.due_at is not None:
+        values["due_at"] = proposal.due_at
+        values["offset_minutes"] = None
+    elif proposal.offset_minutes is not None:
+        values["due_at"] = None
+        values["offset_minutes"] = proposal.offset_minutes
+    elif proposal.destination_date is not None:
+        if pending.due_at is None:
+            raise ValueError("a date correction needs an existing reminder time")
+        zone = ZoneInfo(timezone_name)
+        existing_local = pending.due_at.astimezone(zone)
+        local_due = resolve_local_datetime(
+            proposal.destination_date, existing_local.timetz().replace(tzinfo=None), zone
+        )
+        values["due_at"] = local_due.astimezone(timezone.utc)
+        values["offset_minutes"] = None
+        values["date_explicit"] = True
+    if proposal.scope is not None:
+        values["scope"] = proposal.scope
+    if proposal.date_explicit is not None:
+        values["date_explicit"] = proposal.date_explicit
+    return PendingReschedule.model_validate(values)
+
+
+def pending_candidates(
+    db: Session, *, user_id: UUID, pending: PendingReschedule
+) -> list[RescheduleCandidate]:
+    """Reload only active, owned candidate IDs authorized by a session."""
+
+    allowed = set(pending.candidate_ids)
+    return [
+        candidate
+        for candidate in find_all_candidates(db, user_id=user_id)
+        if candidate.reminder_id in allowed
+    ]
+
+
+def select_pending_candidate_ids(
+    db: Session,
+    *,
+    user_id: UUID,
+    pending: PendingReschedule,
+    text: str,
+    timezone_name: str,
+    now: datetime,
+) -> tuple[UUID, ...]:
+    """Resolve ordinal or clock-based natural candidate references safely."""
+    # Keep matching deliberately narrow for deterministic text selection;
+    # IDs are still constrained to the durable pending candidate list below.
+    candidates = find_candidates(db, user_id=user_id, target_text=pending.target_text)
+    candidate_ids = list(pending.candidate_ids)
+    normalized = text.strip().lower().rstrip(".!?")
+    clock = re.fullmatch(
+        r"(?:the\s+)?(?:at\s+|for\s+|scheduled\s+(?:at|for)\s+)?"
+        r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)(?:\s+(?:one|reminder|occurrence))?",
+        normalized,
+    )
+    if clock is not None:
+        hour = int(clock.group(1)) % 12
+        if clock.group(3) == "pm":
+            hour += 12
+        minute = int(clock.group(2) or 0)
+        zone = ZoneInfo(timezone_name)
+        matches = []
+        for candidate in candidates:
+            due_at = candidate.due_at
+            if due_at.tzinfo is None or due_at.utcoffset() is None:
+                due_at = due_at.replace(tzinfo=timezone.utc)
+            if (
+                candidate.reminder_id in candidate_ids
+                and due_at.astimezone(zone).hour == hour
+                and due_at.astimezone(zone).minute == minute
+            ):
+                matches.append(candidate.reminder_id)
+        if len(matches) == 1:
+            return (matches[0],)
+        return tuple(candidate_ids)
+    day_match = re.fullmatch(
+        r"(?:the\s+)?(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s+(?:one|reminder|occurrence)",
+        normalized,
+    )
+    if day_match is not None:
+        zone = ZoneInfo(timezone_name)
+        requested_day = day_match.group(1)
+        local_now = now.astimezone(zone)
+        if requested_day == "today":
+            requested_date = local_now.date()
+        elif requested_day == "tomorrow":
+            requested_date = local_now.date() + timedelta(days=1)
+        else:
+            requested_date = None
+        matches = []
+        for candidate in candidates:
+            due_at = candidate.due_at
+            if due_at.tzinfo is None or due_at.utcoffset() is None:
+                due_at = due_at.replace(tzinfo=timezone.utc)
+            local_due = due_at.astimezone(zone)
+            if requested_date is not None:
+                matches_if = local_due.date() == requested_date
+            else:
+                matches_if = local_due.strftime("%A").lower() == requested_day
+            if candidate.reminder_id in candidate_ids and matches_if:
+                matches.append(candidate.reminder_id)
+        if len(matches) == 1:
+            return (matches[0],)
+        return tuple(candidate_ids)
+    ordinal = re.fullmatch(
+        r"(?:the\s+)?(first|one|second|two|third|three|1|2|3)(?:\s+(?:one|reminder|occurrence))?", normalized
+    )
+    if ordinal is not None and len(candidate_ids) > 1:
+        selected = _ORDINALS.get(ordinal.group(1))
+        if selected is not None and selected < len(candidate_ids):
+            return (candidate_ids[selected],)
+    return tuple(candidate_ids)
 
 
 def _next_sequence(db: Session, occurrence_id: UUID) -> int:

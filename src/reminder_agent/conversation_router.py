@@ -30,7 +30,8 @@ _NEW_REMINDER = re.compile(
     re.IGNORECASE,
 )
 _LIST_REMINDERS = re.compile(
-    r"^\s*(?:can\s+you\s+)?(?:what\s+(?:do\s+i\s+have|are\s+my\s+reminders?)|"
+    r"^\s*(?:can\s+you\s+)?(?:what\s+(?:do\s+i\s+have|are\s+my\s+reminders?|"
+    r"reminders?\s+do\s+i\s+have)|"
     r"(?:list|show)(?:\s+(?:my|me))?\s+(?:all\s+(?:the\s+)?)?(?:recurring\s+)?reminders?)\b",
     re.IGNORECASE,
 )

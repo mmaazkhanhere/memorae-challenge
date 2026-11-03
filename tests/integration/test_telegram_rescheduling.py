@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 import os
 from threading import Event, Lock, Thread
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -19,6 +19,8 @@ from reminder_agent.worker import NotificationWorker
 from reminder_agent import rescheduling
 from reminder_agent.intent import IntentRoute, IntentRouteSuggestion
 from reminder_agent.rescheduling import (
+    PendingRescheduleOperation,
+    PendingRescheduleProposal,
     RescheduleConflict,
     RescheduleRequest,
     RescheduleScope,
@@ -81,6 +83,234 @@ def test_reschedule_updates_existing_reminder_and_replaces_pending_notification(
     assert notifications[1].due_at.replace(tzinfo=timezone.utc) == datetime(
         2026, 10, 31, 10, 0, tzinfo=timezone.utc
     )
+
+
+def test_conversational_reschedule_targets_match_and_preserve_notification_graph(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory)
+    post_update(api_client, update_factory(950, text="Remind me tomorrow at 9 AM to Call John"))
+
+    response = post_update(
+        api_client,
+        update_factory(951, text="Move my Call John reminder to tomorrow at 10 AM"),
+    )
+
+    assert response.status_code == 200
+    assert "Moved 'Call John'" in telegram_client.messages[-1][1]
+    occurrence = db.scalar(select(ReminderOccurrence))
+    assert occurrence is not None
+    assert occurrence.next_due_at.replace(tzinfo=timezone.utc) == datetime(
+        2026, 10, 31, 10, 0, tzinfo=timezone.utc
+    )
+    notifications = db.scalars(select(Notification).order_by(Notification.sequence)).all()
+    assert [item.status for item in notifications] == ["CANCELED", "PENDING"]
+
+
+def test_conversational_reminder_target_phrase_matches_existing_task(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory)
+    post_update(api_client, update_factory(960, text="Remind me tomorrow at 9 AM to Call John"))
+
+    response = post_update(
+        api_client,
+        update_factory(961, text="Move my reminder to call John to tomorrow at 10 AM"),
+    )
+
+    assert response.status_code == 200
+    assert "Moved 'Call John'" in telegram_client.messages[-1][1]
+    occurrence = db.scalar(select(ReminderOccurrence))
+    assert occurrence is not None
+    assert occurrence.next_due_at.replace(tzinfo=timezone.utc) == datetime(
+        2026, 10, 31, 10, 0, tzinfo=timezone.utc
+    )
+    notifications = db.scalars(select(Notification).order_by(Notification.sequence)).all()
+    assert [item.status for item in notifications] == ["CANCELED", "PENDING"]
+
+
+@pytest.mark.parametrize(
+    "reply,expected_due,user_id,chat_id,base",
+    [
+        ("the Friday one", datetime(2026, 10, 30, 18, 0, tzinfo=timezone.utc), 3001, 4001, 1000),
+        ("the tomorrow one", datetime(2026, 10, 31, 18, 0, tzinfo=timezone.utc), 3002, 4002, 1100),
+        ("the 4 PM one", datetime(2026, 10, 30, 18, 0, tzinfo=timezone.utc), 3003, 4003, 1200),
+    ],
+)
+def test_pending_reschedule_resolves_day_and_clock_references(
+    api_client, telegram_client, db, update_factory, reply, expected_due, user_id, chat_id, base
+) -> None:
+    onboard(api_client, update_factory, user_id=user_id, chat_id=chat_id, base=base)
+    post_update(
+        api_client,
+        update_factory(base + 2, user_id=user_id, chat_id=chat_id, text="Remind me tomorrow at 9 AM to Call John"),
+    )
+    post_update(
+        api_client,
+        update_factory(base + 3, user_id=user_id, chat_id=chat_id, text="Remind me Friday at 4 PM to Call John"),
+    )
+    post_update(
+        api_client,
+        update_factory(base + 4, user_id=user_id, chat_id=chat_id, text="Move the Call John reminder to 6 PM"),
+    )
+    session = db.scalar(
+        select(ConversationSession).where(
+            ConversationSession.external_session_id == str(chat_id)
+        )
+    )
+    assert session is not None and session.pending_clarification is not None
+    candidate_ids = tuple(
+        UUID(value) for value in session.pending_clarification["candidate_ids"]
+    )
+    response = post_update(
+        api_client,
+        update_factory(base + 5, user_id=user_id, chat_id=chat_id, text=reply),
+    )
+
+    assert response.status_code == 200
+    assert "Moved 'Call John'" in telegram_client.messages[-1][1]
+    db.expire_all()
+    assert db.scalar(
+        select(ConversationSession).where(
+            ConversationSession.external_session_id == str(chat_id)
+        )
+    ).pending_clarification is None
+    updated = db.scalars(
+        select(ReminderOccurrence).where(ReminderOccurrence.reminder_id.in_(candidate_ids))
+    ).all()
+    changed = [item for item in updated if item.next_due_at.replace(tzinfo=timezone.utc) == expected_due]
+    assert len(changed) == 1
+    notifications = db.scalars(
+        select(Notification).where(Notification.occurrence_id == changed[0].id).order_by(Notification.sequence)
+    ).all()
+    assert [item.status for item in notifications] == ["CANCELED", "PENDING"]
+
+
+def test_contextual_pending_reply_uses_typed_llm_proposal_and_preserves_candidate_date(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    class PendingExtractor:
+        def __init__(self) -> None:
+            self.called = False
+            self.context = None
+
+        def interpret_pending_reschedule(
+            self, text, *, timezone_name, now, pending_reschedule, reschedule_candidates, recent_messages
+        ):
+            self.called = True
+            self.context = (pending_reschedule, reschedule_candidates, recent_messages)
+            selected = UUID(reschedule_candidates[1]["candidate_id"])
+            return PendingRescheduleProposal(
+                operation=PendingRescheduleOperation.SELECT_AND_UPDATE,
+                candidate_id=selected,
+                due_at=datetime(2026, 10, 30, 19, 0, tzinfo=timezone.utc),
+                date_explicit=False,
+            )
+
+    onboard(api_client, update_factory)
+    post_update(api_client, update_factory(1090, text="Remind me tomorrow at 9 AM to call John"))
+    post_update(api_client, update_factory(1091, text="Remind me Friday at 4 PM to call John"))
+    post_update(api_client, update_factory(1092, text="Move the Call John reminder to 6 PM"))
+    extractor = PendingExtractor()
+    api_client.app.state.reminder_interpreter = extractor
+
+    assert post_update(api_client, update_factory(1093, text="the earlier reminder")).status_code == 200
+
+    assert extractor.called is True
+    assert extractor.context is not None
+    pending_context, candidates, recent = extractor.context
+    assert pending_context["operation"] == "RESCHEDULE_REMINDER"
+    assert len(candidates) == 2 and len(recent) <= 6
+    updated = db.scalars(select(ReminderOccurrence).order_by(ReminderOccurrence.next_due_at)).all()
+    assert [item.next_due_at.replace(tzinfo=timezone.utc) for item in updated] == [
+        datetime(2026, 10, 30, 16, 0, tzinfo=timezone.utc),
+        datetime(2026, 10, 31, 19, 0, tzinfo=timezone.utc),
+    ]
+    assert "Moved 'call John'" in telegram_client.messages[-1][1]
+
+
+def test_hallucinated_pending_candidate_proposal_cannot_mutate(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    class HallucinatingExtractor:
+        def interpret_pending_reschedule(self, *args, **kwargs):
+            return PendingRescheduleProposal(
+                operation=PendingRescheduleOperation.SELECT_AND_UPDATE,
+                candidate_id=uuid4(),
+                due_at=datetime(2026, 10, 30, 19, 0, tzinfo=timezone.utc),
+                date_explicit=False,
+            )
+
+    onboard(api_client, update_factory)
+    post_update(api_client, update_factory(1100, text="Remind me tomorrow at 9 AM to call John"))
+    post_update(api_client, update_factory(1101, text="Remind me Friday at 4 PM to call John"))
+    post_update(api_client, update_factory(1102, text="Move the Call John reminder to 6 PM"))
+    original_due = db.scalars(select(ReminderOccurrence).order_by(ReminderOccurrence.next_due_at)).all()
+    original_due = [item.next_due_at for item in original_due]
+    api_client.app.state.reminder_interpreter = HallucinatingExtractor()
+
+    assert post_update(api_client, update_factory(1103, text="the earlier reminder")).status_code == 200
+
+    assert "which reminder" in telegram_client.messages[-1][1].lower()
+    assert [item.next_due_at for item in db.scalars(select(ReminderOccurrence).order_by(ReminderOccurrence.next_due_at)).all()] == original_due
+    session = db.scalar(select(ConversationSession))
+    assert session is not None and session.status == "AWAITING_CLARIFICATION"
+
+
+def test_explicit_pending_time_correction_stays_deterministic(
+    api_client, db, update_factory
+) -> None:
+    class NoModel:
+        def interpret_pending_reschedule(self, *args, **kwargs):
+            raise AssertionError("explicit parameter correction must not call the model")
+
+    onboard(api_client, update_factory)
+    post_update(api_client, update_factory(1110, text="Remind me tomorrow at 9 AM to call John"))
+    post_update(api_client, update_factory(1111, text="Remind me Friday at 4 PM to call John"))
+    post_update(api_client, update_factory(1112, text="Move the Call John reminder to 6 PM"))
+    api_client.app.state.reminder_interpreter = NoModel()
+
+    assert post_update(api_client, update_factory(1113, text="Actually, make it 7 PM")).status_code == 200
+    session = db.scalar(select(ConversationSession))
+    assert session is not None and session.pending_clarification is not None
+    assert session.pending_clarification["date_explicit"] is False
+    assert post_update(api_client, update_factory(1114, text="the second one")).status_code == 200
+
+    occurrences = db.scalars(select(ReminderOccurrence).order_by(ReminderOccurrence.next_due_at)).all()
+    assert [item.next_due_at.replace(tzinfo=timezone.utc) for item in occurrences] == [
+        datetime(2026, 10, 30, 16, 0, tzinfo=timezone.utc),
+        datetime(2026, 10, 31, 19, 0, tzinfo=timezone.utc),
+    ]
+
+
+@pytest.mark.parametrize("provider_result", ["malformed", "timeout"])
+def test_pending_reschedule_provider_failure_keeps_session_and_rows_unchanged(
+    api_client, db, update_factory, provider_result
+) -> None:
+    class FailingExtractor:
+        def interpret_pending_reschedule(self, *args, **kwargs):
+            if provider_result == "timeout":
+                raise TimeoutError("provider timed out")
+            return {"operation": "SELECT_CANDIDATE", "candidate_id": "not-a-uuid"}
+
+    onboard(api_client, update_factory)
+    post_update(api_client, update_factory(1120, text="Remind me tomorrow at 9 AM to call John"))
+    post_update(api_client, update_factory(1121, text="Remind me Friday at 4 PM to call John"))
+    post_update(api_client, update_factory(1122, text="Move the Call John reminder to 6 PM"))
+    original_due = [
+        item.next_due_at
+        for item in db.scalars(select(ReminderOccurrence).order_by(ReminderOccurrence.next_due_at)).all()
+    ]
+    api_client.app.state.reminder_interpreter = FailingExtractor()
+
+    assert post_update(api_client, update_factory(1123, text="the earlier reminder")).status_code == 200
+
+    assert [
+        item.next_due_at
+        for item in db.scalars(select(ReminderOccurrence).order_by(ReminderOccurrence.next_due_at)).all()
+    ] == original_due
+    session = db.scalar(select(ConversationSession))
+    assert session is not None and session.status == "AWAITING_CLARIFICATION"
 
 
 def test_classifier_routes_indirect_reschedule_to_transactional_handler(
@@ -146,6 +376,48 @@ def test_unsupported_reschedule_language_uses_non_authoritative_extractor_fallba
     assert "Moved 'call the bank'" in telegram_client.messages[-1][1]
     reminder = db.scalar(select(Reminder))
     assert reminder is not None and reminder.version == 2
+
+
+def test_relative_reschedule_offset_is_calculated_from_selected_candidate(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    class RescheduleExtractor:
+        def __init__(self) -> None:
+            self.candidates = []
+
+        def interpret_reschedule(
+            self, text, *, timezone_name, now, reschedule_candidates
+        ):
+            self.candidates = reschedule_candidates
+            return RescheduleRequest(
+                target_text="bank",
+                offset_minutes=-120,
+                scope=RescheduleScope.OCCURRENCE,
+            )
+
+    extractor = RescheduleExtractor()
+    onboard(api_client, update_factory)
+    post_update(api_client, update_factory(980, text="Remind me tomorrow at 9 AM to call the bank"))
+    post_update(api_client, update_factory(981, text="Remind me tomorrow at 12 PM to call the bank"))
+    api_client.app.state.reminder_interpreter = extractor
+
+    response = post_update(
+        api_client,
+        update_factory(982, text="Push the bank reminder back by 2 hours"),
+    )
+
+    assert response.status_code == 200
+    assert "which one should i move" in telegram_client.messages[-1][1].lower()
+    assert sum(candidate["task"] == "call the bank" for candidate in extractor.candidates) == 2
+    assert post_update(api_client, update_factory(983, text="2")).status_code == 200
+
+    occurrences = db.scalars(
+        select(ReminderOccurrence).order_by(ReminderOccurrence.next_due_at)
+    ).all()
+    assert [occurrence.next_due_at.replace(tzinfo=timezone.utc) for occurrence in occurrences] == [
+        datetime(2026, 10, 31, 9, 0, tzinfo=timezone.utc),
+        datetime(2026, 10, 31, 10, 0, tzinfo=timezone.utc),
+    ]
 
 
 def test_reschedule_replay_does_not_apply_twice(
@@ -527,6 +799,27 @@ def test_new_reminder_command_supersedes_pending_reschedule_clarification(
     assert session.pending_clarification is None
 
 
+def test_new_reschedule_command_supersedes_pending_reschedule_clarification(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory)
+    post_update(api_client, update_factory(968, text="Remind me tomorrow at 8 AM to call the bank"))
+    post_update(api_client, update_factory(969, text="Remind me tomorrow at 9 AM to call the bank"))
+    post_update(api_client, update_factory(970, text="Move the bank reminder to tomorrow at 10 AM"))
+
+    response = post_update(
+        api_client,
+        update_factory(971, text="Move the bank reminder to tomorrow at 11 AM"),
+    )
+
+    assert response.status_code == 200
+    assert "which one should i move" in telegram_client.messages[-1][1].lower()
+    session = db.scalar(select(ConversationSession))
+    assert session is not None
+    assert session.status == "AWAITING_CLARIFICATION"
+    assert session.pending_clarification["operation"] == "RESCHEDULE_REMINDER"
+
+
 def test_schedule_query_does_not_answer_pending_reschedule_clarification(
     api_client, telegram_client, db, update_factory
 ) -> None:
@@ -546,7 +839,7 @@ def test_schedule_query_does_not_answer_pending_reschedule_clarification(
 
     response = post_update(
         api_client,
-        update_factory(967, text="What's on my schedule tomorrow?"),
+        update_factory(967, text="What reminders do I have tomorrow?"),
     )
 
     assert response.status_code == 200
@@ -601,6 +894,9 @@ def test_reminder_removed_between_reschedule_clarification_and_mutation_is_safe(
     assert response.status_code == 200
     assert "couldn't move" in telegram_client.messages[-1][1].lower()
     assert db.scalar(select(func.count()).select_from(Notification).where(Notification.status == "CANCELED")) == 0
+    session = db.scalar(select(ConversationSession))
+    assert session is not None and session.status == "ENDED"
+    assert session.pending_clarification is None
 
 
 @pytest.mark.parametrize("destination_kind", ["missing", "other_user"])

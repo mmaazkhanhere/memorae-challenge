@@ -4,7 +4,7 @@ import json
 import logging
 import inspect
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from enum import StrEnum
 from typing import Any, Literal, Protocol, Sequence
@@ -442,6 +442,7 @@ class Interpretation:
     clarification: NeedsClarification | None = None
     field_updates: PendingReminderFieldUpdate | None = None
     reschedule_request: Any | None = None
+    pending_reschedule_proposal: Any | None = None
     response_text: str | None = None
     fallback_allowed: bool = True
     clear_context: bool = False
@@ -486,6 +487,8 @@ class IntentInterpreter(Protocol):
         now: datetime,
         context: PendingReminder | None = None,
         recent_messages: Sequence[str] = (),
+        reschedule_candidates: Sequence[dict[str, str]] = (),
+        pending_reschedule: Any | None = None,
     ) -> Interpretation: ...
 
 
@@ -1004,7 +1007,8 @@ class RuleBasedIntentInterpreter:
         "sunday": 6,
     }
     _list_request = re.compile(
-        r"^\s*(?:can\s+you\s+)?(?:what\s+(?:do\s+i\s+have|are\s+my\s+reminders?)|"
+        r"^\s*(?:can\s+you\s+)?(?:what\s+(?:do\s+i\s+have|are\s+my\s+reminders?|"
+        r"reminders?\s+do\s+i\s+have)|"
         r"(?:list|show)(?:\s+(?:my|me))?\s+(?:all\s+(?:the\s+)?)?(?:recurring\s+)?reminders?|"
         r"what(?:'s|\s+is)\s+(?:(?:on|in)\s+)?(?:my\s+)?schedule|"
         r"what\s+is\s+scheduled|anything\s+coming\s+up)\b",
@@ -2051,6 +2055,8 @@ class OpenAICompatibleIntentInterpreter:
         now: datetime,
         context: PendingReminder | None = None,
         recent_messages: Sequence[str] = (),
+        reschedule_candidates: Sequence[dict[str, str]] = (),
+        pending_reschedule: Any | None = None,
     ) -> Interpretation:
         route = selected_route or (
             IntentRoute.UPDATE_PENDING if context is not None else IntentRoute.NEW_REQUEST
@@ -2091,7 +2097,8 @@ class OpenAICompatibleIntentInterpreter:
                 - LIST_REMINDERS: return only query parameters. Use start_date and end_date as ISO-8601 dates for a requested date or inclusive date range; omit both to list all reminders. Never return reminder records, tasks, or due times: the application queries its own database.
 
                 RESCHEDULE_REQUEST:
-                - RESCHEDULE_REMINDER: target_text, due_local, and scope (OCCURRENCE or SERIES). due_local must be a timezone-naive local ISO-8601 datetime. If the target, time, or scope is ambiguous, return NEEDS_CLARIFICATION with a focused question. Never mutate data.
+                - RESCHEDULE_REMINDER: target_text, exactly one of due_local or offset_minutes, scope (OCCURRENCE or SERIES), and date_explicit. Set date_explicit true only when the user supplied a destination date/day; set it false for time-only changes. due_local must be a timezone-naive local ISO-8601 datetime. For relative requests, return offset_minutes instead: "back by N" means earlier/subtract N (negative offset), while "forward by N" means later/add N (positive offset). In this application, "push back" also means earlier/subtract N. Never use a positive offset for "back" or "push back". If multiple candidates match, return NEEDS_CLARIFICATION with a focused question, but still include target_text, one time target, and scope for the requested change. Never mutate data.
+                - When an existing pending reschedule is supplied, return exactly one of SELECT_CANDIDATE, UPDATE_PENDING_PARAMETERS, SELECT_AND_UPDATE, START_NEW_OPERATION, CANCEL_PENDING, or NEEDS_CLARIFICATION. Candidate IDs must be copied only from the supplied candidates. UPDATE_PENDING_PARAMETERS and SELECT_AND_UPDATE may include exactly one of due_local, destination_date (ISO date, retaining the pending clock), offset_minutes, and may include scope. Do not infer omitted fields. These are proposals only, never commands.
 
                 UPDATE_PENDING:
                 - UPDATE_PENDING_REMINDER: extract only explicitly supplied changes (task, date_local, hour, minute, meridiem, date_explicit, recurrence_frequency, recurrence_interval, recurrence_day_of_month, recurrence_month), with certainty="CLEAR" and exact evidence for each field. Recurrence frequency is MONTHLY or YEARLY; interval is 1-60; day_of_month is 1-31 and month is 1-12. Do not repeat or change other pending fields.
@@ -2113,6 +2120,18 @@ class OpenAICompatibleIntentInterpreter:
             prompt += (
                 " Relevant recent conversation messages are "
                 f"{json.dumps(list(recent_messages)[-34:])}."
+            )
+        if route is IntentRoute.RESCHEDULE_REQUEST and reschedule_candidates:
+            prompt += (
+                " Matching reminder candidates from the application are "
+                f"{json.dumps(list(reschedule_candidates))}. Use these current local due times "
+                "when interpreting relative changes, and ask the user to choose a candidate "
+                "when more than one reminder matches."
+            )
+        if pending_reschedule is not None:
+            prompt += (
+                " Existing application-owned pending reschedule context is "
+                f"{json.dumps(pending_reschedule, default=str)}."
             )
         request_payload = {
             "model": self._model,
@@ -2171,19 +2190,65 @@ class OpenAICompatibleIntentInterpreter:
             }:
                 operation = "LIST_REMINDERS"
             if route is IntentRoute.RESCHEDULE_REQUEST:
-                if operation == "RESCHEDULE_REMINDER":
-                    from reminder_agent.rescheduling import RescheduleRequest, RescheduleScope
+                from reminder_agent.rescheduling import (
+                    PendingRescheduleOperation,
+                    PendingRescheduleProposal,
+                    RescheduleRequest,
+                    RescheduleScope,
+                )
 
+                if pending_reschedule is not None:
+                    pending_operations = {
+                        item.value for item in PendingRescheduleOperation
+                    }
+                    if operation not in pending_operations:
+                        raise ValueError("provider returned an unsupported pending reschedule operation")
+                    raw_proposal: dict[str, Any] = {"operation": operation}
+                    for field in ("candidate_id", "date_explicit", "offset_minutes", "scope", "question"):
+                        if field in data:
+                            raw_proposal[field] = data[field]
+                    due_local_value = data.get("due_local")
+                    if due_local_value is not None:
+                        if not isinstance(due_local_value, str):
+                            raise ValueError("pending reschedule due_local was not a string")
+                        due_local = datetime.fromisoformat(due_local_value)
+                        if due_local.tzinfo is not None and due_local.utcoffset() is not None:
+                            raise ValueError("provider returned an offset-bearing local datetime")
+                        raw_proposal["due_at"] = due_local.replace(
+                            tzinfo=ZoneInfo(timezone_name)
+                        ).astimezone(timezone.utc)
+                    destination_date = data.get("destination_date")
+                    if destination_date is not None:
+                        if not isinstance(destination_date, str):
+                            raise ValueError("pending reschedule destination_date was not a string")
+                        raw_proposal["destination_date"] = date.fromisoformat(destination_date)
+                    proposal = PendingRescheduleProposal.model_validate(raw_proposal)
+                    return Interpretation(
+                        pending_reschedule_proposal=proposal,
+                        response_text=(proposal.question.strip() if proposal.question else None),
+                        fallback_allowed=False,
+                    )
+
+                if operation == "RESCHEDULE_REMINDER":
                     target_text = data.get("target_text")
                     due_local_value = data.get("due_local")
+                    offset_minutes = data.get("offset_minutes")
                     scope_value = data.get("scope")
+                    date_explicit = data.get("date_explicit")
                     if not isinstance(target_text, str) or not target_text.strip():
                         raise ValueError("reschedule intent is missing target_text")
-                    if not isinstance(due_local_value, str):
-                        raise ValueError("reschedule intent is missing due_local")
-                    due_local = datetime.fromisoformat(due_local_value)
-                    if due_local.tzinfo is not None and due_local.utcoffset() is not None:
-                        raise ValueError("provider returned an offset-bearing local datetime")
+                    if (isinstance(due_local_value, str)) == (
+                        isinstance(offset_minutes, int) and not isinstance(offset_minutes, bool)
+                    ):
+                        raise ValueError("reschedule intent needs exactly one time target")
+                    due_at = None
+                    if isinstance(due_local_value, str):
+                        due_local = datetime.fromisoformat(due_local_value)
+                        if due_local.tzinfo is not None and due_local.utcoffset() is not None:
+                            raise ValueError("provider returned an offset-bearing local datetime")
+                        due_at = due_local.replace(tzinfo=ZoneInfo(timezone_name)).astimezone(
+                            timezone.utc
+                        )
                     if scope_value is not None:
                         try:
                             scope = RescheduleScope(scope_value)
@@ -2194,10 +2259,17 @@ class OpenAICompatibleIntentInterpreter:
                     return Interpretation(
                         reschedule_request=RescheduleRequest(
                             target_text=target_text,
-                            due_at=due_local.replace(tzinfo=ZoneInfo(timezone_name)).astimezone(
-                                timezone.utc
+                            due_at=due_at,
+                            offset_minutes=(
+                                offset_minutes if isinstance(offset_minutes, int) else None
                             ),
                             scope=scope,
+                            date_explicit=(
+                                date_explicit
+                                if isinstance(date_explicit, bool)
+                                else isinstance(due_local_value, str)
+                            ),
+                            source_text=text,
                         ),
                         fallback_allowed=False,
                     )
@@ -2205,6 +2277,68 @@ class OpenAICompatibleIntentInterpreter:
                     question = data.get("question")
                     if not isinstance(question, str) or not question.strip():
                         raise ValueError("missing reschedule clarification question")
+                    target_text = data.get("target_text")
+                    due_local_value = data.get("due_local")
+                    offset_minutes = data.get("offset_minutes")
+                    scope_value = data.get("scope")
+                    date_explicit = data.get("date_explicit")
+                    has_absolute_time = isinstance(due_local_value, str)
+                    has_relative_time = isinstance(offset_minutes, int) and not isinstance(
+                        offset_minutes, bool
+                    )
+                    if isinstance(target_text, str) and target_text.strip():
+                        if has_absolute_time == has_relative_time:
+                            if scope_value is not None:
+                                try:
+                                    scope = RescheduleScope(scope_value)
+                                except ValueError as exc:
+                                    raise ValueError("reschedule intent has invalid scope") from exc
+                            else:
+                                scope = None
+                            return Interpretation(
+                                reschedule_request=RescheduleRequest(
+                                    target_text=target_text,
+                                    scope=scope,
+                                    date_explicit=(
+                                        date_explicit
+                                        if isinstance(date_explicit, bool)
+                                        else isinstance(due_local_value, str)
+                                    ),
+                                    source_text=text,
+                                ),
+                                response_text=question.strip(),
+                                fallback_allowed=False,
+                            )
+                        due_at = None
+                        if has_absolute_time:
+                            due_local = datetime.fromisoformat(due_local_value)
+                            if due_local.tzinfo is not None and due_local.utcoffset() is not None:
+                                raise ValueError("provider returned an offset-bearing local datetime")
+                            due_at = due_local.replace(
+                                tzinfo=ZoneInfo(timezone_name)
+                            ).astimezone(timezone.utc)
+                        scope = None
+                        if scope_value is not None:
+                            try:
+                                scope = RescheduleScope(scope_value)
+                            except ValueError as exc:
+                                raise ValueError("reschedule intent has invalid scope") from exc
+                        return Interpretation(
+                            reschedule_request=RescheduleRequest(
+                                target_text=target_text,
+                                due_at=due_at,
+                                offset_minutes=(offset_minutes if has_relative_time else None),
+                                scope=scope,
+                                date_explicit=(
+                                    date_explicit
+                                    if isinstance(date_explicit, bool)
+                                    else isinstance(due_local_value, str)
+                                ),
+                                source_text=text,
+                            ),
+                            response_text=question.strip(),
+                            fallback_allowed=False,
+                        )
                     return Interpretation(response_text=question.strip(), fallback_allowed=False)
                 raise ValueError("provider returned an unsupported reschedule operation")
             if route is IntentRoute.UPDATE_PENDING:
@@ -2497,6 +2631,7 @@ class OpenAICompatibleIntentInterpreter:
                 endpoint_host=endpoint_host,
                 model=self._model,
                 error_type=type(exc).__name__,
+                error_message=str(exc),
             )
             return Interpretation(
                 response_text=(
@@ -2513,7 +2648,12 @@ class ReminderIntentInterpreter:
         self._model = model_interpreter
 
     def interpret_reschedule(
-        self, text: str, *, timezone_name: str, now: datetime
+        self,
+        text: str,
+        *,
+        timezone_name: str,
+        now: datetime,
+        reschedule_candidates: Sequence[dict[str, str]] = (),
     ) -> Any:
         """Return a non-authoritative reschedule proposal from the extractor, if configured."""
 
@@ -2524,8 +2664,58 @@ class ReminderIntentInterpreter:
             selected_route=IntentRoute.RESCHEDULE_REQUEST,
             timezone_name=timezone_name,
             now=now,
+            reschedule_candidates=reschedule_candidates,
         )
-        return result.reschedule_request or result.response_text
+        request = result.reschedule_request
+        if request is not None and request.offset_minutes is not None:
+            normalized = text.lower()
+            if re.search(r"\b(?:back|earlier)\b", normalized):
+                request = replace(request, offset_minutes=-abs(request.offset_minutes))
+            elif re.search(r"\b(?:forward|later)\b", normalized):
+                request = replace(request, offset_minutes=abs(request.offset_minutes))
+        return request or result.response_text
+
+    def interpret_pending_reschedule(
+        self,
+        text: str,
+        *,
+        timezone_name: str,
+        now: datetime,
+        pending_reschedule: Any,
+        reschedule_candidates: Sequence[dict[str, str]] = (),
+        recent_messages: Sequence[str] = (),
+    ) -> Any:
+        """Ask the configured structured extractor about an unfinished move.
+
+        A provider may propose a selection or parameter patch, but this method
+        intentionally does not resolve IDs or make application changes.
+        """
+
+        if self._model is None:
+            return None
+        if isinstance(self._model, OpenAICompatibleIntentInterpreter):
+            result = self._model.interpret(
+                text,
+                selected_route=IntentRoute.RESCHEDULE_REQUEST,
+                timezone_name=timezone_name,
+                now=now,
+                recent_messages=recent_messages,
+                reschedule_candidates=reschedule_candidates,
+                pending_reschedule=pending_reschedule,
+            )
+            return result.pending_reschedule_proposal
+        method = getattr(self._model, "interpret_pending_reschedule", None)
+        if method is None:
+            return None
+        kwargs = {
+            "timezone_name": timezone_name,
+            "now": now,
+            "pending_reschedule": pending_reschedule,
+            "reschedule_candidates": reschedule_candidates,
+            "recent_messages": recent_messages,
+        }
+        parameters = inspect.signature(method).parameters
+        return method(text, **{key: value for key, value in kwargs.items() if key in parameters})
 
     def interpret(
         self,

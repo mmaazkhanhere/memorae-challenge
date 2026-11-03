@@ -32,9 +32,9 @@ def test_router_classifies_pending_conversation_before_parsing() -> None:
 
 
 def test_router_recognizes_read_only_listing_with_or_without_pending_draft() -> None:
-    assert route_message("What do I have tomorrow?", pending=None).route is (
-        ConversationRoute.LIST_REQUEST
-    )
+    for text in ("What do I have tomorrow?", "What reminders do I have tomorrow?"):
+        assert route_message(text, pending=None).route is ConversationRoute.LIST_REQUEST
+        assert route_message(text, pending=_pending()).route is ConversationRoute.LIST_REQUEST
 
 
 def test_router_recognizes_recurring_reminder_list_requests() -> None:
