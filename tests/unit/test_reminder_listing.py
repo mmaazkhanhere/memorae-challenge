@@ -3,7 +3,12 @@ from uuid import UUID
 
 import pytest
 
-from reminder_agent.db.models import Reminder, ReminderOccurrence, User
+from reminder_agent.db.models import (
+    Reminder,
+    ReminderOccurrence,
+    ReminderRecurrenceException,
+    User,
+)
 from reminder_agent.reminder_listing import (
     ListedReminder,
     format_reminder_list,
@@ -316,6 +321,41 @@ def test_existing_recurring_occurrence_suppresses_matching_projected_instance(se
     assert [(item.task, item.due_at) for item in result] == [
         ("weekly review", datetime(2026, 11, 2, 9, tzinfo=timezone.utc))
     ]
+
+
+def test_listing_excludes_unmaterialized_canceled_recurring_instance(session_factory):
+    with session_factory.begin() as db:
+        user = User(name="Ada", timezone="UTC", onboarding_status="ACTIVE")
+        db.add(user)
+        db.flush()
+        reminder = Reminder(
+            user_id=user.id,
+            task="review finances",
+            schedule_type="RECURRING",
+            start_local="2026-11-06T10:00",
+            timezone="UTC",
+            recurrence_rule="FREQ=WEEKLY;BYDAY=FR;BYHOUR=10;BYMINUTE=00",
+            status="ACTIVE",
+        )
+        db.add(reminder)
+        db.flush()
+        db.add(
+            ReminderRecurrenceException(
+                reminder_id=reminder.id,
+                occurrence_date=date(2027, 1, 8),
+            )
+        )
+
+    with session_factory() as db:
+        result = list_reminders_in_range(
+            db,
+            user_id=user.id,
+            start_date=date(2027, 1, 8),
+            end_date=date(2027, 1, 8),
+            timezone_name="UTC",
+        )
+
+    assert result == []
 
 
 def test_listing_includes_only_occurrences_at_the_requested_local_midnight_boundary(

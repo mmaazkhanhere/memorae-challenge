@@ -10,7 +10,11 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from reminder_agent.db.models import Reminder, ReminderOccurrence
+from reminder_agent.db.models import (
+    Reminder,
+    ReminderOccurrence,
+    ReminderRecurrenceException,
+)
 from reminder_agent.recurrence import (
     iter_recurrence_occurrences,
     parse_recurrence_rule,
@@ -110,6 +114,18 @@ def list_reminders_in_range(
     occurrences = db.scalars(
         select(ReminderOccurrence).where(ReminderOccurrence.reminder_id.in_(reminder_ids))
     ).all()
+    exceptions = db.scalars(
+        select(ReminderRecurrenceException).where(
+            ReminderRecurrenceException.reminder_id.in_(reminder_ids),
+            ReminderRecurrenceException.occurrence_date >= start_date,
+            ReminderRecurrenceException.occurrence_date <= end_date,
+        )
+    ).all()
+    exceptions_by_reminder: dict[UUID, set[date]] = {}
+    for exception in exceptions:
+        exceptions_by_reminder.setdefault(exception.reminder_id, set()).add(
+            exception.occurrence_date
+        )
     occurrences_by_reminder: dict[UUID, list[ReminderOccurrence]] = {}
     for occurrence in occurrences:
         occurrences_by_reminder.setdefault(occurrence.reminder_id, []).append(occurrence)
@@ -135,6 +151,7 @@ def list_reminders_in_range(
 
         recurrence = parse_recurrence_rule(reminder.recurrence_rule or "")
         start_local = datetime.fromisoformat(reminder.start_local)
+        skipped_dates = exceptions_by_reminder.get(reminder.id, set())
         projection_now = range_start - timedelta(microseconds=1)
         horizon_days = (end_date - start_date).days + 1
         for _local_date, local_due, due_at in iter_recurrence_occurrences(
@@ -146,6 +163,8 @@ def list_reminders_in_range(
         ):
             due_at = _utc(due_at)
             if not in_requested_window(due_at):
+                continue
+            if _local_date in skipped_dates:
                 continue
             recurrence_key = local_due.replace(tzinfo=None).isoformat(timespec="minutes")
             projected_key = (reminder.id, recurrence_key)
