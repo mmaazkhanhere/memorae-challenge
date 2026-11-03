@@ -7,12 +7,14 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from reminder_agent.intent import PendingReminder
+from reminder_agent.cancellation import is_cancel_command
 
 
 class ConversationRoute(StrEnum):
     NEW_REQUEST = "NEW_REQUEST"
     LIST_REQUEST = "LIST_REQUEST"
     RESCHEDULE_REQUEST = "RESCHEDULE_REQUEST"
+    CANCEL_REQUEST = "CANCEL_REQUEST"
     CLARIFICATION_REPLY = "CLARIFICATION_REPLY"
     CANCELLATION = "CANCELLATION"
     SOCIAL = "SOCIAL"
@@ -122,12 +124,16 @@ def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecisio
             return RouteDecision(ConversationRoute.NEW_REQUEST)
         if is_list_request_command(raw):
             return RouteDecision(ConversationRoute.LIST_REQUEST)
+        if is_cancel_command(raw):
+            return RouteDecision(ConversationRoute.CANCEL_REQUEST)
         if _BARE_CLOCK.fullmatch(raw):
             return RouteDecision(ConversationRoute.UNRELATED)
         return RouteDecision(ConversationRoute.MODEL_FALLBACK)
 
     if normalized in _CANCELLATIONS:
         return RouteDecision(ConversationRoute.CANCELLATION)
+    if is_cancel_command(raw):
+        return RouteDecision(ConversationRoute.CANCEL_REQUEST)
     if normalized in _CONFIRMATION_WORDS:
         return RouteDecision(ConversationRoute.CLARIFICATION_REPLY)
     if normalized in _ACKNOWLEDGEMENTS:
