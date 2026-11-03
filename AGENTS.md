@@ -4,6 +4,10 @@
 
 Read [docs/Architecture.md](docs/Architecture.md) for system behavior, data concepts, channel flows, and reliability constraints; use [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) for the vertical-slice delivery order. The Python/FastAPI application lives under `src/reminder_agent/`, tests under `tests/`, and database migrations under `alembic/`. Operational files such as `docker-compose.yml` and `.env.example` live at the repository root. Keep Telegram, Vapi, and other provider adapters at the channel/integration boundary; put authorization and reminder/memory business rules in shared services.
 
+## Architecture Decision Records
+
+Store Architecture Decision Records (ADRs) in `docs/adr/`, using zero-padded sequential filenames such as `0001-decision-name.md`. ADRs use the title, Status, Date, Context, Decision, Alternatives Considered, Consequences, Implementation References, and Relationship to Original Architecture sections. Use `Accepted` for confirmed decisions; when the original decision date is not reliably known, record the ADR documentation/acceptance date and say so. Use relative Markdown links for related ADRs, distinguish positive consequences from trade-offs, and do not alter an existing ADR unless explicitly requested.
+
 ## Build, Test, and Development Commands
 
 The local workflow is:
