@@ -164,7 +164,12 @@ def resolve_by_occurrence(
 def resolve_latest_delivered(
     db: Session, *, user_id, identity_id, chat_id: int, limit: int = 2
 ) -> list[tuple[ReminderOccurrence, Reminder, Notification]]:
-    """Return at most ``limit`` delivered occurrences for bare acknowledgements."""
+    """Return at most ``limit`` distinct delivered occurrences for bare acknowledgements.
+
+    The row limit must be applied after collapsing historical SENT notifications;
+    otherwise multiple deliveries for one occurrence can hide another eligible
+    occurrence and incorrectly make a bare acknowledgement appear unambiguous.
+    """
 
     candidates = list(
         db.execute(
@@ -172,9 +177,18 @@ def resolve_latest_delivered(
                 db, user_id=user_id, identity_id=identity_id, chat_id=chat_id
             )
             .order_by(Notification.sent_at.desc(), Notification.id.desc())
-            .limit(limit)
         ).all()
     )
+    distinct: list[tuple[ReminderOccurrence, Reminder, Notification]] = []
+    seen_occurrences: set[UUID] = set()
+    for candidate in candidates:
+        occurrence = candidate[0]
+        if occurrence.id in seen_occurrences:
+            continue
+        seen_occurrences.add(occurrence.id)
+        distinct.append(candidate)
+        if len(distinct) >= limit:
+            break
     log_event(
         logger,
         logging.DEBUG,
@@ -183,10 +197,10 @@ def resolve_latest_delivered(
         user_id=str(user_id),
         identity_id=str(identity_id),
         chat_id=chat_id,
-        candidate_count=len(candidates),
+        candidate_count=len(distinct),
         limit=limit,
     )
-    return candidates
+    return distinct
 
 
 def complete_occurrence(

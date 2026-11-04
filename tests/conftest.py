@@ -71,6 +71,12 @@ def session_factory() -> Iterator[sessionmaker[Session]]:
         yield factory
     finally:
         Base.metadata.drop_all(engine)
+        # The fixture creates Alembic's bookkeeping table separately because it
+        # is not part of the ORM metadata. Remove it with the schema so a
+        # subsequent migration run cannot mistake an empty database for a
+        # database at the required revision.
+        with engine.begin() as connection:
+            connection.execute(text("DROP TABLE IF EXISTS alembic_version"))
         engine.dispose()
 
 

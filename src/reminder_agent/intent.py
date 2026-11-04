@@ -31,6 +31,7 @@ _OPERATION_ENVELOPE_KEYS = {
     "SUMMARY",
     "CANCEL_REMINDER",
     "RESCHEDULE_REMINDER",
+    "SNOOZE_OCCURRENCE",
     "UPDATE_PENDING_REMINDER",
     "NEEDS_CLARIFICATION",
     "UNKNOWN",
@@ -103,6 +104,7 @@ class IntentRoute(StrEnum):
     RESCHEDULE_REQUEST = "RESCHEDULE_REQUEST"
     CANCEL_REQUEST = "CANCEL_REQUEST"
     COMPLETE_REQUEST = "COMPLETE_REQUEST"
+    SNOOZE_REQUEST = "SNOOZE_REQUEST"
     UPDATE_PENDING = "UPDATE_PENDING"
     CANCEL_PENDING = "CANCEL_PENDING"
     SOCIAL = "SOCIAL"
@@ -166,6 +168,7 @@ class OpenAICompatibleIntentRouter:
             - RESCHEDULE_REQUEST: Move an existing reminder to a new time.
             - CANCEL_REQUEST: Cancel an existing reminder or recurring series.
             - COMPLETE_REQUEST: Mark one already-delivered reminder occurrence done.
+            - SNOOZE_REQUEST: Postpone one already-delivered reminder occurrence by a positive duration.
             - UPDATE_PENDING: Clarify or modify the pending reminder.
             - CANCEL_PENDING: Cancel the pending reminder.
             - SOCIAL: Casual chat.
@@ -589,6 +592,7 @@ class Interpretation:
     fallback_allowed: bool = True
     clear_context: bool = False
     completion_target_text: str | None = None
+    snooze_duration_seconds: int | None = None
 
     @property
     def resolved_intents(
@@ -1212,6 +1216,19 @@ class RuleBasedIntentInterpreter:
             # Completion is resolved from trusted Telegram delivery context;
             # the extractor must never select an occurrence or invent an ID.
             return Interpretation(fallback_allowed=False)
+        if route is IntentRoute.SNOOZE_REQUEST:
+            from reminder_agent.snooze import parse_snooze_duration
+
+            duration = parse_snooze_duration(raw)
+            if duration is not None:
+                return Interpretation(
+                    snooze_duration_seconds=duration.duration_seconds,
+                    fallback_allowed=False,
+                )
+            return Interpretation(
+                response_text="How long should I snooze that reminder?",
+                fallback_allowed=True,
+            )
         if route is not IntentRoute.UPDATE_PENDING:
             context = None
         # An explicit new reminder command supersedes an unresolved clarification.
@@ -2308,6 +2325,10 @@ class OpenAICompatibleIntentInterpreter:
                 - Do not invent an occurrence ID; the application resolves the target
                   from Telegram delivery context and enforces ownership.
 
+                SNOOZE_REQUEST:
+                - SNOOZE_OCCURRENCE: duration_seconds only, as a positive integer.
+                - Do not return occurrence IDs, user IDs, or delivery destinations.
+
                 RESCHEDULE_REQUEST:
                 - RESCHEDULE_REMINDER: target_text, scope (OCCURRENCE/SERIES),
                 date_explicit, and exactly one of due_local or offset_minutes.
@@ -2446,6 +2467,22 @@ class OpenAICompatibleIntentInterpreter:
                 provider_response=data,
             )
             operation = data.get("operation")
+            if route is IntentRoute.SNOOZE_REQUEST:
+                if operation not in {"SNOOZE_OCCURRENCE", "SNOOZE_REMINDER"}:
+                    raise ValueError("provider returned an unsupported snooze operation")
+                unexpected_fields = set(data) - {"operation", "duration_seconds"}
+                if unexpected_fields:
+                    raise ValueError("snooze intent has unexpected fields")
+                duration_seconds = data.get("duration_seconds")
+                if isinstance(duration_seconds, bool) or not isinstance(duration_seconds, int):
+                    raise ValueError("snooze duration was not an integer")
+                from reminder_agent.snooze import SnoozeDuration
+
+                duration = SnoozeDuration(duration_seconds=duration_seconds)
+                return Interpretation(
+                    snooze_duration_seconds=duration.duration_seconds,
+                    fallback_allowed=False,
+                )
             if route is IntentRoute.LIST_REQUEST and operation in {
                 "LIST_REQUEST",
                 "LIST_REMINDER",
@@ -3145,6 +3182,7 @@ class ReminderIntentInterpreter:
         if (
             result.intent is not None
             or result.intents
+            or result.snooze_duration_seconds is not None
             or self._model is None
             or not result.fallback_allowed
         ):

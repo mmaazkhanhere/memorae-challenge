@@ -33,6 +33,7 @@ from reminder_agent.conversations import (
     pending_reschedule_from_session,
     pending_cancellation_from_session,
     pending_completion_from_session,
+    pending_snooze_from_session,
     session_expired,
     telegram_session_id,
 )
@@ -74,6 +75,14 @@ from reminder_agent.completion import (
     resolve_latest_delivered,
     resolve_by_provider_message,
     resolve_by_occurrence,
+)
+from reminder_agent.snooze import (
+    PendingSnooze,
+    SnoozeDuration,
+    is_snooze_command,
+    parse_snooze_duration,
+    snooze_target_text,
+    snooze_occurrence,
 )
 from reminder_agent.intent import (
     CreateRecurringReminderIntent,
@@ -1490,6 +1499,8 @@ def _route_and_interpret(
             route = ConversationRoute.CANCEL_REQUEST
         elif suggestion is IntentRoute.COMPLETE_REQUEST:
             route = ConversationRoute.COMPLETE_REQUEST
+        elif suggestion is IntentRoute.SNOOZE_REQUEST:
+            route = ConversationRoute.SNOOZE_REQUEST
         elif suggestion is IntentRoute.NEW_REQUEST:
             route = ConversationRoute.NEW_REQUEST
         elif suggestion is IntentRoute.UPDATE_PENDING:
@@ -1573,6 +1584,16 @@ def _route_and_interpret(
             fallback_allowed=False,
             completion_target_text=completion_target_text,
         )
+    elif route is ConversationRoute.SNOOZE_REQUEST:
+        interpretation = _interpret(
+            interpreter,
+            text,
+            selected_route=IntentRoute.SNOOZE_REQUEST,
+            timezone_name=timezone_name,
+            now=now,
+            context=None,
+            recent_messages=recent_messages or [],
+        )
     else:
         selected_route = _selected_intent_route(route, pending=pending)
         interpretation = _interpret(
@@ -1629,7 +1650,7 @@ def _upsert_clarification_session(
     *,
     user_id: UUID,
     external_session_id: str,
-    pending: PendingReminder | PendingCompletion,
+    pending: PendingReminder | PendingCompletion | PendingSnooze,
     now: datetime,
 ) -> ConversationSession:
     values = {
@@ -1799,6 +1820,352 @@ def _handle_completion_follow_up(
         candidate_count=candidate_count,
     )
     return reply
+
+
+def _snooze_duration_from_interpreter(
+    interpreter: IntentInterpreter,
+    text: str,
+    *,
+    timezone_name: str,
+    now: datetime,
+    recent_messages: list[str],
+) -> int | None:
+    """Ask the configured extractor for duration only after rules fail."""
+
+    method = getattr(interpreter, "interpret", None)
+    if method is None:
+        return None
+    kwargs = {"timezone_name": timezone_name, "now": now}
+    parameters = inspect.signature(method).parameters
+    if "selected_route" in parameters:
+        kwargs["selected_route"] = IntentRoute.SNOOZE_REQUEST
+    if "recent_messages" in parameters:
+        kwargs["recent_messages"] = recent_messages
+    try:
+        proposal = method(text, **kwargs)
+    except Exception as exc:  # provider failures are clarification-only
+        log_event(
+            logger,
+            logging.WARNING,
+            "snooze_duration_fallback_failed",
+            reason_type=type(exc).__name__,
+        )
+        return None
+    value = getattr(proposal, "snooze_duration_seconds", None)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _distinct_delivered_candidates(
+    candidates: list[tuple[ReminderOccurrence, Reminder, Notification]],
+) -> list[tuple[ReminderOccurrence, Reminder, Notification]]:
+    """Collapse historical deliveries to one latest row per occurrence."""
+
+    selected: dict[UUID, tuple[ReminderOccurrence, Reminder, Notification]] = {}
+
+    def rank(candidate: tuple[ReminderOccurrence, Reminder, Notification]) -> tuple[int, float]:
+        notification = candidate[2]
+        sent_at = notification.sent_at
+        return (
+            int(notification.sequence),
+            sent_at.timestamp() if sent_at is not None else float("-inf"),
+        )
+
+    for candidate in candidates:
+        occurrence, _reminder, notification = candidate
+        previous = selected.get(occurrence.id)
+        if previous is None or rank(candidate) > rank(previous):
+            selected[occurrence.id] = candidate
+    return list(selected.values())
+
+
+def _handle_snooze_text(
+    db: Session,
+    update: TelegramUpdate,
+    *,
+    user: User,
+    identity: ChannelIdentity,
+    interpreter: IntentInterpreter,
+    now: datetime,
+    pending: PendingSnooze | None = None,
+    recent_messages: list[str] | None = None,
+    session_ttl_seconds: int = 900,
+    proposed_duration_seconds: int | None = None,
+) -> ReminderReply:
+    """Resolve and atomically snooze one already-delivered occurrence."""
+
+    assert update.message is not None
+    text = update.message.text or ""
+    log_event(logger, logging.INFO, "snooze_request_received", update_id=update.update_id,
+              user_id=str(user.id), identity_id=str(identity.id),
+              chat_id=update.message.chat.id, has_pending_context=pending is not None,
+              has_reply_target=update.message.reply_to_message is not None)
+    duration = parse_snooze_duration(text)
+    if duration is None and proposed_duration_seconds is not None:
+        try:
+            duration = SnoozeDuration(duration_seconds=proposed_duration_seconds)
+        except ValueError:
+            duration = None
+    if (
+        duration is None
+        and pending is not None
+        and pending.duration_seconds is None
+        and is_snooze_command(text)
+    ):
+        duration_seconds = _snooze_duration_from_interpreter(
+            interpreter,
+            text,
+            timezone_name=user.timezone or "UTC",
+            now=now,
+            recent_messages=recent_messages or [],
+        )
+        duration = SnoozeDuration(duration_seconds=duration_seconds) if duration_seconds else None
+    if duration is None and pending is not None and pending.duration_seconds is not None:
+        duration = SnoozeDuration(duration_seconds=pending.duration_seconds)
+    log_event(logger, logging.DEBUG, "snooze_duration_resolved", update_id=update.update_id,
+              duration_seconds=duration.duration_seconds if duration is not None else None,
+              source="deterministic" if parse_snooze_duration(text) is not None
+              else "fallback_or_pending" if duration is not None else "unresolved")
+
+    provider_id = (
+        str(update.message.reply_to_message.message_id)
+        if update.message.reply_to_message is not None
+        else None
+    )
+    if pending is not None:
+        candidates: list[tuple[ReminderOccurrence, Reminder, Notification]] = []
+        for occurrence_id in pending.candidate_occurrence_ids:
+            candidates.extend(
+                resolve_by_occurrence(
+                    db,
+                    user_id=user.id,
+                    identity_id=identity.id,
+                    chat_id=update.message.chat.id,
+                    occurrence_id=occurrence_id,
+                )
+            )
+    elif provider_id is not None:
+        candidates = resolve_by_provider_message(
+            db,
+            user_id=user.id,
+            identity_id=identity.id,
+            chat_id=update.message.chat.id,
+            provider_message_id=provider_id,
+        )
+    else:
+        candidates = resolve_latest_delivered(
+            db,
+            user_id=user.id,
+            identity_id=identity.id,
+            chat_id=update.message.chat.id,
+        )
+
+    candidates = _distinct_delivered_candidates(candidates)
+    log_event(logger, logging.DEBUG, "snooze_candidates_resolved", update_id=update.update_id,
+              candidate_count=len(candidates),
+              resolution="pending" if pending is not None else "reply" if provider_id else "latest")
+
+    target_text = snooze_target_text(text)
+    if target_text is None and pending is not None and parse_snooze_duration(text) is None:
+        target_text = text.strip() or None
+    if provider_id is None and target_text and len(candidates) > 1:
+        targeted = match_completion_candidates(target_text, candidates)
+        if len(targeted) == 1:
+            candidates = targeted
+
+    if len(candidates) != 1 or duration is None:
+        if not candidates:
+            response_text = "I couldn't find a delivered reminder to snooze."
+        elif duration is None:
+            response_text = "How long should I snooze that reminder?"
+        else:
+            response_text = "Which delivered reminder should I snooze? Please name it."
+        log_event(logger, logging.INFO, "snooze_clarification_required", update_id=update.update_id,
+                  candidate_count=len(candidates), missing_duration=duration is None)
+        pending_value = None
+        if candidates:
+            pending_value = PendingSnooze(
+                candidate_occurrence_ids=tuple(item[0].id for item in candidates),
+                duration_seconds=duration.duration_seconds if duration is not None else None,
+            )
+        db.rollback()
+        try:
+            with db.begin():
+                existing = _existing_record(db, update)
+                if existing is not None:
+                    log_event(logger, logging.INFO, "snooze_request_replayed", update_id=update.update_id)
+                    return _reply_from_record(existing)
+                locked_session = load_session(
+                    db,
+                    user_id=user.id,
+                    external_session_id=telegram_session_id(update.message.chat.id),
+                    now=now,
+                    ttl_seconds=session_ttl_seconds,
+                    for_update=True,
+                )
+                if pending_value is not None:
+                    _upsert_clarification_session(
+                        db,
+                        user_id=user.id,
+                        external_session_id=telegram_session_id(update.message.chat.id),
+                        pending=pending_value,
+                        now=now,
+                    )
+                elif locked_session is not None:
+                    end_session(locked_session, now=now)
+                return _store_response(
+                    db,
+                    update=update,
+                    user_id=user.id,
+                    text=response_text,
+                    response_kind="snooze_clarification" if pending_value else "snooze_response",
+                    operation="SNOOZE_OCCURRENCE",
+                )
+        except IntegrityError:
+            duplicate = _recover_from_idempotency_race(db, update)
+            if duplicate is not None:
+                return duplicate
+            raise
+
+    selected_occurrence, _reminder, selected_notification = candidates[0]
+    db.rollback()
+    try:
+        with db.begin():
+            existing = _existing_record(db, update)
+            if existing is not None:
+                log_event(logger, logging.INFO, "snooze_request_replayed", update_id=update.update_id)
+                return _reply_from_record(existing)
+            locked_user = db.get(User, user.id)
+            locked_identity = db.get(ChannelIdentity, identity.id)
+            if not _authorized_telegram_identity(
+                locked_user,
+                locked_identity,
+                telegram_user_id=update.message.from_user.id,
+                chat_id=update.message.chat.id,
+            ):
+                log_event(logger, logging.WARNING, "snooze_authorization_failed",
+                          update_id=update.update_id, user_id=str(user.id),
+                          identity_id=str(identity.id))
+                return _store_response(
+                    db,
+                    update=update,
+                    user_id=user.id,
+                    text="I couldn't verify your Telegram account.",
+                    response_kind="authorization_failure",
+                    operation="SNOOZE_OCCURRENCE",
+                )
+            locked_session = load_session(
+                db,
+                user_id=user.id,
+                external_session_id=telegram_session_id(update.message.chat.id),
+                now=now,
+                ttl_seconds=session_ttl_seconds,
+                for_update=True,
+            )
+            result = snooze_occurrence(
+                db,
+                user_id=user.id,
+                identity_id=identity.id,
+                chat_id=update.message.chat.id,
+                occurrence_id=selected_occurrence.id,
+                duration_seconds=duration.duration_seconds,
+                provider_message_id=(
+                    provider_id or selected_notification.provider_message_id
+                ),
+                now=now,
+            )
+            log_event(logger,
+                      logging.INFO if result.outcome == "SNOOZED" else logging.WARNING,
+                      "snooze_request_completed", update_id=update.update_id,
+                      occurrence_id=str(selected_occurrence.id), outcome=result.outcome,
+                      duration_seconds=duration.duration_seconds)
+            if locked_session is not None:
+                end_session(locked_session, now=now)
+            text_result = result.text
+            if result.outcome == "SNOOZED" and result.due_at is not None:
+                task = db.scalar(
+                    select(Reminder.task)
+                    .join(ReminderOccurrence, ReminderOccurrence.reminder_id == Reminder.id)
+                    .where(ReminderOccurrence.id == selected_occurrence.id)
+                ) or "that reminder"
+                text_result = (
+                    f"Snoozed '{task}' until {_local_display(result.due_at, locked_user.timezone)} "
+                    "on Telegram."
+                )
+            return _store_response(
+                db,
+                update=update,
+                user_id=user.id,
+                text=text_result,
+                response_kind="snooze" if result.outcome == "SNOOZED" else "snooze_response",
+                operation="SNOOZE_OCCURRENCE",
+            )
+    except IntegrityError:
+        duplicate = _recover_from_idempotency_race(db, update)
+        if duplicate is not None:
+            return duplicate
+        raise
+
+
+def _end_pending_session(
+    db: Session,
+    update: TelegramUpdate,
+    *,
+    user: User,
+    now: datetime,
+    session_ttl_seconds: int,
+    response_text: str | None = None,
+    response_kind: str = "snooze_canceled",
+    operation: str = "SNOOZE_OCCURRENCE",
+) -> ReminderReply | None:
+    """End any pending clarification under lock, optionally recording a response."""
+
+    assert update.message is not None
+    db.rollback()
+    with db.begin():
+        existing = _existing_record(db, update)
+        if existing is not None:
+            return _reply_from_record(existing)
+        session = load_session(
+            db,
+            user_id=user.id,
+            external_session_id=telegram_session_id(update.message.chat.id),
+            now=now,
+            ttl_seconds=session_ttl_seconds,
+            for_update=True,
+        )
+        if session is not None:
+            end_session(session, now=now)
+        if response_text is None:
+            return None
+        return _store_response(
+            db,
+            update=update,
+            user_id=user.id,
+            text=response_text,
+            response_kind=response_kind,
+            operation=operation,
+        )
+
+
+def _end_pending_snooze(
+    db: Session,
+    update: TelegramUpdate,
+    *,
+    user: User,
+    now: datetime,
+    session_ttl_seconds: int,
+    response_text: str | None = None,
+) -> ReminderReply | None:
+    """End a pending snooze under lock, optionally recording a response."""
+
+    return _end_pending_session(
+        db,
+        update,
+        user=user,
+        now=now,
+        session_ttl_seconds=session_ttl_seconds,
+        response_text=response_text,
+    )
 
 
 def _handle_completion_text(
@@ -2040,6 +2407,21 @@ def handle_reminder_text(
     # never send it through the natural-language extractor.
     text = (update.message.text or "").strip()
     if is_completion_command(text):
+        pending_session = load_session(
+            db,
+            user_id=user.id,
+            external_session_id=telegram_session_id(update.message.chat.id),
+            now=now,
+            ttl_seconds=session_ttl_seconds,
+        )
+        if pending_session is not None:
+            _end_pending_session(
+                db,
+                update,
+                user=user,
+                now=now,
+                session_ttl_seconds=session_ttl_seconds,
+            )
         log_event(
             logger,
             logging.INFO,
@@ -2102,6 +2484,9 @@ def handle_reminder_text(
     pending_completion = (
         None if session_is_expired else pending_completion_from_session(session)
     )
+    pending_snooze = (
+        None if session_is_expired else pending_snooze_from_session(session)
+    )
     text = update.message.text or ""
     recent_messages = _recent_messages(db, user_id=user.id)
     recent_delivered_reminders = _recent_delivered_reminders(
@@ -2121,6 +2506,7 @@ def handle_reminder_text(
         ),
         has_pending_cancellation=pending_cancellation is not None,
         has_pending_completion=pending_completion is not None,
+        has_pending_snooze=pending_snooze is not None,
         recent_message_count=len(recent_messages),
     )
     observed_session_version = None if session_is_expired or session is None else session.version
@@ -2139,6 +2525,78 @@ def handle_reminder_text(
         # requests continue to use durable idempotency below.
         db.rollback()
         return ReminderReply(update.message.chat.id, OUT_OF_SCOPE_RESPONSE)
+
+    # A pending snooze remains in its original operation context unless the
+    # user explicitly starts a new mutation or safely cancels it. Read-only
+    # list/summary requests do not consume the pending question.
+    normalized_text = re.sub(r"[.!?]+$", "", text.strip().casefold()).strip()
+    if is_snooze_command(text) and pending_snooze is None and (
+        pending is not None
+        or pending_reschedule is not None
+        or pending_cancellation is not None
+        or pending_completion is not None
+    ):
+        _end_pending_session(
+            db,
+            update,
+            user=user,
+            now=now,
+            session_ttl_seconds=session_ttl_seconds,
+        )
+        pending = None
+        pending_reschedule = None
+        pending_cancellation = None
+        pending_completion = None
+        observed_session_version = None
+    if pending_snooze is not None and normalized_text in {
+        "cancel",
+        "cancel it",
+        "never mind",
+        "nevermind",
+        "not now",
+    }:
+        return _end_pending_snooze(
+            db,
+            update,
+            user=user,
+            now=now,
+            session_ttl_seconds=session_ttl_seconds,
+            response_text="Okay, I won't snooze that reminder.",
+        )
+    if pending_snooze is not None and (
+        is_new_reminder_command(text)
+        or is_reschedule_command(text)
+        or is_cancel_command(text)
+    ):
+        _end_pending_snooze(
+            db,
+            update,
+            user=user,
+            now=now,
+            session_ttl_seconds=session_ttl_seconds,
+        )
+        pending_snooze = None
+        observed_session_version = None
+    if pending_snooze is not None and (
+        is_list_request_command(text) or is_summary_request_command(text)
+    ):
+        pending_snooze = None
+
+    # Snooze is an occurrence-scoped operation. Handle it before generic
+    # reminder parsing so a delivered acknowledgement cannot become a new
+    # reminder or a reschedule request.
+    if is_snooze_command(text) or pending_snooze is not None:
+        return _handle_snooze_text(
+            db,
+            update,
+            user=user,
+            identity=identity,
+            interpreter=interpreter,
+            now=now,
+            pending=pending_snooze,
+            recent_messages=recent_messages,
+            session_ttl_seconds=session_ttl_seconds,
+        )
     if pending_cancellation is not None and (
         is_list_request_command(text)
         or is_new_reminder_command(text)
@@ -2341,6 +2799,19 @@ def handle_reminder_text(
                 identity=identity,
                 now=now,
                 target_text=interpretation.completion_target_text,
+            )
+        elif route is ConversationRoute.SNOOZE_REQUEST:
+            return _handle_snooze_text(
+                db,
+                update,
+                user=user,
+                identity=identity,
+                interpreter=interpreter,
+                now=now,
+                pending=pending_snooze,
+                recent_messages=recent_messages,
+                session_ttl_seconds=session_ttl_seconds,
+                proposed_duration_seconds=interpretation.snooze_duration_seconds,
             )
     if interpretation is None:
         interpretation = Interpretation(
