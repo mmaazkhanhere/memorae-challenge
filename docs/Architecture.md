@@ -2,7 +2,7 @@
 
 > Cleaned and formatted version of the original challenge planning document. Architecture choices, workflows, open questions, diagrams, and data definitions are preserved; obvious typographical errors and duplicate lines have been tidied.
 
-> **Implementation status:** Sections 1–8 preserve the original design; Section 9 is authoritative for the implementation through VS-10.
+> **Implementation status:** Sections 1–8 preserve the original design; Section 9 is authoritative for the implementation through VS-11.
 
 ## 1. Overview and Scope
 
@@ -76,12 +76,13 @@ Requirements and scope → user workflows and edge cases → domain model and bu
 13. The system shall reschedule an existing reminder to a user-specified time.
 14. The system shall cancel a user-selected reminder or recurring reminder series.
 15. The system shall mark a selected reminder as completed when requested.
-16. The system shall snooze a selected reminder by a user-specified duration.
-17. The system shall store a user-provided fact as a memory item without creating a reminder.
-18. The system shall retrieve a previously stored fact in response to a user's query.
-19. The system shall respond to requests outside its supported capabilities with a predefined scope-limitation message, without executing operations or modifying user data.
-20. The system shall validate every requested operation, its parameters, and the user's authorization before execution, regardless of instructions contained in user input.
-21. The system shall request clarification when it cannot reliably determine a supported intent, without executing an operation.
+16. The system shall answer read-only reminder progress queries, including pending counts, today's remaining tasks, completed counts, and overdue counts.
+17. The system shall snooze a selected reminder by a user-specified duration.
+18. The system shall store a user-provided fact as a memory item without creating a reminder.
+19. The system shall retrieve a previously stored fact in response to a user's query.
+20. The system shall respond to requests outside its supported capabilities with a predefined scope-limitation message, without executing operations or modifying user data.
+21. The system shall validate every requested operation, its parameters, and the user's authorization before execution, regardless of instructions contained in user input.
+22. The system shall request clarification when it cannot reliably determine a supported intent, without executing an operation.
 
 #### Phase 2: Telegram Voice Notes
 
@@ -1017,13 +1018,13 @@ flowchart TB
 
 ```
 
-## 9. Implemented Architecture: VS-01 through VS-10
+## 9. Implemented Architecture: VS-01 through VS-11
 
-This section records the architecture implemented for VS-01 through VS-10 only. It is an implementation supplement to the original design material above: it does not change the existing requirements, workflows, or designs for later slices.
+This section records the architecture implemented for VS-01 through VS-11 only. It is an implementation supplement to the original design material above: it does not change the existing requirements, workflows, or designs for later slices.
 
 ### 9.1 Current Component Architecture
 
-The running system consists of a Telegram webhook adapter, shared reminder application services, PostgreSQL persistence, and a separate worker process. The implemented Telegram path supports onboarding and verified phone linking, one-time and recurring reminders, clarification, unsupported-request responses, listing, rescheduling, and cancellation.
+The running system consists of a Telegram webhook adapter, shared reminder application services, PostgreSQL persistence, and a separate worker process. The implemented Telegram path supports onboarding and verified phone linking, one-time and recurring reminders, clarification, unsupported-request responses, listing, rescheduling, cancellation, and completion of delivered occurrences.
 
 `api.telegram.telegram_webhook` verifies Telegram's webhook secret, validates the incoming `TelegramUpdate`, and calls `onboarding.handle_update`. Once onboarding is active, that function delegates text requests to `reminders.handle_reminder_text`. The handler resolves the trusted Telegram identity, checks idempotency, applies request policy, and then invokes the appropriate service. It does not accept user-supplied identifiers as authority.
 
@@ -1056,6 +1057,7 @@ Implemented service boundaries are deliberately small and operation-specific:
 
 - `onboarding.py` creates Telegram identities, collects time zones, and verifies self-shared phone contacts.
 - `reminders.py` is the Telegram orchestration boundary for creation, clarification, listing, rescheduling, and cancellation.
+- `completion.py` resolves and completes only an owned, already-delivered occurrence.
 - `reminder_listing.py`, `rescheduling.py`, and `cancellation.py` implement owned-reminder lookup, candidate selection, grounding, and transactional change rules.
 - `recurrence_service.py` materializes upcoming recurring instances.
 - `worker.py` contains `NotificationWorker` and `ConfirmationWorker`.
@@ -1064,6 +1066,8 @@ Implemented service boundaries are deliberately small and operation-specific:
 
 Natural-language processing is a deterministic-first hybrid, not a generic command interpreter. The LLM, when configured, proposes a narrow typed classification or parameter result; it never authorizes an operation or writes data itself.
 
+**Mandatory project-wide invariant.** This is the required processing architecture for every current and future vertical slice and supported channel, not a Telegram-only implementation detail. A channel adapter must authenticate its input and resolve the canonical user, then use shared conversation and application services. It must not bypass this sequence, duplicate business logic, or allow an LLM to mutate data. Any change to this invariant requires explicit approval from the project owner before implementation.
+
 The primary execution order for a Telegram text request is:
 
 1. The webhook authenticates and validates the update; `handle_update` resolves the Telegram identity.
@@ -1071,33 +1075,51 @@ The primary execution order for a Telegram text request is:
 3. `conversation_router.route_message` makes a deterministic routing decision from the text and any pending creation context.
 4. Only a `MODEL_FALLBACK` route calls `OpenAICompatibleIntentRouter.classify`, when a router is configured.
 5. The selected route reaches the applicable deterministic parser: `RuleBasedIntentInterpreter`, listing parsing, `parse_reschedule_request`, or `parse_cancellation_request`.
+   A `COMPLETE_REQUEST` route bypasses extraction and resolves the delivered occurrence from trusted Telegram context.
 6. If that parser permits fallback, `ReminderIntentInterpreter` can ask its configured extraction adapter for a structured proposal. Rescheduling and cancellation first parse and find owned candidates deterministically; their contextual model proposals remain non-authoritative.
 7. Parsers, grounding functions, typed Pydantic schemas, and application services validate the result before a transaction changes data. Insufficient information becomes a clarification; unsupported or unsafe input becomes a non-mutating response.
 
 There is no single centralized verifier. Verification is distributed across the parsers and typed schemas in `intent.py`, `restrict_to_explicit_field_updates`, candidate and grounding functions in `rescheduling.py` and `cancellation.py`, identity/ownership checks in `reminders.py`, and eligibility checks in `worker.py`.
 
-**Telegram message interpretation flow.** This is the primary request-processing view. The LLM paths are fallback branches; a deterministic result does not call either LLM.
+**Mandatory processing pipeline.** This is the primary request-processing view for Telegram text, Telegram voice-note transcripts, Vapi utterances, and future supported channels. The LLM paths are fallback branches; a deterministic result does not call either LLM. `Clarify` persists or updates the typed pending context and returns the focused validated question in the response format appropriate to the channel. `Scope` returns the predefined scope-limitation response without mutation.
 
 ```mermaid
 flowchart TD
-    MSG[Telegram message] --> ROUTER[Deterministic intent router]
-    ROUTER -->|recognized command| PARSE[Deterministic parameter parser]
-    ROUTER -->|ambiguous command| ROUTE{Intent LLM enabled?}
-    ROUTER -->|social or unrelated| SAFE[Safe non-mutating response]
-    ROUTE -->|yes| INTENT[Intent LLM]
-    ROUTE -->|no| RESP[Clarify or reject]
-    INTENT -->|supported intent| PARSE
-    INTENT -->|unclear or invalid| RESP
+    IN[Channel message or voice transcript] --> AUTH[Authenticate channel and resolve canonical user]
+    AUTH --> CONTEXT[Load relevant history and pending clarification state]
+    CONTEXT --> PENDING{Pending operation exists?}
+    PENDING -->|reply| CONTINUE[Resolve reply in its original operation context]
+    PENDING -->|explicit new request| SUPERSEDE[Safely supersede pending operation]
+    PENDING -->|safe cancellation| CANCEL[Cancel pending operation without mutation]
+    PENDING -->|no| ROUTER[Deterministic intent routing]
+    CONTINUE --> ROUTER
+    SUPERSEDE --> ROUTER
+    CANCEL --> RESPONSE[Channel-appropriate response]
 
-    PARSE --> PARAMS{Typed parameters found?}
-    PARAMS -->|yes| VALIDATE[Validate and ground]
-    PARAMS -->|no, fallback enabled| EXTRACT[Extraction LLM]
-    PARAMS -->|no, fallback unavailable| RESP
-    EXTRACT -->|proposal| VALIDATE
-    EXTRACT -->|invalid or failed| RESP
+    ROUTER -->|clear supported intent| PARSE[Deterministic parameter extraction]
+    ROUTER -->|insufficient certainty| CLASSIFY{Existing classifier available?}
+    ROUTER -->|clearly unsupported| SCOPE[Predefined scope-limitation response]
+    CLASSIFY -->|yes| LLM_INTENT[LLM: typed intent proposal only]
+    CLASSIFY -->|no| CLARIFY[Clarify without mutation]
+    LLM_INTENT -->|supported intent| PARSE
+    LLM_INTENT -->|uncertain or invalid| CLARIFY
+    LLM_INTENT -->|unsupported| SCOPE
 
-    VALIDATE -->|valid and authorized| EXECUTE[Execute operation]
-    VALIDATE -->|missing, unsafe, or unsupported| RESP
+    PARSE -->|complete, typed parameters| VERIFY[Deterministic verification and grounding]
+    PARSE -->|incomplete or unreliable| EXTRACT{Existing extractor available?}
+    EXTRACT -->|yes| LLM_EXTRACT[LLM: typed parameter proposal only]
+    EXTRACT -->|no| CLARIFY
+    LLM_EXTRACT --> VERIFY
+
+    VERIFY -->|schema, time, ownership, authorization, target, state, and rules valid| EXECUTE[Shared application service]
+    VERIFY -->|missing or ambiguous| CLARIFY
+    VERIFY -->|unsupported, unsafe, or invalid| SCOPE
+    EXECUTE --> COMMIT[Transactional, idempotent commit]
+    COMMIT --> CONFIRM[Confirmation from committed result only]
+    CLARIFY --> SAVE[Persist or retain validated pending context]
+    SAVE --> RESPONSE
+    SCOPE --> RESPONSE
+    CONFIRM --> RESPONSE
 ```
 
 `conversation_router.py` performs the first routing decision. `intent.py` provides the deterministic parser and optional OpenAI-compatible classifiers/extractors. Grounding and authorization remain distributed across `reminders.py`, `rescheduling.py`, `cancellation.py`, and the worker checks; no single verifier is implied.
@@ -1224,3 +1246,32 @@ flowchart TD
 ```
 
 `recurrence_service.py` creates future work. `NotificationWorker` in `worker.py` claims due notifications with leases, rechecks eligibility, and records `SENT`, retryable, `FAILED`, or `UNKNOWN` outcomes. `UNKNOWN` preserves provider uncertainty rather than claiming exactly-once delivery.
+
+### 9.7 Delivered-occurrence completion (VS-11)
+
+VS-11 adds completion without changing the persistence schema. The existing
+`provider_message_id`, occurrence state, reminder state, Telegram identity, and
+idempotency records are sufficient to ground the operation.
+
+Telegram reminder notifications include a signed inline `Done` callback. The
+webhook validates the callback signature, private chat, sender identity, linked
+Telegram destination, occurrence ownership, and the callback message's stored
+provider message ID before changing state. A textual `Done` reply uses the
+replied-to Telegram `message_id` as the preferred lookup. A bare completion
+phrase is accepted only when exactly one eligible delivered occurrence exists;
+zero or multiple candidates result in clarification and no mutation.
+
+The completion service locks the occurrence and delivered notification, then
+rechecks ownership and delivery before setting the occurrence to `COMPLETED`.
+For a one-time reminder it also completes the parent reminder; for a recurring
+reminder the parent series remains `ACTIVE`. The service does not commit by
+itself: the state transition and the Telegram update's `IdempotencyRecord` are
+committed together. Replayed updates return the stored response and do not
+repeat the state change. Callback-query acknowledgement is best-effort UI
+feedback and is independent of the durable completion transaction.
+
+Completion is deterministic. The intent classifier knows the
+`COMPLETE_REQUEST` route, but the application does not use an LLM-generated
+occurrence ID or target as authority. The extractor prompt documents the
+completion operation for route consistency, while the actual completion path
+bypasses extraction and resolves only from trusted Telegram delivery context.

@@ -38,7 +38,7 @@ Production startup fails fast unless `DATABASE_URL` uses PostgreSQL,
 least 32 characters. The sample placeholders and local SQLite defaults are intended only for
 injected test applications. `/ready` also verifies that the domain tables exist, so a stale
 `alembic_version` row cannot make an empty database appear healthy. Readiness also requires the
-current migration head (`0013_recurring_occurrence_keys`) and the worker/confirmation claim
+current migration head (`0014_recurrence_exceptions`) and the worker/confirmation claim
 columns, so a partially migrated database is rejected before webhooks are accepted.
 The additive schema-repair migrations also rebuild missing domain tables when a
 database was reset without resetting its Alembic version row.
@@ -95,6 +95,22 @@ is already `SENDING`. Canceled reminders and occurrences are excluded by the exi
 eligibility checks, so no stale pending notification is delivered after a committed cancellation.
 Indirect cancellation language can be routed by the configured intent model; the model may only
 propose target text and scope, while the backend resolves owned candidates and performs the write.
+
+VS-11 supports marking a delivered occurrence done from Telegram. Reminder notifications include
+a signed `Done` button, and replying `Done` to the original notification uses Telegram's stored
+provider message ID. A bare `Done` is accepted only when exactly one delivered occurrence is
+eligible; otherwise the bot asks which reminder was intended. Completion locks and rechecks the
+owned delivered occurrence, completes the parent only for a one-time reminder, and leaves a
+recurring series active. The occurrence state change and Telegram update idempotency response are
+committed together, so replaying a message or button callback is safe. Callback signatures,
+sender identity, private chat, and notification destination are all validated; callback UI
+acknowledgement is best-effort and does not determine completion success.
+
+Telegram also supports read-only progress questions such as `How many reminders are pending?`,
+`What do I still have to do today?`, `How many tasks have I completed?`, and overdue counts.
+These summaries are computed from the authenticated user's own reminder occurrences; delivered
+but uncompleted reminders remain outstanding, and recurring instances are projected for today's
+view when they have not yet been materialized.
 
 The same worker also retries durable Telegram confirmations that failed after the inbound
 command was committed. Confirmation responses are stored with the idempotency record, retried
@@ -156,7 +172,8 @@ cause. Confirmation events include `confirmation_claimed`, `confirmation_deliver
 `confirmation_delivery_failed`, `confirmation_delivery_outcome_recorded`, and
 `confirmation_delivered`. VS-10 adds `cancellation_command_started`,
 `cancellation_clarification_saved`, `cancellation_extraction_failed`, `reminder_canceled`, and
-`reminder_cancellation_conflict`. Logs never contain tokens, secrets, prompts, reminder text, or personal
+`reminder_cancellation_conflict`. VS-11 adds `completion_target_ambiguous`,
+`reminder_occurrence_completed`, and `telegram_callback_acknowledgement_failed`. Logs never contain tokens, secrets, prompts, reminder text, or personal
 data.
 
 Telegram webhook updates are idempotent. Each update gets one logical outbound response. A
