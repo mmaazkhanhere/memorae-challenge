@@ -8,6 +8,7 @@ from enum import StrEnum
 
 from reminder_agent.intent import PendingReminder
 from reminder_agent.cancellation import is_cancel_command
+from reminder_agent.snooze import is_snooze_command
 
 
 class ConversationRoute(StrEnum):
@@ -17,6 +18,7 @@ class ConversationRoute(StrEnum):
     RESCHEDULE_REQUEST = "RESCHEDULE_REQUEST"
     CANCEL_REQUEST = "CANCEL_REQUEST"
     COMPLETE_REQUEST = "COMPLETE_REQUEST"
+    SNOOZE_REQUEST = "SNOOZE_REQUEST"
     CLARIFICATION_REPLY = "CLARIFICATION_REPLY"
     CANCELLATION = "CANCELLATION"
     SOCIAL = "SOCIAL"
@@ -139,6 +141,8 @@ def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecisio
 
     if is_completion_command(raw):
         return RouteDecision(ConversationRoute.COMPLETE_REQUEST)
+    if is_snooze_command(raw):
+        return RouteDecision(ConversationRoute.SNOOZE_REQUEST)
 
     # An acknowledgement is conversational only when there is no active
     # clarification.  With pending context it must be interpreted as an answer
