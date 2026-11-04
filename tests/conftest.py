@@ -18,10 +18,14 @@ class FakeTelegramClient:
     def __init__(self) -> None:
         self.messages: list[tuple[int, str]] = []
         self.reply_markups: list[dict | None] = []
+        self.callback_acknowledgements: list[str] = []
 
     def send_message(self, chat_id: int, text: str, *, reply_markup=None) -> None:
         self.messages.append((chat_id, text))
         self.reply_markups.append(reply_markup)
+
+    def answer_callback_query(self, callback_query_id: str) -> None:
+        self.callback_acknowledgements.append(callback_query_id)
 
 
 @pytest.fixture()
