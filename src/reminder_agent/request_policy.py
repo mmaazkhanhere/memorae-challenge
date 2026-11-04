@@ -57,13 +57,6 @@ _OUT_OF_SCOPE_PATTERNS = (
         r"math|stock price|sports score|write code|debug code)\b",
         re.IGNORECASE,
     ),
-    # Snoozing remains deferred until VS-12. Completion is implemented by VS-11
-    # through a deterministic, occurrence-scoped application service.
-    re.compile(
-        r"\bsnooze\b.*\b(?:reminder|reminders|standup|meeting|task)\b|"
-        r"\b(?:reminder|reminders)\b.*\bsnooze\b",
-        re.IGNORECASE,
-    ),
     re.compile(r"\bremember\b", re.IGNORECASE),
 )
 
@@ -105,4 +98,5 @@ def is_supported_operation(operation: object) -> bool:
         "RESCHEDULE_REMINDER",
         "CANCEL_REMINDER",
         "COMPLETE_REMINDER",
+        "SNOOZE_OCCURRENCE",
     }
