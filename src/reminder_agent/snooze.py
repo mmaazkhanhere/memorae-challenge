@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import logging
 import re
 from typing import Literal
 from uuid import UUID
@@ -13,6 +14,9 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from reminder_agent.db.models import ChannelIdentity, Notification, Reminder, ReminderOccurrence
+from reminder_agent.observability import get_logger, log_event
+
+logger = get_logger()
 
 TELEGRAM = "TELEGRAM"
 LINKED = "LINKED"
@@ -143,7 +147,19 @@ def snooze_occurrence(
         now = now.replace(tzinfo=timezone.utc)
     else:
         now = now.astimezone(timezone.utc)
+    log_event(
+        logger,
+        logging.INFO,
+        "snooze_mutation_started",
+        user_id=str(user_id),
+        identity_id=str(identity_id),
+        chat_id=chat_id,
+        occurrence_id=str(occurrence_id),
+        duration_seconds=duration_seconds,
+        has_provider_message_id=provider_message_id is not None,
+    )
     if duration_seconds <= 0:
+        log_event(logger, logging.INFO, "snooze_mutation_rejected", outcome="INVALID_DURATION")
         return SnoozeResult("INVALID_DURATION", "Please provide a positive snooze duration.")
     due_at = now + timedelta(seconds=duration_seconds)
 
@@ -163,10 +179,25 @@ def snooze_occurrence(
         .with_for_update()
     )
     if identity is None or occurrence is None:
+        log_event(
+            logger,
+            logging.INFO,
+            "snooze_mutation_rejected",
+            outcome="NOT_FOUND",
+            occurrence_id=str(occurrence_id),
+        )
         return SnoozeResult("NOT_FOUND", "I couldn't find that delivered reminder to snooze.")
 
     reminder = db.get(Reminder, occurrence.reminder_id)
     if reminder is None or reminder.status != ACTIVE or occurrence.status != NOTIFIED:
+        log_event(
+            logger,
+            logging.INFO,
+            "snooze_mutation_rejected",
+            outcome="NOT_ELIGIBLE",
+            occurrence_id=str(occurrence_id),
+            occurrence_status=occurrence.status,
+        )
         return SnoozeResult("NOT_ELIGIBLE", "That reminder is no longer available to snooze.")
 
     delivery_filters = [
@@ -180,6 +211,13 @@ def snooze_occurrence(
         select(Notification).where(*delivery_filters).with_for_update()
     )
     if delivered is None:
+        log_event(
+            logger,
+            logging.INFO,
+            "snooze_mutation_rejected",
+            outcome="NOT_DELIVERED",
+            occurrence_id=str(occurrence_id),
+        )
         return SnoozeResult(
             "NOT_DELIVERED", "That reminder was not delivered to this Telegram chat."
         )
@@ -200,6 +238,15 @@ def snooze_occurrence(
             status=PENDING,
             created_at=now,
         )
+    )
+    log_event(
+        logger,
+        logging.INFO,
+        "snooze_mutation_staged",
+        outcome="SNOOZED",
+        occurrence_id=str(occurrence.id),
+        notification_sequence=int(max_sequence) + 1,
+        due_at=due_at.isoformat(),
     )
     return SnoozeResult(
         "SNOOZED",

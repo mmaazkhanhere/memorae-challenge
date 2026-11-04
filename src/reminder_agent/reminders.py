@@ -1895,6 +1895,10 @@ def _handle_snooze_text(
 
     assert update.message is not None
     text = update.message.text or ""
+    log_event(logger, logging.INFO, "snooze_request_received", update_id=update.update_id,
+              user_id=str(user.id), identity_id=str(identity.id),
+              chat_id=update.message.chat.id, has_pending_context=pending is not None,
+              has_reply_target=update.message.reply_to_message is not None)
     duration = parse_snooze_duration(text)
     if duration is None and proposed_duration_seconds is not None:
         try:
@@ -1917,6 +1921,10 @@ def _handle_snooze_text(
         duration = SnoozeDuration(duration_seconds=duration_seconds) if duration_seconds else None
     if duration is None and pending is not None and pending.duration_seconds is not None:
         duration = SnoozeDuration(duration_seconds=pending.duration_seconds)
+    log_event(logger, logging.DEBUG, "snooze_duration_resolved", update_id=update.update_id,
+              duration_seconds=duration.duration_seconds if duration is not None else None,
+              source="deterministic" if parse_snooze_duration(text) is not None
+              else "fallback_or_pending" if duration is not None else "unresolved")
 
     provider_id = (
         str(update.message.reply_to_message.message_id)
@@ -1952,6 +1960,9 @@ def _handle_snooze_text(
         )
 
     candidates = _distinct_delivered_candidates(candidates)
+    log_event(logger, logging.DEBUG, "snooze_candidates_resolved", update_id=update.update_id,
+              candidate_count=len(candidates),
+              resolution="pending" if pending is not None else "reply" if provider_id else "latest")
 
     target_text = snooze_target_text(text)
     if target_text is None and pending is not None and parse_snooze_duration(text) is None:
@@ -1968,6 +1979,8 @@ def _handle_snooze_text(
             response_text = "How long should I snooze that reminder?"
         else:
             response_text = "Which delivered reminder should I snooze? Please name it."
+        log_event(logger, logging.INFO, "snooze_clarification_required", update_id=update.update_id,
+                  candidate_count=len(candidates), missing_duration=duration is None)
         pending_value = None
         if candidates:
             pending_value = PendingSnooze(
@@ -1979,6 +1992,7 @@ def _handle_snooze_text(
             with db.begin():
                 existing = _existing_record(db, update)
                 if existing is not None:
+                    log_event(logger, logging.INFO, "snooze_request_replayed", update_id=update.update_id)
                     return _reply_from_record(existing)
                 locked_session = load_session(
                     db,
@@ -2018,6 +2032,7 @@ def _handle_snooze_text(
         with db.begin():
             existing = _existing_record(db, update)
             if existing is not None:
+                log_event(logger, logging.INFO, "snooze_request_replayed", update_id=update.update_id)
                 return _reply_from_record(existing)
             locked_user = db.get(User, user.id)
             locked_identity = db.get(ChannelIdentity, identity.id)
@@ -2027,6 +2042,9 @@ def _handle_snooze_text(
                 telegram_user_id=update.message.from_user.id,
                 chat_id=update.message.chat.id,
             ):
+                log_event(logger, logging.WARNING, "snooze_authorization_failed",
+                          update_id=update.update_id, user_id=str(user.id),
+                          identity_id=str(identity.id))
                 return _store_response(
                     db,
                     update=update,
@@ -2055,6 +2073,11 @@ def _handle_snooze_text(
                 ),
                 now=now,
             )
+            log_event(logger,
+                      logging.INFO if result.outcome == "SNOOZED" else logging.WARNING,
+                      "snooze_request_completed", update_id=update.update_id,
+                      occurrence_id=str(selected_occurrence.id), outcome=result.outcome,
+                      duration_seconds=duration.duration_seconds)
             if locked_session is not None:
                 end_session(locked_session, now=now)
             text_result = result.text
