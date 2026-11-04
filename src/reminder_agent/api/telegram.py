@@ -142,6 +142,7 @@ def telegram_webhook(
             intent_router=request.app.state.intent_router,
             now=request.app.state.clock(),
             session_ttl_seconds=request.app.state.settings.conversation_session_ttl_seconds,
+            callback_secret=request.app.state.settings.telegram_webhook_secret,
         )
         log_event(
             logger,
@@ -159,6 +160,28 @@ def telegram_webhook(
                 "telegram_update_duplicate",
                 update_id=update.update_id,
             )
+        client = None
+        if reply is not None and update.callback_query is not None:
+            client = request.app.state.telegram_client or HttpTelegramClient(
+                request.app.state.settings.telegram_bot_token,
+                request.app.state.settings.telegram_api_timeout_seconds,
+            )
+            acknowledge_callback = getattr(client, "answer_callback_query", None)
+            if callable(acknowledge_callback):
+                try:
+                    acknowledge_callback(update.callback_query.id)
+                except TelegramAPIError as exc:
+                    # Callback acknowledgement is only UI feedback. The
+                    # completion mutation and durable response must still
+                    # be delivered even if this best-effort call fails.
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "telegram_callback_acknowledgement_failed",
+                        update_id=update.update_id,
+                        failure_kind=exc.failure_kind,
+                        provider_status_code=exc.status_code,
+                    )
         if reply is not None and reply.should_send:
             if reply.idempotency_key is not None and not claim_delivery(db, reply.idempotency_key):
                 log_event(
@@ -176,10 +199,11 @@ def telegram_webhook(
                 update_id=update.update_id,
             )
             try:
-                client = request.app.state.telegram_client or HttpTelegramClient(
-                    request.app.state.settings.telegram_bot_token,
-                    request.app.state.settings.telegram_api_timeout_seconds,
-                )
+                if client is None:
+                    client = request.app.state.telegram_client or HttpTelegramClient(
+                        request.app.state.settings.telegram_bot_token,
+                        request.app.state.settings.telegram_api_timeout_seconds,
+                    )
                 _send_reply_with_retry(
                     client,
                     reply,

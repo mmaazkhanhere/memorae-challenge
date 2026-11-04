@@ -39,7 +39,7 @@ class Settings(BaseSettings):
 
 
 def validate_runtime_settings(settings: Settings, *, allow_local_database: bool = False) -> None:
-    """Reject deployment defaults that are unsafe for a production process."""
+    """Reject unsafe production settings while preserving local/test mode."""
     if allow_local_database:
         return
 
@@ -55,6 +55,9 @@ def validate_runtime_settings(settings: Settings, *, allow_local_database: bool 
     scheme = urlparse(settings.database_url).scheme.lower()
     if not scheme.startswith("postgresql"):
         errors.append("DATABASE_URL must use PostgreSQL in production")
+
+    if not (settings.llm_api_key or "").strip():
+        errors.append("LLM_API_KEY must be configured before production startup")
 
     if errors:
         raise RuntimeError("Invalid production configuration: " + "; ".join(errors))

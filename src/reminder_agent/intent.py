@@ -22,6 +22,19 @@ logger = get_logger()
 
 
 _STRICT_CANCELLATION_MODELS = {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}
+_OPERATION_ENVELOPE_KEYS = {
+    "CREATE_ONE_TIME_REMINDER",
+    "CREATE_ONE_TIME_REMINDERS",
+    "CREATE_RECURRING_REMINDER",
+    "LIST_REMINDERS",
+    "LIST_REQUEST",
+    "SUMMARY",
+    "CANCEL_REMINDER",
+    "RESCHEDULE_REMINDER",
+    "UPDATE_PENDING_REMINDER",
+    "NEEDS_CLARIFICATION",
+    "UNKNOWN",
+}
 _CANCELLATION_JSON_SCHEMA = {
     "name": "cancellation_request",
     "strict": True,
@@ -86,8 +99,10 @@ def extract_listing_task_query(text: str) -> str | None:
 class IntentRoute(StrEnum):
     NEW_REQUEST = "NEW_REQUEST"
     LIST_REQUEST = "LIST_REQUEST"
+    SUMMARY_REQUEST = "SUMMARY_REQUEST"
     RESCHEDULE_REQUEST = "RESCHEDULE_REQUEST"
     CANCEL_REQUEST = "CANCEL_REQUEST"
+    COMPLETE_REQUEST = "COMPLETE_REQUEST"
     UPDATE_PENDING = "UPDATE_PENDING"
     CANCEL_PENDING = "CANCEL_PENDING"
     SOCIAL = "SOCIAL"
@@ -101,6 +116,7 @@ class IntentRouteSuggestion(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     operation: IntentRoute
+    target_text: str | None = None
 
 
 class IntentRouter(Protocol):
@@ -110,6 +126,7 @@ class IntentRouter(Protocol):
         *,
         pending: "PendingReminder | None",
         recent_messages: Sequence[str],
+        recent_delivered_reminders: Sequence[dict[str, str]] = (),
     ) -> IntentRouteSuggestion: ...
 
 
@@ -128,6 +145,7 @@ class OpenAICompatibleIntentRouter:
         *,
         pending: "PendingReminder | None",
         recent_messages: Sequence[str],
+        recent_delivered_reminders: Sequence[dict[str, str]] = (),
     ) -> IntentRouteSuggestion:
         relevant_history = list(recent_messages)[-6:]
         log_event(
@@ -144,18 +162,20 @@ class OpenAICompatibleIntentRouter:
 
             - NEW_REQUEST: Separate reminder, even if one is pending.
             - LIST_REQUEST: Retrieve reminders.
+            - SUMMARY_REQUEST: Count or summarize pending, remaining, completed, or overdue work.
             - RESCHEDULE_REQUEST: Move an existing reminder to a new time.
             - CANCEL_REQUEST: Cancel an existing reminder or recurring series.
+            - COMPLETE_REQUEST: Mark one already-delivered reminder occurrence done.
             - UPDATE_PENDING: Clarify or modify the pending reminder.
             - CANCEL_PENDING: Cancel the pending reminder.
             - SOCIAL: Casual chat.
             - UNRELATED: Non-reminder request.
             - UNCERTAIN: Ambiguous intent.
 
-            Use pending state and conversation context. Distinguish new requests from pending updates by meaning, not keywords. If unclear, return UNCERTAIN.
+            Use pending state, conversation context, and trusted recently-delivered reminders. If the message refers to a specific task, return that task in target_text. If multiple delivered reminders exist and no target is clear, return UNCERTAIN. If unclear, return UNCERTAIN.
 
             Do not extract fields or execute actions.
-            Return JSON only: {"operation": "<OPERATION>"}.
+            Return JSON only: {"operation": "<OPERATION>", "target_text": "<task or null>"}.
             """
         )
         payload = {
@@ -173,6 +193,7 @@ class OpenAICompatibleIntentRouter:
                                 recent_messages
                             ),
                             "recent_messages": relevant_history,
+                            "recent_delivered_reminders": list(recent_delivered_reminders),
                         }
                     ),
                 },
@@ -180,6 +201,16 @@ class OpenAICompatibleIntentRouter:
             "temperature": 0,
             "response_format": {"type": "json_object"},
         }
+        log_event(
+            logger,
+            logging.INFO,
+            "intent_classification_input",
+            model=self._model,
+            latest_message=text[:500],
+            active_pending=bool(pending),
+            recent_messages=relevant_history,
+            recent_delivered_reminders=list(recent_delivered_reminders),
+        )
         try:
             response = httpx.post(
                 self._url,
@@ -197,6 +228,7 @@ class OpenAICompatibleIntentRouter:
                 "intent_classification_completed",
                 model=self._model,
                 operation=suggestion.operation,
+                provider_response=data,
             )
             return suggestion
         except (httpx.HTTPError, KeyError, TypeError, ValueError, ValidationError, json.JSONDecodeError):
@@ -360,6 +392,32 @@ class ListRemindersIntent(BaseModel):
             raise ValueError("date range is too large")
         return self
 
+
+class ReminderSummaryIntent(BaseModel):
+    """A read-only request for reminder progress or task counts."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    operation: Literal["SUMMARY"] = "SUMMARY"
+    metric: Literal[
+        "PENDING_COUNT",
+        "TODAY_REMAINING",
+        "COMPLETED_COUNT",
+        "TODAY_COMPLETED",
+        "OVERDUE_COUNT",
+    ]
+    timezone_name: str = Field(min_length=1, max_length=150)
+
+    @field_validator("timezone_name")
+    @classmethod
+    def timezone_must_be_valid(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except Exception as exc:
+            raise ValueError("timezone_name must be a valid IANA timezone") from exc
+        return value
+
+
 class PendingReminder(BaseModel):
     """Validated, serializable partial data for a one-time or weekly reminder."""
 
@@ -509,10 +567,18 @@ def _last_clarification_question(recent_messages: Sequence[str]) -> str | None:
 @dataclass(frozen=True)
 class Interpretation:
     intent: (
-        CreateOneTimeReminderIntent | CreateRecurringReminderIntent | ListRemindersIntent | None
+        CreateOneTimeReminderIntent
+        | CreateRecurringReminderIntent
+        | ListRemindersIntent
+        | ReminderSummaryIntent
+        | None
     ) = None
     intents: tuple[
-        CreateOneTimeReminderIntent | CreateRecurringReminderIntent | ListRemindersIntent, ...
+        CreateOneTimeReminderIntent
+        | CreateRecurringReminderIntent
+        | ListRemindersIntent
+        | ReminderSummaryIntent,
+        ...
     ] = ()
     clarification: NeedsClarification | None = None
     field_updates: PendingReminderFieldUpdate | None = None
@@ -522,12 +588,17 @@ class Interpretation:
     response_text: str | None = None
     fallback_allowed: bool = True
     clear_context: bool = False
+    completion_target_text: str | None = None
 
     @property
     def resolved_intents(
         self,
     ) -> tuple[
-        CreateOneTimeReminderIntent | CreateRecurringReminderIntent | ListRemindersIntent, ...
+        CreateOneTimeReminderIntent
+        | CreateRecurringReminderIntent
+        | ListRemindersIntent
+        | ReminderSummaryIntent,
+        ...
     ]:
         """Return one or more validated commands represented by this result."""
         if self.intents:
@@ -1091,6 +1162,13 @@ class RuleBasedIntentInterpreter:
         r"what\s+is\s+scheduled|anything\s+coming\s+up)\b",
         re.IGNORECASE,
     )
+    _summary_request = re.compile(
+        r"^\s*(?:(?:how\s+many|what\s+is\s+the\s+number\s+of).*(?:pending|outstanding|unfinished|overdue|completed|done|finished)(?:.*(?:today|this\s+day))?"
+        r"|(?:what|which|show|list).*(?:still\s+have\s+to\s+do|have\s+left|remaining).*(?:today|this\s+day)"
+        r"|(?:what|which|show|list).*(?:today|this\s+day).*(?:still\s+have\s+to\s+do|have\s+left|remaining)"
+        r"|(?:what|which|show|list).*(?:completed|done|finished).*(?:today|this\s+day))\s*[?!.]*\s*$",
+        re.IGNORECASE,
+    )
     _list_range = re.compile(
         r"\b(?:from|between)\s+(?P<start>today|tomorrow|monday|tuesday|wednesday|"
         r"thursday|friday|saturday|sunday|\d{4}-\d{2}-\d{2})\s+"
@@ -1122,6 +1200,18 @@ class RuleBasedIntentInterpreter:
                 response_text="There is no unfinished reminder to update.",
                 fallback_allowed=False,
             )
+        if route is IntentRoute.SUMMARY_REQUEST:
+            summary = self._interpret_summary(raw, timezone_name=timezone_name, now=now)
+            if summary is not None:
+                return summary
+            return Interpretation(
+                response_text="Please ask for pending, remaining, completed, or overdue reminders.",
+                fallback_allowed=False,
+            )
+        if route is IntentRoute.COMPLETE_REQUEST:
+            # Completion is resolved from trusted Telegram delivery context;
+            # the extractor must never select an occurrence or invent an ID.
+            return Interpretation(fallback_allowed=False)
         if route is not IntentRoute.UPDATE_PENDING:
             context = None
         # An explicit new reminder command supersedes an unresolved clarification.
@@ -1135,6 +1225,10 @@ class RuleBasedIntentInterpreter:
         listing = self._interpret_listing(raw, timezone_name=timezone_name, now=now)
         if listing is not None:
             return listing
+
+        summary = self._interpret_summary(raw, timezone_name=timezone_name, now=now)
+        if summary is not None:
+            return summary
 
         # Split independently timed clauses such as "tomorrow at 9 AM to pay
         # rent and at 6 PM to call Sara".  The date before the first clock is
@@ -1359,6 +1453,31 @@ class RuleBasedIntentInterpreter:
             PendingReminder(task=task or None, timezone_name=timezone_name),
             now=now,
             fallback_allowed=True,
+        )
+
+    def _interpret_summary(
+        self, raw: str, *, timezone_name: str, now: datetime
+    ) -> Interpretation | None:
+        """Parse common read-only progress questions without a model call."""
+
+        normalized = " ".join(raw.lower().strip(" .!? ").split())
+        if self._summary_request.match(raw) is None:
+            return None
+        if re.search(r"\b(?:overdue|late)\b", normalized):
+            metric = "OVERDUE_COUNT"
+        elif re.search(r"\b(?:completed|done|finished)\b", normalized):
+            metric = (
+                "TODAY_COMPLETED"
+                if re.search(r"\b(?:today|this\s+day)\b", normalized)
+                else "COMPLETED_COUNT"
+            )
+        elif re.search(r"\b(?:still\s+have\s+to\s+do|have\s+left|remaining)\b", normalized):
+            metric = "TODAY_REMAINING"
+        else:
+            metric = "PENDING_COUNT"
+        return Interpretation(
+            intent=ReminderSummaryIntent(metric=metric, timezone_name=timezone_name),
+            fallback_allowed=False,
         )
 
     def _interpret_calendar_recurrence(
@@ -2143,6 +2262,10 @@ class OpenAICompatibleIntentInterpreter:
                 response_text="There is no unfinished reminder to update.",
                 fallback_allowed=False,
             )
+        if route is IntentRoute.COMPLETE_REQUEST:
+            # Completion is resolved from trusted Telegram delivery context;
+            # the extractor must never select an occurrence or invent an ID.
+            return Interpretation(fallback_allowed=False)
         if route is not IntentRoute.UPDATE_PENDING:
             context = None
         local_now = _normalise_now(now).astimezone(ZoneInfo(timezone_name))
@@ -2174,6 +2297,16 @@ class OpenAICompatibleIntentInterpreter:
                 - LIST_REMINDERS: optional start_date, end_date (inclusive ISO dates),
                 task_query (only if explicitly mentioned). Omit dates to list all.
                 Return query filters, never reminder records.
+
+                SUMMARY_REQUEST:
+                - SUMMARY: return exactly one metric: PENDING_COUNT,
+                TODAY_REMAINING, COMPLETED_COUNT, TODAY_COMPLETED, or OVERDUE_COUNT.
+                This is a read-only progress query; return no counts or reminder records.
+
+                COMPLETE_REQUEST:
+                - COMPLETE_REMINDER: acknowledge one already-delivered occurrence.
+                - Do not invent an occurrence ID; the application resolves the target
+                  from Telegram delivery context and enforces ownership.
 
                 RESCHEDULE_REQUEST:
                 - RESCHEDULE_REMINDER: target_text, scope (OCCURRENCE/SERIES),
@@ -2285,6 +2418,24 @@ class OpenAICompatibleIntentInterpreter:
             data = json.loads(content) if isinstance(content, str) else content
             if not isinstance(data, dict):
                 raise ValueError("provider response was not an object")
+            if "operation" not in data:
+                envelope_keys = [
+                    key
+                    for key, value in data.items()
+                    if key in _OPERATION_ENVELOPE_KEYS and isinstance(value, dict)
+                ]
+                if len(envelope_keys) == 1:
+                    envelope_operation = envelope_keys[0]
+                    envelope_body = data[envelope_operation]
+                    data = {**envelope_body, "operation": envelope_operation}
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "reminder_intent_provider_envelope_normalized",
+                        endpoint_host=endpoint_host,
+                        model=self._model,
+                        operation=envelope_operation,
+                    )
             log_event(
                 logger,
                 logging.INFO,
@@ -2303,6 +2454,33 @@ class OpenAICompatibleIntentInterpreter:
                 "SHOW_REMINDERS",
             }:
                 operation = "LIST_REMINDERS"
+            if route is IntentRoute.SUMMARY_REQUEST:
+                if operation in {"SUMMARY_REQUEST", "REMINDER_SUMMARY", "STATUS_SUMMARY"}:
+                    operation = "SUMMARY"
+                if operation != "SUMMARY":
+                    raise ValueError("provider returned an unsupported summary operation")
+                metric = data.get("metric")
+                if metric is None:
+                    metric = data.get("summary_type")
+                if not isinstance(metric, str):
+                    raise ValueError("summary intent is missing metric")
+                metric_aliases = {
+                    "PENDING": "PENDING_COUNT",
+                    "PENDING_REMINDERS": "PENDING_COUNT",
+                    "OUTSTANDING": "PENDING_COUNT",
+                    "REMAINING_TODAY": "TODAY_REMAINING",
+                    "COMPLETED": "COMPLETED_COUNT",
+                    "COMPLETED_TODAY": "TODAY_COMPLETED",
+                    "OVERDUE": "OVERDUE_COUNT",
+                }
+                metric = metric_aliases.get(metric.upper(), metric.upper())
+                return Interpretation(
+                    intent=ReminderSummaryIntent(
+                        metric=metric,
+                        timezone_name=timezone_name,
+                    ),
+                    fallback_allowed=False,
+                )
             if route is IntentRoute.CANCEL_REQUEST:
                 from reminder_agent.cancellation import (
                     CancellationRequest,
@@ -2639,6 +2817,12 @@ class OpenAICompatibleIntentInterpreter:
                 weekdays = data.get("weekdays")
                 start_local_value = data.get("start_local")
                 frequency = str(data.get("frequency", "WEEKLY")).upper()
+                if frequency == "DAILY":
+                    # The domain stores daily schedules as a weekly rule on all
+                    # seven weekdays; normalize the provider's documented DAILY
+                    # vocabulary before validating the typed intent.
+                    frequency = "WEEKLY"
+                    weekdays = list(range(7))
                 if not isinstance(task, str):
                     raise ValueError("recurring intent is missing fields")
                 if not isinstance(weekdays, list):

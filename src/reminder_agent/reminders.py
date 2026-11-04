@@ -32,6 +32,7 @@ from reminder_agent.conversations import (
     pending_from_session,
     pending_reschedule_from_session,
     pending_cancellation_from_session,
+    pending_completion_from_session,
     session_expired,
     telegram_session_id,
 )
@@ -58,11 +59,21 @@ from reminder_agent.cancellation import (
 )
 from reminder_agent.conversation_router import (
     ConversationRoute,
+    is_completion_command,
     is_new_reminder_command,
     is_list_request_command,
+    is_summary_request_command,
     route_message,
     social_response,
     unrelated_response,
+)
+from reminder_agent.completion import (
+    complete_occurrence,
+    match_completion_candidates,
+    PendingCompletion,
+    resolve_latest_delivered,
+    resolve_by_provider_message,
+    resolve_by_occurrence,
 )
 from reminder_agent.intent import (
     CreateRecurringReminderIntent,
@@ -72,12 +83,18 @@ from reminder_agent.intent import (
     IntentInterpreter,
     Interpretation,
     ListRemindersIntent,
+    ReminderSummaryIntent,
     PendingReminder,
     ReminderIntentInterpreter,
     RuleBasedIntentInterpreter,
     restrict_to_explicit_field_updates,
 )
-from reminder_agent.reminder_listing import format_reminder_list, list_reminders_in_range
+from reminder_agent.reminder_listing import (
+    format_reminder_list,
+    format_reminder_summary,
+    list_reminders_in_range,
+    summarize_reminders,
+)
 from reminder_agent.recurrence import (
     MonthlyRecurrence,
     WeeklyRecurrence,
@@ -1366,6 +1383,8 @@ def _selected_intent_route(
 ) -> IntentRoute:
     if route is ConversationRoute.LIST_REQUEST:
         return IntentRoute.LIST_REQUEST
+    if route is ConversationRoute.SUMMARY_REQUEST:
+        return IntentRoute.SUMMARY_REQUEST
     if route is ConversationRoute.CLARIFICATION_REPLY:
         return IntentRoute.UPDATE_PENDING
     if route is ConversationRoute.MODEL_FALLBACK:
@@ -1396,6 +1415,24 @@ def _recent_messages(db: Session, *, user_id: UUID) -> list[str]:
     return messages[-34:]
 
 
+def _recent_delivered_reminders(
+    db: Session, *, user_id: UUID, identity_id: UUID, chat_id: int
+) -> list[dict[str, str]]:
+    """Build non-authoritative context for intent classification only."""
+    candidates = resolve_latest_delivered(
+        db, user_id=user_id, identity_id=identity_id, chat_id=chat_id
+    )
+    return [
+        {
+            "task": reminder.task,
+            "delivered_at": notification.sent_at.isoformat()
+            if notification.sent_at is not None
+            else "",
+        }
+        for _occurrence, reminder, notification in candidates
+    ]
+
+
 def _route_and_interpret(
     interpreter: IntentInterpreter,
     text: str,
@@ -1406,10 +1443,12 @@ def _route_and_interpret(
     user_name: str | None,
     intent_router: IntentRouter | None = None,
     recent_messages: list[str] | None = None,
+    recent_delivered_reminders: list[dict[str, str]] | None = None,
 ) -> tuple[ConversationRoute, Interpretation]:
     """Route first, then interpret only the route that permits it."""
     route = route_message(text, pending=pending).route
     classifier_selected_update = False
+    completion_target_text: str | None = None
     log_event(
         logger,
         logging.INFO,
@@ -1425,11 +1464,16 @@ def _route_and_interpret(
             has_pending=pending is not None,
             recent_message_count=min(len(recent_messages or []), 34),
         )
-        suggestion = intent_router.classify(
-            text,
-            pending=pending,
-            recent_messages=recent_messages or [],
-        ).operation
+        classify_kwargs = {
+            "pending": pending,
+            "recent_messages": recent_messages or [],
+            "recent_delivered_reminders": recent_delivered_reminders or [],
+        }
+        if "recent_delivered_reminders" not in inspect.signature(intent_router.classify).parameters:
+            classify_kwargs.pop("recent_delivered_reminders")
+        suggestion_result = intent_router.classify(text, **classify_kwargs)
+        suggestion = suggestion_result.operation
+        completion_target_text = getattr(suggestion_result, "target_text", None)
         log_event(
             logger,
             logging.INFO,
@@ -1438,21 +1482,45 @@ def _route_and_interpret(
         )
         if suggestion is IntentRoute.LIST_REQUEST:
             route = ConversationRoute.LIST_REQUEST
+        elif suggestion is IntentRoute.SUMMARY_REQUEST:
+            route = ConversationRoute.SUMMARY_REQUEST
         elif suggestion is IntentRoute.RESCHEDULE_REQUEST:
             route = ConversationRoute.RESCHEDULE_REQUEST
         elif suggestion is IntentRoute.CANCEL_REQUEST:
             route = ConversationRoute.CANCEL_REQUEST
+        elif suggestion is IntentRoute.COMPLETE_REQUEST:
+            route = ConversationRoute.COMPLETE_REQUEST
         elif suggestion is IntentRoute.NEW_REQUEST:
             route = ConversationRoute.NEW_REQUEST
-        elif suggestion is IntentRoute.UPDATE_PENDING and pending is not None:
-            route = ConversationRoute.CLARIFICATION_REPLY
-            classifier_selected_update = True
+        elif suggestion is IntentRoute.UPDATE_PENDING:
+            if pending is not None:
+                route = ConversationRoute.CLARIFICATION_REPLY
+                classifier_selected_update = True
+            else:
+                # UPDATE_PENDING has no valid target without an active draft.
+                # Treat the message as a new request so a classifier mistake
+                # cannot discard a complete reminder command.
+                route = ConversationRoute.NEW_REQUEST
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "reminder_route_classifier_recovered",
+                    requested_operation=suggestion,
+                    replacement_route=route,
+                    reason="no_pending_clarification",
+                )
         elif suggestion is IntentRoute.CANCEL_PENDING and pending is not None:
             route = ConversationRoute.CANCELLATION
         elif suggestion is IntentRoute.SOCIAL:
             route = ConversationRoute.SOCIAL
         elif suggestion is IntentRoute.UNRELATED:
-            route = ConversationRoute.UNRELATED
+            # A classifier has identified this as a clearly unsupported
+            # request. Keep deterministic conversational handling separate,
+            # but return the project-wide scope limitation here.
+            return ConversationRoute.UNRELATED, Interpretation(
+                response_text=OUT_OF_SCOPE_RESPONSE,
+                fallback_allowed=False,
+            )
         else:
             log_event(
                 logger,
@@ -1483,6 +1551,16 @@ def _route_and_interpret(
             response_text=unrelated_response(text, pending=pending),
             fallback_allowed=False,
         )
+    elif route is ConversationRoute.SUMMARY_REQUEST:
+        interpretation = _interpret(
+            interpreter,
+            text,
+            selected_route=IntentRoute.SUMMARY_REQUEST,
+            timezone_name=timezone_name,
+            now=now,
+            context=None,
+            recent_messages=recent_messages or [],
+        )
     elif route is ConversationRoute.RESCHEDULE_REQUEST:
         interpretation = Interpretation(fallback_allowed=False)
     elif route is ConversationRoute.CANCEL_REQUEST:
@@ -1490,6 +1568,11 @@ def _route_and_interpret(
         # model proposal. The cancellation service invokes that fallback only
         # after a zero-match result, with owned active candidates as context.
         interpretation = Interpretation(fallback_allowed=False)
+    elif route is ConversationRoute.COMPLETE_REQUEST:
+        interpretation = Interpretation(
+            fallback_allowed=False,
+            completion_target_text=completion_target_text,
+        )
     else:
         selected_route = _selected_intent_route(route, pending=pending)
         interpretation = _interpret(
@@ -1546,7 +1629,7 @@ def _upsert_clarification_session(
     *,
     user_id: UUID,
     external_session_id: str,
-    pending: PendingReminder,
+    pending: PendingReminder | PendingCompletion,
     now: datetime,
 ) -> ConversationSession:
     values = {
@@ -1606,6 +1689,283 @@ def _upsert_clarification_session(
     )
     assert session is not None
     return session
+
+
+def _handle_completion_follow_up(
+    db: Session,
+    update: TelegramUpdate,
+    *,
+    user: User,
+    identity: ChannelIdentity,
+    now: datetime,
+    session_ttl_seconds: int,
+) -> ReminderReply | None:
+    """Resolve a reply to an earlier ambiguous delivered-reminder completion."""
+    assert update.message is not None
+    db.rollback()
+    reply: ReminderReply | None = None
+    result = None
+    candidate_count = 0
+    try:
+        with db.begin():
+            session = load_session(
+                db,
+                user_id=user.id,
+                external_session_id=telegram_session_id(update.message.chat.id),
+                now=now,
+                ttl_seconds=session_ttl_seconds,
+                for_update=True,
+            )
+            locked_pending = pending_completion_from_session(session)
+            if locked_pending is None:
+                return None
+            candidates: list[tuple[ReminderOccurrence, Reminder, Notification]] = []
+            for occurrence_id in locked_pending.candidate_occurrence_ids:
+                candidates.extend(
+                    resolve_by_occurrence(
+                        db,
+                        user_id=user.id,
+                        identity_id=identity.id,
+                        chat_id=update.message.chat.id,
+                        occurrence_id=occurrence_id,
+                    )
+                )
+            candidate_count = len(candidates)
+            matches = match_completion_candidates(update.message.text or "", candidates)
+            if len(matches) != 1:
+                if not candidates:
+                    response_text = "I couldn't find a delivered reminder to mark as done."
+                    end_session(session, now=now)
+                    outcome = "NO_CANDIDATES"
+                else:
+                    response_text = "Which delivered reminder did you complete? Please name it."
+                    outcome = "AMBIGUOUS"
+                reply = _store_response(
+                    db,
+                    update=update,
+                    user_id=user.id,
+                    text=response_text,
+                    response_kind="completion_ambiguous",
+                    operation="COMPLETE_REMINDER",
+                )
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "completion_follow_up_unresolved",
+                    update_id=update.update_id,
+                    outcome=outcome,
+                    candidate_count=candidate_count,
+                    match_count=len(matches),
+                )
+            else:
+                selected = matches[0]
+                result = complete_occurrence(
+                    db,
+                    user_id=user.id,
+                    identity_id=identity.id,
+                    chat_id=update.message.chat.id,
+                    occurrence_id=selected[0].id,
+                    now=now,
+                )
+                end_session(session, now=now)
+                reply = _store_response(
+                    db,
+                    update=update,
+                    user_id=user.id,
+                    text=result.text,
+                    response_kind="completion",
+                    operation="COMPLETE_REMINDER",
+                )
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "completion_follow_up_resolved",
+                    update_id=update.update_id,
+                    occurrence_id=str(selected[0].id),
+                    outcome=result.outcome,
+                )
+    except IntegrityError:
+        duplicate = _recover_from_idempotency_race(db, update)
+        if duplicate is not None:
+            return duplicate
+        raise
+    assert reply is not None
+    log_event(
+        logger,
+        logging.INFO,
+        "completion_follow_up_committed",
+        update_id=update.update_id,
+        outcome=result.outcome if result is not None else "UNRESOLVED",
+        candidate_count=candidate_count,
+    )
+    return reply
+
+
+def _handle_completion_text(
+    db: Session,
+    update: TelegramUpdate,
+    *,
+    user: User,
+    identity: ChannelIdentity,
+    now: datetime,
+    target_text: str | None = None,
+) -> ReminderReply:
+    """Resolve and complete the single delivered occurrence targeted by a reply."""
+    assert update.message is not None
+    provider_id = (
+        str(update.message.reply_to_message.message_id)
+        if update.message.reply_to_message is not None
+        else None
+    )
+    log_event(
+        logger,
+        logging.INFO,
+        "completion_text_received",
+        update_id=update.update_id,
+        user_id=str(user.id),
+        identity_id=str(identity.id),
+        chat_id=update.message.chat.id,
+        resolution="reply" if provider_id is not None else "latest_delivered",
+        has_provider_message_reference=provider_id is not None,
+        target_text=target_text,
+    )
+    if provider_id is not None:
+        # A reply explicitly identifies the Telegram notification. Never fall
+        # back to a different reminder when that reference is stale or unrelated.
+        candidates = resolve_by_provider_message(
+            db,
+            user_id=user.id,
+            identity_id=identity.id,
+            chat_id=update.message.chat.id,
+            provider_message_id=provider_id,
+        )
+    else:
+        candidates = resolve_latest_delivered(
+            db,
+            user_id=user.id,
+            identity_id=identity.id,
+            chat_id=update.message.chat.id,
+        )
+    if provider_id is None and target_text and candidates:
+        targeted = match_completion_candidates(target_text, candidates)
+        if len(targeted) == 1:
+            candidates = targeted
+    log_event(
+        logger,
+        logging.DEBUG,
+        "completion_target_resolution_finished",
+        update_id=update.update_id,
+        candidate_count=len(candidates),
+        resolution="reply" if provider_id is not None else "latest_delivered",
+    )
+    if len(candidates) != 1:
+        reply_text = (
+            "Which delivered reminder did you complete?"
+            if candidates
+            else "I couldn't find a delivered reminder to mark as done."
+        )
+        db.rollback()
+        if candidates:
+            pending_completion = PendingCompletion(
+                candidate_occurrence_ids=tuple(candidate[0].id for candidate in candidates)
+            )
+            _upsert_clarification_session(
+                db,
+                user_id=user.id,
+                external_session_id=telegram_session_id(update.message.chat.id),
+                pending=pending_completion,
+                now=now,
+            )
+            log_event(
+                logger,
+                logging.INFO,
+                "completion_clarification_saved",
+                update_id=update.update_id,
+                candidate_count=len(candidates),
+            )
+        log_event(
+            logger,
+            logging.INFO,
+            "completion_target_ambiguous",
+            update_id=update.update_id,
+            candidate_count=len(candidates),
+        )
+        reply = _store_response(
+            db,
+            update=update,
+            user_id=user.id,
+            text=reply_text,
+            response_kind="completion_ambiguous",
+            operation="COMPLETE_REMINDER",
+        )
+        try:
+            db.commit()
+        except IntegrityError:
+            duplicate = _recover_from_idempotency_race(db, update)
+            if duplicate is not None:
+                return duplicate
+            raise
+        log_event(
+            logger,
+            logging.INFO,
+            "completion_response_committed",
+            update_id=update.update_id,
+            outcome="AMBIGUOUS",
+            candidate_count=len(candidates),
+        )
+        return reply
+
+    result = complete_occurrence(
+        db,
+        user_id=user.id,
+        identity_id=identity.id,
+        chat_id=update.message.chat.id,
+        occurrence_id=candidates[0][0].id,
+        provider_message_id=provider_id,
+        now=now,
+    )
+    log_event(
+        logger,
+        logging.INFO,
+        "completion_service_result",
+        update_id=update.update_id,
+        occurrence_id=str(result.occurrence_id) if result.occurrence_id else None,
+        outcome=result.outcome,
+        resolution="reply" if provider_id is not None else "unambiguous_last_delivered",
+    )
+    reply = _store_response(
+        db,
+        update=update,
+        user_id=user.id,
+        text=result.text,
+        response_kind="completion",
+        operation="COMPLETE_REMINDER",
+    )
+    try:
+        db.commit()
+    except IntegrityError:
+        duplicate = _recover_from_idempotency_race(db, update)
+        if duplicate is not None:
+            return duplicate
+        raise
+    log_event(
+        logger,
+        logging.INFO,
+        "completion_response_committed",
+        update_id=update.update_id,
+        occurrence_id=str(result.occurrence_id) if result.occurrence_id else None,
+        outcome=result.outcome,
+    )
+    log_event(
+        logger,
+        logging.INFO,
+        "reminder_occurrence_completed",
+        update_id=update.update_id,
+        occurrence_id=str(result.occurrence_id) if result.occurrence_id else None,
+        outcome=result.outcome,
+        resolution="reply" if provider_id is not None else "unambiguous_last_delivered",
+    )
+    return reply
 
 
 def handle_reminder_text(
@@ -1675,6 +2035,25 @@ def handle_reminder_text(
             reason="missing_user_or_identity",
         )
         return ReminderReply(update.message.chat.id, "I couldn't verify your account.")
+
+    # Completion is a deterministic acknowledgement of a delivered occurrence;
+    # never send it through the natural-language extractor.
+    text = (update.message.text or "").strip()
+    if is_completion_command(text):
+        log_event(
+            logger,
+            logging.INFO,
+            "completion_route_selected",
+            update_id=update.update_id,
+            source="deterministic",
+        )
+        return _handle_completion_text(
+            db,
+            update,
+            user=user,
+            identity=identity,
+            now=now,
+        )
     timezone_name = user.timezone
     if user.onboarding_status != ACTIVE or not timezone_name:
         db.rollback()
@@ -1720,8 +2099,14 @@ def handle_reminder_text(
     pending_cancellation = (
         None if session_is_expired else pending_cancellation_from_session(session)
     )
+    pending_completion = (
+        None if session_is_expired else pending_completion_from_session(session)
+    )
     text = update.message.text or ""
     recent_messages = _recent_messages(db, user_id=user.id)
+    recent_delivered_reminders = _recent_delivered_reminders(
+        db, user_id=user.id, identity_id=identity.id, chat_id=update.message.chat.id
+    )
     log_event(
         logger,
         logging.INFO,
@@ -1735,6 +2120,7 @@ def handle_reminder_text(
             else 0
         ),
         has_pending_cancellation=pending_cancellation is not None,
+        has_pending_completion=pending_completion is not None,
         recent_message_count=len(recent_messages),
     )
     observed_session_version = None if session_is_expired or session is None else session.version
@@ -1794,7 +2180,9 @@ def handle_reminder_text(
         )
         if cancellation_reply is not None:
             return cancellation_reply
-    if pending_reschedule is not None and is_list_request_command(text):
+    if pending_reschedule is not None and (
+        is_list_request_command(text) or is_summary_request_command(text)
+    ):
         # A read-only schedule query is not an answer to the old reschedule
         # question. Leave that clarification available for a later reply and
         # let the normal listing flow handle this message.
@@ -1847,6 +2235,45 @@ def handle_reminder_text(
     )
     if reschedule_reply is not None:
         return reschedule_reply
+    if pending_completion is not None and (
+        is_new_reminder_command(text)
+        or is_reschedule_command(text)
+        or is_list_request_command(text)
+        or is_summary_request_command(text)
+    ):
+        db.rollback()
+        with db.begin():
+            locked_session = load_session(
+                db,
+                user_id=user.id,
+                external_session_id=telegram_session_id(update.message.chat.id),
+                now=now,
+                ttl_seconds=session_ttl_seconds,
+                for_update=True,
+            )
+            if pending_completion_from_session(locked_session) is not None:
+                end_session(locked_session, now=now)
+        pending_completion = None
+        log_event(
+            logger,
+            logging.INFO,
+            "completion_clarification_superseded",
+            update_id=update.update_id,
+            replacement_route=(
+                "RESCHEDULE_REQUEST" if is_reschedule_command(text) else "NEW_REQUEST"
+            ),
+        )
+    if pending_completion is not None:
+        completion_reply = _handle_completion_follow_up(
+            db,
+            update,
+            user=user,
+            identity=identity,
+            now=now,
+            session_ttl_seconds=session_ttl_seconds,
+        )
+        if completion_reply is not None:
+            return completion_reply
     if session_is_expired:
         interpretation = None
     else:
@@ -1895,6 +2322,26 @@ def handle_reminder_text(
             )
             if cancellation_reply is not None:
                 return cancellation_reply
+        elif route is ConversationRoute.COMPLETE_REQUEST:
+            # The classifier is only a routing hint. Completion still uses the
+            # same delivered-notification resolution, authorization, transaction,
+            # and idempotency path as deterministic commands.
+            log_event(
+                logger,
+                logging.INFO,
+                "completion_route_selected",
+                update_id=update.update_id,
+                source="llm_classifier",
+            )
+            db.rollback()
+            return _handle_completion_text(
+                db,
+                update,
+                user=user,
+                identity=identity,
+                now=now,
+                target_text=interpretation.completion_target_text,
+            )
     if interpretation is None:
         interpretation = Interpretation(
             response_text="That clarification expired. Please send the complete reminder again.",
@@ -2000,6 +2447,12 @@ def handle_reminder_text(
                     user_name=user.name,
                     intent_router=intent_router,
                     recent_messages=_recent_messages(db, user_id=user.id),
+                    recent_delivered_reminders=_recent_delivered_reminders(
+                        db,
+                        user_id=user.id,
+                        identity_id=identity.id,
+                        chat_id=update.message.chat.id,
+                    ),
                 )
                 observed_session_version = locked_session.version
                 log_event(
@@ -2058,6 +2511,35 @@ def handle_reminder_text(
                         timezone_name=user.timezone,
                         task_query=list_intent.task_query,
                     ),
+                )
+
+            summary_intents = [
+                intent
+                for intent in interpretation.resolved_intents
+                if isinstance(intent, ReminderSummaryIntent)
+            ]
+            if summary_intents:
+                if len(summary_intents) != 1 or len(interpretation.resolved_intents) != 1:
+                    return ReminderReply(
+                        update.message.chat.id,
+                        "Please ask one reminder progress question at a time.",
+                    )
+                summary_intent = summary_intents[0]
+                if summary_intent.timezone_name != user.timezone:
+                    return ReminderReply(
+                        update.message.chat.id,
+                        "I couldn't verify your reminder time zone. Please try again.",
+                    )
+                summary = summarize_reminders(
+                    db,
+                    user_id=user.id,
+                    metric=summary_intent.metric,
+                    timezone_name=user.timezone,
+                    now=now,
+                )
+                return ReminderReply(
+                    update.message.chat.id,
+                    format_reminder_summary(summary, timezone_name=user.timezone),
                 )
 
             if interpretation.clarification is not None:

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from sqlalchemy import select
 
+from reminder_agent.completion import parse_callback_data
 from reminder_agent.db.models import (
     ChannelIdentity,
     IdempotencyRecord,
@@ -72,6 +73,7 @@ def _utc(value: datetime) -> datetime:
 class RecordingTelegramClient:
     def __init__(self, result_id: str = "tg-42", error: TelegramAPIError | None = None):
         self.messages: list[tuple[int, str]] = []
+        self.reply_markups: list[dict | None] = []
         self.result_id = result_id
         self.error = error
 
@@ -79,6 +81,7 @@ class RecordingTelegramClient:
         if self.error is not None:
             raise self.error
         self.messages.append((chat_id, text))
+        self.reply_markups.append(reply_markup)
         return TelegramDeliveryResult(self.result_id)
 
 
@@ -115,7 +118,9 @@ def test_due_notification_is_sent_and_records_provider_result(session_factory, f
         notification_id, occurrence_id = _seed_notification(db, fixed_now)
 
     client = RecordingTelegramClient()
-    assert _worker(session_factory, client, fixed_now).run_once() == 1
+    assert _worker(
+        session_factory, client, fixed_now, callback_secret="callback-secret"
+    ).run_once() == 1
 
     with session_factory() as db:
         notification = db.get(Notification, notification_id)
@@ -127,6 +132,9 @@ def test_due_notification_is_sent_and_records_provider_result(session_factory, f
         assert notification.claimed_by is None
         assert occurrence is not None and occurrence.status == "NOTIFIED"
     assert client.messages == [(2001, "Reminder: call the bank")]
+    assert client.reply_markups[0]["inline_keyboard"][0][0]["text"] == "Done"
+    callback = client.reply_markups[0]["inline_keyboard"][0][0]["callback_data"]
+    assert parse_callback_data(callback, "callback-secret") == occurrence_id
 
 
 def test_confirmation_worker_retries_failed_confirmation(session_factory, fixed_now):

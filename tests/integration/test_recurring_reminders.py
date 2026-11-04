@@ -8,7 +8,12 @@ import pytest
 from sqlalchemy import func, select
 
 from reminder_agent.db.models import ChannelIdentity, Notification, Reminder, ReminderOccurrence, User
-from reminder_agent.intent import CreateRecurringReminderIntent, Interpretation
+from reminder_agent.intent import (
+    CreateRecurringReminderIntent,
+    IntentRoute,
+    IntentRouteSuggestion,
+    Interpretation,
+)
 from reminder_agent.recurrence_service import (
     materialize_active_recurring_reminders,
     materialize_recurring_reminder,
@@ -94,6 +99,45 @@ def test_every_day_reminder_materializes_all_seven_weekdays(
     ).all()
     assert len(occurrences) >= 7
     assert len({occurrence.recurrence_instance_key for occurrence in occurrences[:7]}) == 7
+
+
+def test_classifier_update_pending_without_context_still_creates_recurring_request(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory)
+
+    class MisclassifyingRouter:
+        def classify(self, *args, **kwargs):
+            return IntentRouteSuggestion(operation=IntentRoute.UPDATE_PENDING)
+
+    class RecurringInterpreter:
+        def interpret(self, text, *, selected_route, timezone_name, now, **kwargs):
+            assert selected_route is IntentRoute.NEW_REQUEST
+            return Interpretation(
+                intent=CreateRecurringReminderIntent(
+                    task="call parents",
+                    frequency="WEEKLY",
+                    interval=1,
+                    weekdays=(0, 1, 2, 3, 4, 5, 6),
+                    hour=14,
+                    minute=10,
+                    start_local=datetime(2026, 11, 5, 14, 10),
+                    timezone_name=timezone_name,
+                )
+            )
+
+    api_client.app.state.intent_router = MisclassifyingRouter()
+    api_client.app.state.reminder_interpreter = RecurringInterpreter()
+    response = post_update(
+        api_client,
+        update_factory(312, text="Every day, remind me at 2:10 pm to call parents."),
+    )
+
+    assert response.status_code == 200
+    reminder = db.scalar(select(Reminder))
+    assert reminder is not None
+    assert reminder.task == "call parents"
+    assert reminder.schedule_type == "RECURRING"
 
 
 def test_monthly_and_yearly_reminders_persist_calendar_rules(

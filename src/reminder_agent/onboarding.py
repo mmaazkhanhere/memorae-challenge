@@ -13,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from reminder_agent.db.models import ChannelIdentity, IdempotencyRecord, User
+from reminder_agent.completion import complete_occurrence, parse_callback_data
 from reminder_agent.observability import get_logger, log_event
 from reminder_agent.telegram import TelegramUpdate
 
@@ -159,9 +160,12 @@ def _store_result(
     text: str,
     reply_markup: dict | None = None,
 ) -> OnboardingReply:
-    assert update.message is not None
+    source_message = update.message or (
+        update.callback_query.message if update.callback_query else None
+    )
+    assert source_message is not None
     reply = OnboardingReply(
-        chat_id=update.message.chat.id,
+        chat_id=source_message.chat.id,
         text=text,
         idempotency_key=str(update.update_id),
         reply_markup=reply_markup,
@@ -807,8 +811,144 @@ def handle_update(
     intent_router=None,
     now: datetime | None = None,
     session_ttl_seconds: int = 900,
+    callback_secret: str = "development",
 ) -> OnboardingReply | None:
     """Apply one Telegram update and return the committed response, if any."""
+    if update.callback_query is not None and update.callback_query.message is not None:
+        callback = update.callback_query
+        message = callback.message
+        log_event(
+            logger,
+            logging.INFO,
+            "completion_callback_received",
+            update_id=update.update_id,
+            callback_query_id=callback.id,
+            telegram_user_id=callback.from_user.id,
+            chat_id=message.chat.id,
+            has_data=bool(callback.data),
+        )
+        if message.chat.type != "private" or not callback.data:
+            log_event(
+                logger,
+                logging.INFO,
+                "completion_callback_rejected",
+                update_id=update.update_id,
+                reason=("non_private_chat" if message.chat.type != "private" else "missing_data"),
+            )
+            return None
+        if not callback.data.startswith("done:"):
+            log_event(
+                logger,
+                logging.INFO,
+                "completion_callback_rejected",
+                update_id=update.update_id,
+                reason="unsupported_action",
+            )
+            return None
+        occurrence_id = parse_callback_data(callback.data, callback_secret)
+        if occurrence_id is None:
+            log_event(
+                logger,
+                logging.WARNING,
+                "completion_callback_rejected",
+                update_id=update.update_id,
+                reason="invalid_signature_or_occurrence_id",
+            )
+            return None
+        existing = _existing_record(db, update)
+        if existing is not None:
+            db.rollback()
+            log_event(
+                logger,
+                logging.INFO,
+                "completion_callback_duplicate",
+                update_id=update.update_id,
+                occurrence_id=str(occurrence_id),
+            )
+            return _reply_from_record(existing)
+        identity = db.scalar(
+            select(ChannelIdentity)
+            .join(User, User.id == ChannelIdentity.user_id)
+            .where(
+                User.onboarding_status == ACTIVE,
+                User.timezone.is_not(None),
+                ChannelIdentity.channel_type == TELEGRAM,
+                ChannelIdentity.external_id == str(callback.from_user.id),
+                ChannelIdentity.status == LINKED,
+                ChannelIdentity.telegram_chat_id == message.chat.id,
+            )
+        )
+        if identity is None:
+            log_event(
+                logger,
+                logging.WARNING,
+                "completion_callback_rejected",
+                update_id=update.update_id,
+                occurrence_id=str(occurrence_id),
+                reason="telegram_identity_not_authorized",
+            )
+            return None
+        log_event(
+            logger,
+            logging.DEBUG,
+            "completion_callback_authorized",
+            update_id=update.update_id,
+            occurrence_id=str(occurrence_id),
+            user_id=str(identity.user_id),
+            identity_id=str(identity.id),
+        )
+        result = complete_occurrence(
+            db, user_id=identity.user_id, identity_id=identity.id,
+            chat_id=message.chat.id,
+            occurrence_id=occurrence_id,
+            provider_message_id=str(message.message_id),
+        )
+        log_event(
+            logger,
+            logging.INFO,
+            "completion_callback_service_result",
+            update_id=update.update_id,
+            occurrence_id=str(result.occurrence_id) if result.occurrence_id else str(occurrence_id),
+            outcome=result.outcome,
+        )
+        reply = _store_result(
+            db, update=update, user_id=identity.user_id,
+            operation="COMPLETE_REMINDER", text=result.text,
+        )
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            duplicate = _existing_record(db, update)
+            if duplicate is not None:
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "completion_callback_duplicate",
+                    update_id=update.update_id,
+                    occurrence_id=str(occurrence_id),
+                    reason="idempotency_race",
+                )
+                return _reply_from_record(duplicate)
+            raise
+        log_event(
+            logger,
+            logging.INFO,
+            "completion_callback_committed",
+            update_id=update.update_id,
+            occurrence_id=str(result.occurrence_id) if result.occurrence_id else str(occurrence_id),
+            outcome=result.outcome,
+        )
+        log_event(
+            logger,
+            logging.INFO,
+            "reminder_occurrence_completed",
+            update_id=update.update_id,
+            occurrence_id=str(result.occurrence_id) if result.occurrence_id else None,
+            outcome=result.outcome,
+            resolution="callback",
+        )
+        return reply
     if update.message is None or update.message.chat.type != "private":
         return None
     if update.message.contact is not None:

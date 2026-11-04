@@ -9,6 +9,7 @@ from reminder_agent.intent import (
     ListRemindersIntent,
     OpenAICompatibleIntentInterpreter,
     PendingReminder,
+    ReminderSummaryIntent,
     ReminderIntentInterpreter,
     RuleBasedIntentInterpreter,
 )
@@ -44,6 +45,29 @@ def test_rule_interpreter_parses_date_range_and_all_reminders():
     assert isinstance(all_reminders.intent, ListRemindersIntent)
     assert all_reminders.intent.start_date is None
     assert all_reminders.intent.end_date is None
+
+
+@pytest.mark.parametrize(
+    ("text", "metric"),
+    [
+        ("How many reminders are pending?", "PENDING_COUNT"),
+        ("What do I still have to do today?", "TODAY_REMAINING"),
+        ("How many tasks have I completed?", "COMPLETED_COUNT"),
+        ("How many tasks have I completed today?", "TODAY_COMPLETED"),
+        ("How many reminders are overdue?", "OVERDUE_COUNT"),
+    ],
+)
+def test_rule_interpreter_parses_progress_questions(text, metric):
+    result = RuleBasedIntentInterpreter().interpret(
+        text,
+        selected_route=IntentRoute.SUMMARY_REQUEST,
+        timezone_name="Asia/Karachi",
+        now=datetime(2026, 10, 30, 12, tzinfo=timezone.utc),
+    )
+
+    assert isinstance(result.intent, ReminderSummaryIntent)
+    assert result.intent.metric == metric
+    assert result.fallback_allowed is False
 
 
 @pytest.mark.parametrize(

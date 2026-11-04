@@ -72,6 +72,34 @@ def test_telegram_listing_is_owner_scoped_and_empty_is_explicit(
     assert telegram_client.messages[-1][1] == "You have no active reminders on 2026-11-03."
 
 
+def test_telegram_progress_questions_are_read_only_and_owner_scoped(
+    api_client, telegram_client, db, update_factory
+):
+    onboard(api_client, update_factory)
+    assert post_update(
+        api_client,
+        update_factory(508, text="Remind me today at 6 PM to submit the report"),
+    ).status_code == 200
+    assert post_update(
+        api_client,
+        update_factory(509, text="Remind me tomorrow at 9 AM to call the bank"),
+    ).status_code == 200
+
+    response = post_update(
+        api_client, update_factory(519, text="How many reminders are pending?")
+    )
+    assert response.status_code == 200
+    assert telegram_client.messages[-1][1] == "You have 2 pending reminders."
+
+    response = post_update(
+        api_client, update_factory(523, text="What do I still have to do today?")
+    )
+    assert response.status_code == 200
+    assert "You still have 1 task to do today:" in telegram_client.messages[-1][1]
+    assert "submit the report" in telegram_client.messages[-1][1]
+    assert "call the bank" not in telegram_client.messages[-1][1]
+
+
 def test_listing_does_not_discard_an_unfinished_reminder_clarification(
     api_client, telegram_client, db, update_factory
 ):

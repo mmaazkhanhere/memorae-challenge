@@ -55,6 +55,16 @@ class TelegramMessage(BaseModel):
     chat: TelegramChat
     text: str | None = None
     contact: TelegramContact | None = None
+    reply_to_message: "TelegramMessage | None" = None
+
+
+class TelegramCallbackQuery(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    id: str
+    from_user: TelegramUser = Field(alias="from")
+    data: str | None = None
+    message: TelegramMessage | None = None
 
 
 class TelegramUpdate(BaseModel):
@@ -62,6 +72,7 @@ class TelegramUpdate(BaseModel):
 
     update_id: int
     message: TelegramMessage | None = None
+    callback_query: TelegramCallbackQuery | None = None
 
 
 @dataclass(frozen=True)
@@ -73,6 +84,8 @@ class TelegramClient(Protocol):
     def send_message(
         self, chat_id: int, text: str, *, reply_markup: dict[str, Any] | None = None
     ) -> TelegramDeliveryResult | None: ...
+
+    def answer_callback_query(self, callback_query_id: str) -> None: ...
 
 
 class TelegramAPIError(RuntimeError):
@@ -363,3 +376,42 @@ class HttpTelegramClient:
                 str(provider_message_id) if provider_message_id is not None else None
             )
         )
+
+    def answer_callback_query(self, callback_query_id: str) -> None:
+        """Stop Telegram's inline-button spinner after a callback is handled."""
+
+        url = f"https://api.telegram.org/bot{self._token}/answerCallbackQuery"
+        try:
+            response = httpx.post(
+                url,
+                json={"callback_query_id": callback_query_id},
+                timeout=self._timeout,
+            )
+        except httpx.RequestError as exc:
+            raise TelegramAPIError(
+                "Telegram callback acknowledgement failed",
+                failure_kind="network",
+                cause=self._safe_cause(exc),
+            ) from exc
+        try:
+            payload = response.json()
+        except (TypeError, ValueError) as exc:
+            raise TelegramAPIError(
+                "Telegram returned an invalid callback acknowledgement",
+                status_code=response.status_code,
+                failure_kind="invalid_response",
+                cause=self._safe_cause(exc),
+            ) from exc
+        if (
+            not response.is_success
+            or not isinstance(payload, dict)
+            or payload.get("ok") is not True
+        ):
+            raise TelegramAPIError(
+                "Telegram rejected the callback acknowledgement",
+                status_code=response.status_code,
+                telegram_description=self._safe_description(
+                    payload.get("description") if isinstance(payload, dict) else None
+                ),
+                failure_kind="http_error" if not response.is_success else "api_error",
+            )

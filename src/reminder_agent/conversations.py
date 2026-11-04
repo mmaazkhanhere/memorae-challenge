@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from reminder_agent.db.models import ConversationSession
+from reminder_agent.completion import PendingCompletion
 from reminder_agent.intent import PendingReminder
 from reminder_agent.observability import get_logger, log_event
 
@@ -100,6 +101,16 @@ def pending_cancellation_from_session(session: ConversationSession | None):
     from reminder_agent.cancellation import PendingCancellation
 
     return PendingCancellation.model_validate(session.pending_clarification)
+
+
+def pending_completion_from_session(session: ConversationSession | None):
+    """Load VS-11 completion candidates without treating IDs as authority."""
+
+    if session is None or session.pending_clarification is None:
+        return None
+    if session.pending_clarification.get("operation") != "COMPLETE_REMINDER":
+        return None
+    return PendingCompletion.model_validate(session.pending_clarification)
 
 
 def end_session(session: ConversationSession, *, now: datetime) -> None:
