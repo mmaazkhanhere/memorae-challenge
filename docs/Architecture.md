@@ -1018,9 +1018,9 @@ flowchart TB
 
 ```
 
-## 9. Implemented Architecture: VS-01 through VS-11
+## 9. Implemented Architecture: VS-01 through VS-12
 
-This section records the architecture implemented for VS-01 through VS-11 only. It is an implementation supplement to the original design material above: it does not change the existing requirements, workflows, or designs for later slices.
+This section records the architecture implemented for VS-01 through VS-12 only. It is an implementation supplement to the original design material above: it does not change the existing requirements, workflows, or designs for later slices.
 
 ### 9.1 Current Component Architecture
 
@@ -1275,3 +1275,35 @@ Completion is deterministic. The intent classifier knows the
 occurrence ID or target as authority. The extractor prompt documents the
 completion operation for route consistency, while the actual completion path
 bypasses extraction and resolves only from trusted Telegram delivery context.
+
+### 9.8 Delivered-occurrence snooze (VS-12)
+
+VS-12 reuses the delivered-occurrence resolution and authorization boundary
+introduced by VS-11. A Telegram reply is first grounded to the stored
+`provider_message_id`; a bare snooze is accepted only when exactly one distinct
+owned, linked, delivered occurrence is eligible. Historical sent notifications
+are collapsed for candidate selection, but remain immutable delivery history.
+
+The deterministic router recognizes explicit positive relative durations before
+any model call. If routing is uncertain, the configured classifier may propose
+`SNOOZE_REQUEST`; only then may the extractor propose a positive
+`duration_seconds`. Neither model may supply an occurrence ID, user ID, chat ID,
+or delivery destination. Invalid, ambiguous, stale, or unauthorized proposals
+produce clarification and no mutation.
+
+The snooze service locks the occurrence and rechecks the authenticated Telegram
+identity, parent reminder, occurrence state, and matching sent notification.
+Within the caller's transaction it changes the same occurrence from
+`NOTIFIED` to `PENDING`, updates `next_due_at` to `now + duration`, and inserts
+one new `PENDING` notification with the next sequence number. It does not create
+another occurrence, alter a recurring rule, or modify the previous `SENT`
+notification. The idempotency response and state change commit together; a
+replayed Telegram update returns the stored response and does not postpone the
+occurrence twice.
+
+The normal notification worker delivers the replacement notification through
+its existing eligibility and lease path. Once sent, the occurrence becomes
+`NOTIFIED` again and the replacement receives its own provider message ID. A
+pending snooze clarification retains its typed candidate context, can be safely
+canceled, is superseded by an explicit new mutation, and is not consumed by a
+read-only list or summary request.
