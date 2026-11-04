@@ -22,6 +22,7 @@ from reminder_agent.observability import configure_logging, get_logger, log_even
 from reminder_agent.recurrence_service import materialize_active_recurring_reminders
 from reminder_agent.settings import get_settings, validate_runtime_settings
 from reminder_agent.telegram import HttpTelegramClient, TelegramAPIError, TelegramClient
+from reminder_agent.completion import callback_data
 
 TELEGRAM = "TELEGRAM"
 LINKED = "LINKED"
@@ -295,6 +296,7 @@ class NotificationWorker:
         recurrence_materialization_batch_size: int = 100,
         clock: Callable[[], datetime] = utc_now,
         sleep: Callable[[float], None] = time.sleep,
+        callback_secret: str = "development",
     ) -> None:
         self.session_factory = session_factory
         self.telegram_client = telegram_client
@@ -308,6 +310,7 @@ class NotificationWorker:
         self.recurrence_materialization_batch_size = recurrence_materialization_batch_size
         self.clock = clock
         self.sleep = sleep
+        self.callback_secret = callback_secret
 
     def recover_expired_claims(self, now: datetime | None = None) -> int:
         now = _as_utc(now or self.clock())
@@ -540,8 +543,31 @@ class NotificationWorker:
                 0.0, (now - _as_utc(notification.due_at)).total_seconds()
             ),
         )
+        done_markup = {
+            "inline_keyboard": [[
+                {
+                    "text": "Done",
+                    "callback_data": callback_data(
+                        notification.occurrence_id, self.callback_secret
+                    ),
+                }
+            ]]
+        }
+        log_event(
+            logger,
+            logging.DEBUG,
+            "completion_action_attached",
+            worker_id=self.worker_id,
+            notification_id=str(claim.notification_id),
+            occurrence_id=str(notification.occurrence_id),
+            action="done",
+        )
         try:
-            result = self.telegram_client.send_message(chat_id, f"Reminder: {task}")
+            result = self.telegram_client.send_message(
+                chat_id,
+                f"Reminder: {task}",
+                reply_markup=done_markup,
+            )
         except TelegramAPIError as exc:
             outcome = self._finalize_error(claim.notification_id, now, exc)
             log_event(
@@ -648,6 +674,7 @@ def run() -> None:
         retry_base_delay_seconds=settings.notification_retry_base_delay_seconds,
         recurrence_materialization_horizon_days=settings.recurrence_materialization_horizon_days,
         recurrence_materialization_batch_size=settings.recurrence_materialization_batch_size,
+        callback_secret=settings.telegram_webhook_secret,
     )
     confirmation_worker = ConfirmationWorker(
         session_factory,
