@@ -159,6 +159,7 @@ def test_intent_router_classifies_only_the_operation_and_limits_history(monkeypa
     assert suggestion.operation is IntentRoute.NEW_REQUEST
     assert "LIST_REQUEST" in captured["messages"][0]["content"]
     assert "RESCHEDULE_REQUEST" in captured["messages"][0]["content"]
+    assert "COMPLETE_REQUEST" in captured["messages"][0]["content"]
     context = json.loads(captured["messages"][1]["content"])
     assert context["active_pending"]["task"] == "call Bilal"
     assert context["missing_fields"] == ["date"]
@@ -261,6 +262,35 @@ def test_list_request_route_from_classifier_reaches_interpreter() -> None:
     assert result.response_text == "listing"
 
 
+def test_classifier_update_pending_without_context_recovers_as_new_request() -> None:
+    class UpdateRouter:
+        def classify(self, *args, **kwargs):
+            return IntentRouteSuggestion(operation=IntentRoute.UPDATE_PENDING)
+
+    class RecordingInterpreter:
+        def __init__(self) -> None:
+            self.selected_route = None
+
+        def interpret(self, text, *, selected_route, **kwargs):
+            self.selected_route = selected_route
+            return Interpretation(response_text="recurring reminder")
+
+    interpreter = RecordingInterpreter()
+    route, result = _route_and_interpret(
+        interpreter,
+        "Every day, remind me at 2:10 pm to call parents",
+        timezone_name="Asia/Karachi",
+        now=NOW,
+        pending=None,
+        user_name="Ada",
+        intent_router=UpdateRouter(),
+    )
+
+    assert route is ConversationRoute.NEW_REQUEST
+    assert interpreter.selected_route is IntentRoute.NEW_REQUEST
+    assert result.response_text == "recurring reminder"
+
+
 def test_classifier_reschedule_route_bypasses_reminder_extractor() -> None:
     class RescheduleRouter:
         def classify(self, *args, **kwargs):
@@ -286,6 +316,33 @@ def test_classifier_reschedule_route_bypasses_reminder_extractor() -> None:
     )
 
     assert route is ConversationRoute.RESCHEDULE_REQUEST
+
+
+def test_classifier_completion_route_bypasses_extractor() -> None:
+    class CompletionRouter:
+        def classify(self, *args, **kwargs):
+            return IntentRouteSuggestion(operation=IntentRoute.COMPLETE_REQUEST)
+
+    class RecordingInterpreter:
+        def __init__(self) -> None:
+            self.called = False
+
+        def interpret(self, *args, **kwargs):
+            self.called = True
+            return Interpretation(response_text="must not be called")
+
+    interpreter = RecordingInterpreter()
+    route, result = _route_and_interpret(
+        interpreter,
+        "I finished it",
+        timezone_name="UTC",
+        now=NOW,
+        pending=None,
+        user_name="Ada",
+        intent_router=CompletionRouter(),
+    )
+
+    assert route is ConversationRoute.COMPLETE_REQUEST
     assert interpreter.called is False
     assert result.fallback_allowed is False
 
@@ -1506,6 +1563,44 @@ def test_openai_compatible_interpreter_accepts_structured_response(monkeypatch) 
     assert result.intent is not None
     assert result.intent.task == "call the bank"
     assert result.intent.due_at == datetime(2026, 10, 31, 4, 0, tzinfo=timezone.utc)
+
+
+def test_openai_compatible_interpreter_normalizes_keyed_recurring_response(monkeypatch) -> None:
+    def fake_post(*args, **kwargs):
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"CREATE_RECURRING_REMINDER":{'
+                                '"task":"call parents","frequency":"DAILY",'
+                                '"interval":1,"hour":14,"minute":10,'
+                                '"start_local":"2026-11-04T14:10"}}'
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    result = OpenAICompatibleIntentInterpreter(
+        "https://llm.example/v1", "secret", "provider-model"
+    ).interpret(
+        "Every day, remind me at 2:10 pm to call parents",
+        timezone_name="Asia/Karachi",
+        now=NOW,
+    )
+
+    assert isinstance(result.intent, CreateRecurringReminderIntent)
+    assert result.intent.task == "call parents"
+    assert result.intent.frequency == "WEEKLY"
+    assert result.intent.weekdays == (0, 1, 2, 3, 4, 5, 6)
+    assert result.intent.hour == 14
+    assert result.intent.minute == 10
 
 
 def test_openai_compatible_interpreter_accepts_structured_reschedule_response(

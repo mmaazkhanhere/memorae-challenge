@@ -46,6 +46,7 @@ def test_prompt_injection_is_rejected_as_untrusted_input() -> None:
         "LIST_REMINDERS",
         "RESCHEDULE_REMINDER",
         "CANCEL_REMINDER",
+        "COMPLETE_REMINDER",
     ],
 )
 def test_every_supported_operation_is_explicitly_allowed(operation: str) -> None:
@@ -55,7 +56,6 @@ def test_every_supported_operation_is_explicitly_allowed(operation: str) -> None
 @pytest.mark.parametrize(
     "operation",
     [
-        "COMPLETE_REMINDER",
         "SNOOZE_REMINDER",
         "SAVE_MEMORY",
         "RETRIEVE_MEMORY",
@@ -96,3 +96,9 @@ def test_empty_or_whitespace_only_request_needs_clarification(text: str) -> None
 def test_listing_is_in_scope_and_read_only_operation_is_supported() -> None:
     assert assess_request("What do I have tomorrow?").is_rejected is False
     assert is_supported_operation("LIST_REMINDERS") is True
+
+
+def test_completion_is_in_scope_but_snooze_remains_deferred() -> None:
+    assert assess_request("Done").is_rejected is False
+    assert is_supported_operation("COMPLETE_REMINDER") is True
+    assert is_supported_operation("SNOOZE_REMINDER") is False

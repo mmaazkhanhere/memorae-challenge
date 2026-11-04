@@ -13,8 +13,10 @@ from reminder_agent.cancellation import is_cancel_command
 class ConversationRoute(StrEnum):
     NEW_REQUEST = "NEW_REQUEST"
     LIST_REQUEST = "LIST_REQUEST"
+    SUMMARY_REQUEST = "SUMMARY_REQUEST"
     RESCHEDULE_REQUEST = "RESCHEDULE_REQUEST"
     CANCEL_REQUEST = "CANCEL_REQUEST"
+    COMPLETE_REQUEST = "COMPLETE_REQUEST"
     CLARIFICATION_REPLY = "CLARIFICATION_REPLY"
     CANCELLATION = "CANCELLATION"
     SOCIAL = "SOCIAL"
@@ -47,6 +49,13 @@ _TASK_LIST_REQUEST = re.compile(
     r"(?:show|list)\s+(?:my\s+)?\S.+\s+reminders?)\b",
     re.IGNORECASE,
 )
+_SUMMARY_REQUEST = re.compile(
+    r"^\s*(?:(?:how\s+many|what\s+is\s+the\s+number\s+of).*(?:pending|outstanding|unfinished|overdue|completed|done|finished)(?:.*(?:today|this\s+day))?"
+    r"|(?:what|which|show|list).*(?:still\s+have\s+to\s+do|have\s+left|remaining).*(?:today|this\s+day)"
+    r"|(?:what|which|show|list).*(?:today|this\s+day).*(?:still\s+have\s+to\s+do|have\s+left|remaining)"
+    r"|(?:what|which|show|list).*(?:completed|done|finished).*(?:today|this\s+day))\s*[?!.]*\s*$",
+    re.IGNORECASE,
+)
 _CLOCK_WITH_AT = re.compile(
     r"\bat\s+\d{1,2}(?::\d{2})?\s*(?:a\.m\.|p\.m\.|am|pm)?\b",
     re.IGNORECASE,
@@ -65,6 +74,16 @@ _TASK_CORRECTION = re.compile(
     re.IGNORECASE,
 )
 _CANCELLATIONS = {"cancel", "cancel it", "never mind", "nevermind", "not now"}
+_COMPLETION = re.compile(
+    r"^\s*(?:done(?:\s*,?\s*thanks?)?|completed|finished(?:\s+it)?|"
+    r"mark(?:ed)?\s+(?:it|that)\s+done|"
+    r"mark\s+(?:the\s+)?(?:reminder|task)\s+(?:as\s+)?complete)\s*[.!?]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def is_completion_command(text: str) -> bool:
+    return _COMPLETION.fullmatch(text.strip()) is not None
 _ACKNOWLEDGEMENTS = {
     "yes",
     "yeah",
@@ -103,6 +122,11 @@ def is_list_request_command(text: str) -> bool:
     )
 
 
+def is_summary_request_command(text: str) -> bool:
+    """Return whether text asks for reminder progress/count information."""
+    return _SUMMARY_REQUEST.fullmatch(text.strip()) is not None
+
+
 def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecision:
     """Choose a safe deterministic path or the model fallback.
 
@@ -113,6 +137,9 @@ def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecisio
     raw = text.strip()
     normalized = re.sub(r"[.!?]+$", "", raw.lower()).strip()
 
+    if is_completion_command(raw):
+        return RouteDecision(ConversationRoute.COMPLETE_REQUEST)
+
     # An acknowledgement is conversational only when there is no active
     # clarification.  With pending context it must be interpreted as an answer
     # to the outstanding question, or preserve that state and ask again.
@@ -122,6 +149,8 @@ def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecisio
     if pending is None:
         if is_new_reminder_command(raw):
             return RouteDecision(ConversationRoute.NEW_REQUEST)
+        if is_summary_request_command(raw):
+            return RouteDecision(ConversationRoute.SUMMARY_REQUEST)
         if is_list_request_command(raw):
             return RouteDecision(ConversationRoute.LIST_REQUEST)
         if is_cancel_command(raw):
@@ -140,6 +169,8 @@ def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecisio
         return RouteDecision(ConversationRoute.SOCIAL)
     if is_list_request_command(raw):
         return RouteDecision(ConversationRoute.LIST_REQUEST)
+    if is_summary_request_command(raw):
+        return RouteDecision(ConversationRoute.SUMMARY_REQUEST)
     if is_new_reminder_command(raw):
         # A complete new command intentionally supersedes a stale draft rather
         # than being parsed as an edit to its task or schedule.

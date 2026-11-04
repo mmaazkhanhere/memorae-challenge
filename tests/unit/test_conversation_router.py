@@ -2,7 +2,9 @@ from datetime import date
 
 from reminder_agent.conversation_router import (
     ConversationRoute,
+    is_completion_command,
     is_list_request_command,
+    is_summary_request_command,
     route_message,
     social_response,
 )
@@ -52,11 +54,30 @@ def test_router_recognizes_schedule_list_wording() -> None:
         assert route_message(text, pending=_pending()).route is ConversationRoute.LIST_REQUEST
 
 
+def test_router_recognizes_progress_questions() -> None:
+    for text in (
+        "How many reminders are pending?",
+        "What do I still have to do today?",
+        "How many tasks have I completed?",
+        "How many reminders are overdue?",
+    ):
+        assert is_summary_request_command(text) is True
+        assert route_message(text, pending=None).route is ConversationRoute.SUMMARY_REQUEST
+        assert route_message(text, pending=_pending()).route is ConversationRoute.SUMMARY_REQUEST
+
+
 def test_router_recognizes_explicit_cancellation_requests() -> None:
     assert route_message("Cancel the standup", pending=None).route is ConversationRoute.CANCEL_REQUEST
     assert route_message("Cancel only tomorrow's standup", pending=_pending()).route is (
         ConversationRoute.CANCEL_REQUEST
     )
+
+
+def test_router_recognizes_completion_without_invoking_reminder_creation() -> None:
+    for text in ("Done", "Done, thanks", "finished it", "mark the reminder as complete"):
+        assert is_completion_command(text) is True
+        assert route_message(text, pending=None).route is ConversationRoute.COMPLETE_REQUEST
+    assert is_completion_command("Remind me to mark the task done") is False
 
 
 def test_router_does_not_start_a_reminder_from_unrelated_text() -> None:
