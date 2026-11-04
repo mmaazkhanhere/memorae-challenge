@@ -12,7 +12,9 @@ from reminder_agent.db.models import (
 from reminder_agent.reminder_listing import (
     ListedReminder,
     format_reminder_list,
+    format_reminder_summary,
     list_reminders_in_range,
+    summarize_reminders,
 )
 
 
@@ -200,6 +202,78 @@ def test_empty_listing_is_explicit_and_formatting_is_local():
         start_date=date(2026, 11, 1),
         end_date=date(2026, 11, 1),
         timezone_name="UTC",
+    )
+
+
+def test_summary_counts_are_owner_scoped_and_today_keeps_delivered_work(
+    session_factory,
+):
+    now = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)
+    with session_factory.begin() as db:
+        ada = User(name="Ada", timezone="UTC", onboarding_status="ACTIVE")
+        bob = User(name="Bob", timezone="UTC", onboarding_status="ACTIVE")
+        db.add_all([ada, bob])
+        db.flush()
+        rows = [
+            (ada, "pending task", datetime(2026, 11, 1, 9, tzinfo=timezone.utc), "PENDING"),
+            (ada, "delivered task", datetime(2026, 11, 1, 10, tzinfo=timezone.utc), "NOTIFIED"),
+            (ada, "completed task", datetime(2026, 10, 31, 10, tzinfo=timezone.utc), "COMPLETED"),
+            (bob, "private task", datetime(2026, 11, 1, 11, tzinfo=timezone.utc), "PENDING"),
+        ]
+        for owner, task, due_at, status in rows:
+            reminder = Reminder(
+                user_id=owner.id,
+                task=task,
+                schedule_type="ONE_TIME",
+                start_local=due_at.isoformat(),
+                timezone="UTC",
+                status="COMPLETED" if status == "COMPLETED" else "ACTIVE",
+            )
+            db.add(reminder)
+            db.flush()
+            db.add(
+                ReminderOccurrence(
+                    reminder_id=reminder.id,
+                    scheduled_at=due_at,
+                    next_due_at=due_at,
+                    status=status,
+                    updated_at=(
+                        datetime(2026, 11, 1, 11, tzinfo=timezone.utc)
+                        if status == "COMPLETED"
+                        else due_at
+                    ),
+                )
+            )
+
+    with session_factory() as db:
+        pending = summarize_reminders(
+            db,
+            user_id=ada.id,
+            metric="PENDING_COUNT",
+            timezone_name="UTC",
+            now=now,
+        )
+        remaining = summarize_reminders(
+            db,
+            user_id=ada.id,
+            metric="TODAY_REMAINING",
+            timezone_name="UTC",
+            now=now,
+        )
+        completed = summarize_reminders(
+            db,
+            user_id=ada.id,
+            metric="COMPLETED_COUNT",
+            timezone_name="UTC",
+            now=now,
+        )
+
+    assert pending.count == 2
+    assert remaining.count == 2
+    assert {item.task for item in remaining.reminders} == {"pending task", "delivered task"}
+    assert completed.count == 1
+    assert format_reminder_summary(remaining, timezone_name="UTC").startswith(
+        "You still have 2 tasks to do today:"
     )
 
 
