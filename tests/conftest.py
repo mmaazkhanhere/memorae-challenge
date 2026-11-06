@@ -53,6 +53,8 @@ def session_factory() -> Iterator[sessionmaker[Session]]:
         )
     else:
         engine = create_engine(database_url, pool_pre_ping=True)
+        with engine.begin() as connection:
+            connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
     Base.metadata.create_all(engine)
     with engine.begin() as connection:
         connection.execute(
@@ -93,6 +95,8 @@ def api_client(session_factory, telegram_client, fixed_now) -> Iterator[TestClie
         telegram_webhook_secret="test-secret",
         # Tests must not inherit a developer's live provider key from .env.
         llm_api_key=None,
+        embedding_provider="disabled",
+        embedding_api_key=None,
     )
     app = create_app(
         settings,

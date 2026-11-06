@@ -17,7 +17,11 @@ from sqlalchemy import (
     Uuid,
     text,
 )
+from pgvector.sqlalchemy import Vector
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+MEMORY_EMBEDDING_DIMENSIONS = 1536
 
 
 def utc_now() -> datetime:
@@ -58,7 +62,12 @@ class MemoryFact(Base):
     __tablename__ = "memory_facts"
     __table_args__ = (
         CheckConstraint("length(trim(content)) > 0", name="ck_memory_facts_content_nonempty"),
+        CheckConstraint(
+            "embedding_status IN ('PENDING', 'INDEXED', 'FAILED', 'SKIPPED_SENSITIVE')",
+            name="ck_memory_facts_embedding_status",
+        ),
         Index("ix_memory_facts_user_created", "user_id", "created_at"),
+        Index("ix_memory_facts_user_embedding_status", "user_id", "embedding_status"),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
@@ -66,6 +75,24 @@ class MemoryFact(Base):
         Uuid(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    # PostgreSQL stores a real pgvector column. SQLite is retained only as the
+    # lightweight unit-test backend and stores the same numbers as JSON.
+    embedding: Mapped[list[float] | None] = mapped_column(
+        Vector(MEMORY_EMBEDDING_DIMENSIONS).with_variant(JSON(), "sqlite"),
+        nullable=True,
+    )
+    embedding_status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="PENDING", server_default="PENDING"
+    )
+    embedding_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    embedding_content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    embedding_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    embedding_last_error: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    embedding_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
