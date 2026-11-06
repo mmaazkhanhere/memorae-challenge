@@ -38,7 +38,7 @@ Production startup fails fast unless `DATABASE_URL` uses PostgreSQL,
 least 32 characters. The sample placeholders and local SQLite defaults are intended only for
 injected test applications. `/ready` also verifies that the domain tables exist, so a stale
 `alembic_version` row cannot make an empty database appear healthy. Readiness also requires the
-current migration head (`0014_recurrence_exceptions`) and the worker/confirmation claim
+current migration head (`0016_memory_embeddings`) and the worker/confirmation claim
 columns, so a partially migrated database is rejected before webhooks are accepted.
 The additive schema-repair migrations also rebuild missing domain tables when a
 database was reset without resetting its Alembic version row.
@@ -131,6 +131,30 @@ Run tests with:
 ```powershell
 uv run pytest
 ```
+
+Semantic memory uses PostgreSQL pgvector with `vector(1536)`, cosine distance,
+and a provider-agnostic embedding boundary. It is disabled by default. Configure
+the `EMBEDDING_*` values in `.env` (set `EMBEDDING_PROVIDER=gemini` and provide
+`EMBEDDING_API_KEY` to use Google's `gemini-embedding-001`), apply migrations, then index one resumable
+batch at a time with:
+
+```powershell
+uv run memory-embedding-backfill
+```
+
+External embedding calls exclude detected passwords, PINs, access codes, keys,
+tokens, and recovery secrets unless the deployment explicitly approves
+`EMBEDDING_ALLOW_SENSITIVE_EXTERNAL=true`. Original memory text remains the
+source of truth; failed or disabled indexing never deletes a fact and lexical
+retrieval continues to work.
+
+Gemini's free tier is available for eligible projects, but Google does not
+publish one universal embedding RPM/TPM/RPD value: quotas are project- and
+tier-specific and must be checked in AI Studio. The adapter sends
+`RETRIEVAL_DOCUMENT` for saved facts and `RETRIEVAL_QUERY` for questions and
+normalizes the 1,536-dimensional truncated prefix. A Gemini key is not present
+in this checkout, so the live-provider test is skipped; fake-response coverage
+is included.
 
 When running PostgreSQL integration tests, set `TEST_DATABASE_URL` to the dedicated
 `memorae_test` database on port 5434. The test fixture refuses to run destructive cleanup if

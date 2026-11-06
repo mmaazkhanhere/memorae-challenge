@@ -1018,9 +1018,9 @@ flowchart TB
 
 ```
 
-## 9. Implemented Architecture: VS-01 through VS-13
+## 9. Implemented Architecture: VS-01 through VS-14
 
-This section records the architecture implemented for VS-01 through VS-13 only. It is an implementation supplement to the original design material above: it does not change the existing requirements, workflows, or designs for later slices.
+This section records the architecture implemented for VS-01 through VS-14. It is an implementation supplement to the original design material above: it does not change the existing requirements, workflows, or designs for later slices.
 
 ### 9.1 Current Component Architecture
 
@@ -1197,7 +1197,9 @@ The current SQLAlchemy schema and Alembic migrations provide these implemented t
 - `notifications`: a due Telegram delivery linked to an occurrence and destination identity, with sequence, status, attempts, provider result, and lease fields.
 - `conversation_sessions`: typed pending clarification payloads, channel/session identity, status, optional active reminder reference, version, and update time.
 - `idempotency_records`: a unique `(source, idempotency_key)` record with request hash, durable response, business outcome, and confirmation-delivery state.
-- `memory_facts`: non-empty user-owned fact content with creation/update timestamps and an owner/date index.
+- `memory_facts`: authoritative non-empty user-owned fact content, nullable
+  `vector(1536)` semantic data, model/content-hash/versioning metadata, indexing
+  status and attempts, timestamps, and owner/date plus owner/index-status indexes.
 
 The implemented relationships are user-to-identities/reminders/sessions, reminder-to-occurrences/recurrence-exceptions, occurrence-to-notifications, and notification-to-a destination identity. Foreign keys cascade from user to owned rows and from reminder to occurrences/exceptions; notification destinations use `RESTRICT` to preserve delivery ownership. Application transactions persist a state change and its idempotency response together. Outbound Telegram calls occur only after the transaction commits. Rescheduling and cancellation lock the target reminder, relevant occurrences, and pending notifications; they fail safely if a notification is already `SENDING`.
 
@@ -1375,3 +1377,64 @@ replayed direct Telegram read can send the response again. This is an accepted
 VS-14 response-delivery limitation, not an idempotency or authorization gap;
 response-level deduplication remains future work if Telegram duplicate replies
 become operationally unacceptable.
+
+### 9.11 PostgreSQL semantic memory indexing
+
+Migration `0016_memory_embeddings` enables the PostgreSQL `vector` extension
+and adds a nullable `vector(1536)` column to the existing `memory_facts` table.
+It is additive: existing fact text and identifiers are unchanged and existing
+rows receive `embedding_status=PENDING`. `content` remains the authoritative
+fact and is the only value returned to a user. The current schema is compatible
+with either the configurable OpenAI-compatible adapter or Google's
+`gemini-embedding-001` adapter at 1,536 dimensions and cosine distance. Gemini
+uses `RETRIEVAL_DOCUMENT` for saved facts and `RETRIEVAL_QUERY` for questions;
+its 1,536-dimensional Matryoshka prefix is manually L2-normalized after
+truncation as required by Google's guidance. The provider boundary is a small
+`EmbeddingProvider` protocol; deterministic fakes are used in automated tests.
+
+Embedding work starts only inside the already authorized memory-save service,
+after intent, extraction, grounding, canonical-user resolution, pending-context
+validation, and replay checks. A successful vector is recorded as `INDEXED`
+with its model name and SHA-256 content hash. Provider failure does not roll
+back the fact: the original content commits as `FAILED`, with only a sanitized
+error category and attempt count, and can be retried. A disabled provider
+stores `PENDING`. The save confirmation says only that the information was
+saved and never claims semantic indexing succeeded. Replayed Telegram save
+events return their committed idempotent result without repeating embedding
+work.
+
+`memory-embedding-backfill` locks at most 100 eligible rows with `FOR UPDATE
+SKIP LOCKED`, regenerates vectors from current authoritative content, and
+commits one resumable batch. Content updates invalidate or regenerate their
+vector; matching model and content hashes make regeneration a no-op. Model
+changes are handled by deploying a compatible schema migration when dimensions
+change, updating the provider/model configuration, and repeatedly running the
+backfill. During that transition, retrieval only uses rows indexed by the active
+model/configuration; embeddings from incompatible models are never compared. A
+dimension change always requires a new Alembic migration; it must never
+reinterpret an existing vector column in place.
+
+Retrieval remains deterministic-first. It runs an owner-filtered, bounded lexical
+query and returns a single exact subject match without calling either an LLM or
+the embedding provider. Multiple lexical matches enter the existing typed
+`RETRIEVE_MEMORY` clarification flow. Only when lexical evidence is insufficient
+does the service embed the query and issue an exact, bounded PostgreSQL cosine
+search constrained by both canonical `user_id` and active embedding model.
+Scores below the configurable relevance threshold are unknown; candidates close
+within the configurable ambiguity margin clarify instead of letting the highest
+score hide a plausible conflict. Thresholds are configuration values exercised
+at their boundaries by deterministic tests. HNSW is intentionally absent: exact
+owner-filtered search preserves recall and is adequate at current scale. Add an
+approximate index only after query plans and per-owner cardinality demonstrate a
+need.
+
+Embedding privacy is deny-by-default for external providers. Passwords,
+passphrases, PINs, access/gate/door/security codes, API keys, tokens, private
+keys, recovery/seed phrases, and similar detected secrets are marked
+`SKIPPED_SENSITIVE` and remain lexically retrievable; their content is not sent
+externally unless `EMBEDDING_ALLOW_SENSITIVE_EXTERNAL=true` reflects an approved
+deployment policy. The same rule suppresses sensitive query embedding. Raw
+memories, query contents, vectors, provider responses, and credentials are not
+logged. If the provider or semantic index is unavailable, retrieval falls back
+to deterministic lexical behavior and otherwise responds unknown or asks for
+clarification; it never invents a value.
