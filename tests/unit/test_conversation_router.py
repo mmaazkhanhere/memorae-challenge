@@ -3,6 +3,7 @@ from datetime import date
 from reminder_agent.conversation_router import (
     ConversationRoute,
     is_completion_command,
+    is_memory_save_command,
     is_list_request_command,
     is_summary_request_command,
     route_message,
@@ -85,6 +86,18 @@ def test_router_does_not_start_a_reminder_from_unrelated_text() -> None:
     assert route_message("I have five tasks today", pending=None).route is (
         ConversationRoute.MODEL_FALLBACK
     )
+
+
+def test_router_recognizes_explicit_memory_save_deterministically() -> None:
+    for text in (
+        "Remember my gate code is 4512",
+        "Make a note that my laptop model is ThinkPad T14",
+        "Take note of my backup email",
+    ):
+        assert is_memory_save_command(text) is True
+        assert route_message(text, pending=None).route is (
+            ConversationRoute.SAVE_MEMORY_REQUEST
+        )
 
 
 def test_router_allows_free_text_only_when_the_task_is_missing() -> None:

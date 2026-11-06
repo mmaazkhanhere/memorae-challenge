@@ -19,6 +19,7 @@ class ConversationRoute(StrEnum):
     CANCEL_REQUEST = "CANCEL_REQUEST"
     COMPLETE_REQUEST = "COMPLETE_REQUEST"
     SNOOZE_REQUEST = "SNOOZE_REQUEST"
+    SAVE_MEMORY_REQUEST = "SAVE_MEMORY_REQUEST"
     CLARIFICATION_REPLY = "CLARIFICATION_REPLY"
     CANCELLATION = "CANCELLATION"
     SOCIAL = "SOCIAL"
@@ -33,6 +34,10 @@ class RouteDecision:
 
 _NEW_REMINDER = re.compile(
     r"^\s*(?:please\s+)?(?:remind\s+me|set\s+(?:a\s+)?reminder)(?:\s+|$)",
+    re.IGNORECASE,
+)
+_SAVE_MEMORY = re.compile(
+    r"^\s*(?:please\s+)?(?:remember|save|(?:make|take)\s+(?:a\s+)?note)\b",
     re.IGNORECASE,
 )
 _LIST_REMINDERS = re.compile(
@@ -114,6 +119,11 @@ def is_new_reminder_command(text: str) -> bool:
     return _NEW_REMINDER.match(text.strip()) is not None
 
 
+def is_memory_save_command(text: str) -> bool:
+    """Return whether text explicitly asks to save information."""
+    return _SAVE_MEMORY.match(text.strip()) is not None
+
+
 def is_list_request_command(text: str) -> bool:
     """Return whether text explicitly asks to view reminders or a schedule."""
     raw = text.strip()
@@ -143,6 +153,8 @@ def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecisio
         return RouteDecision(ConversationRoute.COMPLETE_REQUEST)
     if is_snooze_command(raw):
         return RouteDecision(ConversationRoute.SNOOZE_REQUEST)
+    if is_memory_save_command(raw):
+        return RouteDecision(ConversationRoute.SAVE_MEMORY_REQUEST)
 
     # An acknowledgement is conversational only when there is no active
     # clarification.  With pending context it must be interpreted as an answer
