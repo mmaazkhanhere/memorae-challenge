@@ -3323,6 +3323,10 @@ class ReminderIntentInterpreter:
             provider_result.resolved_intents
             or provider_result.clarification is not None
             or provider_result.clear_context
+            # SAVE_MEMORY is a typed provider result too.  It does not expose
+            # a reminder intent, so omitting it here causes the provider fact
+            # to be replaced by the rule-based reminder clarification.
+            or provider_result.memory_fact is not None
         ):
             if (
                 context is None

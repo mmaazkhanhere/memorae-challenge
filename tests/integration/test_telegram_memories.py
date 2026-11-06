@@ -4,7 +4,12 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
 from reminder_agent.conversation_router import ConversationRoute, route_message
-from reminder_agent.intent import IntentRoute, IntentRouteSuggestion, Interpretation
+from reminder_agent.intent import (
+    IntentRoute,
+    IntentRouteSuggestion,
+    Interpretation,
+    ReminderIntentInterpreter,
+)
 from reminder_agent.main import create_app
 from reminder_agent.memories import MemoryIntentEvidence, SaveMemoryFact
 
@@ -385,6 +390,46 @@ def test_keep_in_mind_completes_model_fallback_memory_sequence_once(
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
 
 
+def test_model_routed_memory_save_for_dog_name_creates_only_one_fact(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=1450)
+    text = "I'd like you to remember that my dog's name is Bruno"
+
+    class MemoryRouter:
+        def classify(self, *args, **kwargs):
+            return IntentRouteSuggestion(
+                operation=IntentRoute.SAVE_MEMORY,
+                memory_intent_evidence=MemoryIntentEvidence(
+                    kind="EXPLICIT_SAVE_REQUEST",
+                    confidence="CLEAR",
+                    evidence_text="remember",
+                ),
+            )
+
+    class MemoryExtractor:
+        def interpret(self, latest_text, *, selected_route, **kwargs):
+            assert latest_text == text
+            assert selected_route is IntentRoute.SAVE_MEMORY
+            return Interpretation(
+                memory_fact=SaveMemoryFact(content="my dog's name is Bruno")
+            )
+
+    api_client.app.state.intent_router = MemoryRouter()
+    api_client.app.state.reminder_interpreter = ReminderIntentInterpreter(
+        model_interpreter=MemoryExtractor()
+    )
+
+    assert post_update(api_client, update_factory(1452, text=text)).status_code == 200
+    assert telegram_client.messages[-1][1] == "I saved that information."
+    assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
+    assert db.scalar(select(func.count()).select_from(Reminder)) == 0
+    assert db.scalar(select(func.count()).select_from(ReminderOccurrence)) == 0
+    assert db.scalar(select(func.count()).select_from(Notification)) == 0
+    fact = db.scalar(select(MemoryFact))
+    assert fact is not None and fact.content == "my dog's name is Bruno"
+
+
 def test_uncertain_memory_classification_clarifies_without_extraction_or_mutation(
     api_client, telegram_client, db, update_factory
 ) -> None:
@@ -464,7 +509,11 @@ def test_malformed_llm_memory_content_clarifies_without_mutation(
     ).status_code == 200
 
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == 0
+    assert db.scalar(select(func.count()).select_from(Reminder)) == 0
+    assert db.scalar(select(func.count()).select_from(ReminderOccurrence)) == 0
+    assert db.scalar(select(func.count()).select_from(Notification)) == 0
     assert telegram_client.messages[-1][1] == "Tell me what information to remember."
+    assert "reminder task" not in telegram_client.messages[-1][1].lower()
     session = db.scalar(select(ConversationSession))
     assert session is not None
     assert session.pending_clarification == {"operation": "SAVE_MEMORY", "content": None}
