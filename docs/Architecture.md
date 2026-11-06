@@ -1074,6 +1074,11 @@ The primary execution order for a Telegram text request is:
 1. The webhook authenticates and validates the update; `handle_update` resolves the Telegram identity.
 2. `handle_reminder_text` verifies the active user, linked Telegram identity, idempotency key, onboarding state, and saved IANA time zone.
 3. `conversation_router.route_message` makes a deterministic routing decision from the text and any pending creation context.
+   It recognizes only high-precision creation forms: `remember to <action>` and
+   `save a reminder to <action>` select reminder creation, while `remember
+   that/my <fact>` selects memory saving. Mixed cues such as `remember to keep
+   <fact> in mind`, and otherwise ambiguous wording, select `MODEL_FALLBACK`
+   rather than guessing.
 4. Only a `MODEL_FALLBACK` route calls `OpenAICompatibleIntentRouter.classify`, when a router is configured. The classifier may select `SAVE_MEMORY` for a clearly intentional indirect save request, but not for an ordinary statement. For memory fallback, it also returns typed `MemoryIntentEvidence`: a clear `EXPLICIT_SAVE_REQUEST` plus an exact source span. `reminders.py` accepts that evidence only when its kind, confidence, and source grounding validate; English phrase matching is not used as authorization.
 5. The selected route reaches the applicable deterministic parser: `RuleBasedIntentInterpreter`, listing parsing, `parse_reschedule_request`, or `parse_cancellation_request`.
    A `COMPLETE_REQUEST` route bypasses extraction and resolves the delivered occurrence from trusted Telegram context.
@@ -1313,9 +1318,11 @@ read-only list or summary request.
 ### 9.9 Saved memory facts (VS-13)
 
 VS-13 adds a minimal `memory_facts` table and a shared `memories.py` service. A
-Telegram request beginning with explicit save language such as “Remember …” is
-recognized deterministically before reminder interpretation. Natural-language
-variants that do not match the deterministic prefix use the existing classifier,
+high-precision explicit fact command such as “Remember my …” or “Remember
+that my …” is recognized deterministically. Explicit reminder wording such as
+“Remember to call …” and “Save a reminder to …” is routed to reminder
+creation instead. Mixed creation cues and other natural-language variants use
+the existing classifier,
 which returns structured save-intent evidence rather than relying on a growing
 English phrase allowlist. Evidence must be a clear explicit-save classification
 with a grounded source span; ordinary statements, quoted instructions, negated
