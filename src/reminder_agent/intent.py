@@ -17,7 +17,11 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from reminder_agent.observability import get_logger, log_event
 from reminder_agent.recurrence import WeeklyRecurrence
 from reminder_agent.request_policy import OUT_OF_SCOPE_RESPONSE
-from reminder_agent.memories import MemoryIntentEvidence, SaveMemoryFact
+from reminder_agent.intent_routing_rules import (
+    REMINDER_COMMAND_PREFIX,
+    is_disambiguated_reminder_command,
+)
+from reminder_agent.memories import MemoryIntentEvidence, SaveMemoryFact, extract_memory_content
 
 logger = get_logger()
 
@@ -1103,10 +1107,7 @@ def restrict_to_explicit_field_updates(
 class RuleBasedIntentInterpreter:
     """Conservative parser that refuses to guess incomplete date/time requests."""
 
-    _prefix = re.compile(
-        r"^\s*(?:please\s+)?(?:remind\s+me|set\s+(?:a\s+)?reminder)(?:\s+|$)",
-        re.IGNORECASE,
-    )
+    _prefix = REMINDER_COMMAND_PREFIX
     _relative = re.compile(
         r"\bin\s+(?P<amount>\d+|[a-z]+)\s+(?P<unit>minutes?|hours?)\b",
         re.IGNORECASE,
@@ -1262,6 +1263,17 @@ class RuleBasedIntentInterpreter:
             return Interpretation(
                 response_text="How long should I snooze that reminder?",
                 fallback_allowed=True,
+            )
+        if route is IntentRoute.SAVE_MEMORY:
+            content = extract_memory_content(raw)
+            if content is None:
+                return Interpretation(
+                    response_text="What information should I remember?",
+                    fallback_allowed=True,
+                )
+            return Interpretation(
+                memory_fact=SaveMemoryFact(content=content),
+                fallback_allowed=False,
             )
         if route is not IntentRoute.UPDATE_PENDING:
             context = None
@@ -1444,6 +1456,7 @@ class RuleBasedIntentInterpreter:
                         date_explicit=True,
                     ),
                     now=now,
+                    fallback_allowed=not is_disambiguated_reminder_command(raw),
                 )
             due_local = datetime.combine(
                 local_date,
@@ -1492,7 +1505,11 @@ class RuleBasedIntentInterpreter:
                 timezone_name=timezone_name,
                 date_explicit=date_explicit,
             )
-            return self._pending_result(pending, now=now)
+            return self._pending_result(
+                pending,
+                now=now,
+                fallback_allowed=not is_disambiguated_reminder_command(raw),
+            )
 
         # A command with an ordinary task but no schedule is still useful
         # deterministic input.  Store it as pending rather than asking a model
@@ -1503,7 +1520,7 @@ class RuleBasedIntentInterpreter:
         return self._pending_result(
             PendingReminder(task=task or None, timezone_name=timezone_name),
             now=now,
-            fallback_allowed=True,
+            fallback_allowed=not is_disambiguated_reminder_command(raw),
         )
 
     def _interpret_summary(

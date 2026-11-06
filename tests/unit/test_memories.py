@@ -77,6 +77,11 @@ def test_incomplete_memory_command_has_no_content(text: str) -> None:
     assert extract_memory_content(text) is None
 
 
+def test_memory_extractor_rejects_reminder_shaped_text() -> None:
+    assert is_memory_save_command("Remember to call Ali") is False
+    assert extract_memory_content("Remember to call Ali") is None
+
+
 def test_memory_content_validation_rejects_blank() -> None:
     with pytest.raises(ValueError):
         SaveMemoryFact(content="   ")

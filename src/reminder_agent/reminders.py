@@ -75,9 +75,9 @@ from reminder_agent.memories import (
     extract_memory_content,
     is_memory_intent_evidence_grounded,
     is_memory_content_grounded,
-    is_memory_save_command,
     save_memory_fact,
 )
+from reminder_agent.intent_routing_rules import is_memory_reminder_collision
 from reminder_agent.completion import (
     complete_occurrence,
     match_completion_candidates,
@@ -1467,9 +1467,10 @@ def _route_and_interpret(
     intent_router: IntentRouter | None = None,
     recent_messages: list[str] | None = None,
     recent_delivered_reminders: list[dict[str, str]] | None = None,
+    deterministic_route: ConversationRoute | None = None,
 ) -> tuple[ConversationRoute, Interpretation]:
     """Route first, then interpret only the route that permits it."""
-    route = route_message(text, pending=pending).route
+    route = deterministic_route or route_message(text, pending=pending).route
     deterministic_route = route
     classifier_selected_update = False
     classifier_selected = False
@@ -2268,7 +2269,7 @@ def _handle_memory_text(
     if from_model:
         content = model_content
     else:
-        content = extract_memory_content(text) if is_memory_save_command(text) else text.strip()
+        content = extract_memory_content(text) if pending is None else text.strip()
 
     # Re-validate model output at the application boundary before any database
     # work. The shared persistence service validates again inside its own
@@ -2804,17 +2805,20 @@ def handle_reminder_text(
         return ReminderReply(update.message.chat.id, OUT_OF_SCOPE_RESPONSE)
 
     normalized_text = re.sub(r"[.!?]+$", "", text.strip().casefold()).strip()
+    deterministic_route = route_message(text, pending=pending).route
 
     # A stale SAVE_MEMORY draft must not consume an arbitrary next statement as
-    # its fact. An explicit new memory command is a fresh request and is still
-    # allowed to proceed through the deterministic path below.
+    # its fact. Explicit memory and reminder commands remain new operations.
     expired_memory_pending = (
         session_is_expired
         and session is not None
         and isinstance(session.pending_clarification, dict)
         and session.pending_clarification.get("operation") == "SAVE_MEMORY"
     )
-    if expired_memory_pending and not is_memory_save_command(text):
+    if expired_memory_pending and deterministic_route not in {
+        ConversationRoute.SAVE_MEMORY_REQUEST,
+        ConversationRoute.NEW_REQUEST,
+    }:
         return _end_pending_session(
             db,
             update,
@@ -2829,11 +2833,11 @@ def handle_reminder_text(
             "That memory request expired. Please send the complete request again.",
         )
 
-    # Memory saving is an explicit, deterministic command. It is handled before
-    # reminder operations so a saved fact can never fall through to reminder
-    # extraction or create reminder-related rows.
-    if is_memory_save_command(text) or pending_memory is not None:
-        if pending_memory is not None and normalized_text in {
+    # A pending memory accepts a plain fact as its answer. Explicit commands
+    # continue through the shared route decision so they can supersede this
+    # operation safely instead of being silently saved as content.
+    if pending_memory is not None:
+        if normalized_text in {
             "cancel",
             "cancel it",
             "never mind",
@@ -2851,13 +2855,12 @@ def handle_reminder_text(
                 operation="SAVE_MEMORY",
             ) or ReminderReply(update.message.chat.id, "Okay, I won't save anything.")
 
-        if is_memory_save_command(text) and pending_memory is None and (
-            pending is not None
-            or pending_reschedule is not None
-            or pending_cancellation is not None
-            or pending_completion is not None
-            or pending_snooze is not None
-        ):
+        if deterministic_route in {
+            ConversationRoute.NEW_REQUEST,
+            ConversationRoute.RESCHEDULE_REQUEST,
+            ConversationRoute.CANCEL_REQUEST,
+            ConversationRoute.SNOOZE_REQUEST,
+        } or is_memory_reminder_collision(text):
             _end_pending_session(
                 db,
                 update,
@@ -2865,19 +2868,19 @@ def handle_reminder_text(
                 now=now,
                 session_ttl_seconds=session_ttl_seconds,
             )
-            pending = None
-            pending_reschedule = None
-            pending_cancellation = None
-            pending_completion = None
-            pending_snooze = None
-        return _handle_memory_text(
-            db,
-            update,
-            user=user,
-            pending=pending_memory,
-            now=now,
-            session_ttl_seconds=session_ttl_seconds,
-        )
+            pending_memory = None
+        elif deterministic_route not in {
+            ConversationRoute.LIST_REQUEST,
+            ConversationRoute.SUMMARY_REQUEST,
+        }:
+            return _handle_memory_text(
+                db,
+                update,
+                user=user,
+                pending=pending_memory,
+                now=now,
+                session_ttl_seconds=session_ttl_seconds,
+            )
 
     # A pending snooze remains in its original operation context unless the
     # user explicitly starts a new mutation or safely cancels it. Read-only
@@ -3097,6 +3100,7 @@ def handle_reminder_text(
             intent_router=intent_router,
             recent_messages=recent_messages,
             recent_delivered_reminders=recent_delivered_reminders,
+            deterministic_route=deterministic_route,
         )
         if route is ConversationRoute.RESCHEDULE_REQUEST:
             reschedule_reply = _handle_reschedule_text(
@@ -3188,7 +3192,7 @@ def handle_reminder_text(
                 now=now,
                 session_ttl_seconds=session_ttl_seconds,
                 model_content=memory_fact.content if memory_fact is not None else None,
-                from_model=True,
+                from_model=deterministic_route is ConversationRoute.MODEL_FALLBACK,
                 clarification_text=interpretation.response_text,
             )
         elif route is ConversationRoute.SNOOZE_REQUEST:

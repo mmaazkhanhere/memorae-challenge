@@ -220,26 +220,114 @@ def test_unexpected_memory_save_failure_rolls_back_and_never_confirms(
     ) == 0
 
 
-def test_explicit_memory_save_bypasses_interpreter_and_classifier(
+def test_explicit_memory_save_uses_rules_without_calling_classifier(
     api_client, db, update_factory
 ) -> None:
     onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=800)
-
-    class FailingInterpreter:
-        def interpret(self, *args, **kwargs):
-            raise AssertionError("explicit memory save must not invoke extraction")
 
     class FailingRouter:
         def classify(self, *args, **kwargs):
             raise AssertionError("explicit memory save must not invoke classification")
 
-    api_client.app.state.reminder_interpreter = FailingInterpreter()
     api_client.app.state.intent_router = FailingRouter()
     assert post_update(
         api_client,
         update_factory(802, text="Remember my emergency contact is Sam"),
     ).status_code == 200
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
+
+
+def test_unambiguous_reminder_and_memory_commands_do_not_cross_write_or_call_llm(
+    api_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=1600)
+
+    class FailingRouter:
+        def classify(self, *args, **kwargs):  # pragma: no cover - assertion below
+            raise AssertionError("unambiguous commands must not invoke classification")
+
+    class FailingExtractor:
+        def interpret(self, *args, **kwargs):  # pragma: no cover - assertion below
+            raise AssertionError("deterministic commands must not invoke extraction fallback")
+
+    api_client.app.state.intent_router = FailingRouter()
+    api_client.app.state.reminder_interpreter = ReminderIntentInterpreter(
+        model_interpreter=FailingExtractor()
+    )
+    timed_reminder = update_factory(1602, text="Remember to call Ali tomorrow at 9 AM")
+    assert post_update(api_client, timed_reminder).status_code == 200
+    reminder = db.scalar(select(Reminder))
+    assert reminder is not None and reminder.task == "call Ali"
+    assert db.scalar(select(func.count()).select_from(MemoryFact)) == 0
+
+    assert post_update(
+        api_client, update_factory(1603, text="Remember to call Ali")
+    ).status_code == 200
+    assert db.scalar(select(func.count()).select_from(Reminder)) == 1
+    session = db.scalar(select(ConversationSession))
+    assert session is not None
+    assert session.pending_clarification["task"] == "call Ali"
+
+    assert post_update(
+        api_client, update_factory(1604, text="Remember my gate code is 4512")
+    ).status_code == 200
+    assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
+    assert db.scalar(select(func.count()).select_from(Reminder)) == 1
+
+    assert post_update(
+        api_client, update_factory(1605, text="Remember that my birthday is January 10")
+    ).status_code == 200
+    assert db.scalar(select(func.count()).select_from(MemoryFact)) == 2
+    assert db.scalar(select(func.count()).select_from(Reminder)) == 1
+
+    saved_reminder = update_factory(1606, text="Save a reminder to call Ali tomorrow at 9")
+    assert post_update(api_client, saved_reminder).status_code == 200
+    assert db.scalar(select(func.count()).select_from(MemoryFact)) == 2
+    # The command is deterministically a reminder request. "9" lacks an
+    # AM/PM marker, so the existing schedule validator keeps it as a pending
+    # reminder rather than guessing a delivery time.
+    assert db.scalar(select(func.count()).select_from(Reminder)) == 1
+    db.expire_all()
+    session = db.scalar(select(ConversationSession))
+    assert session is not None and session.pending_clarification["task"] == "call Ali"
+    assert post_update(api_client, saved_reminder).status_code == 200
+    assert db.scalar(select(func.count()).select_from(MemoryFact)) == 2
+    assert db.scalar(select(func.count()).select_from(Reminder)) == 1
+
+
+def test_colliding_or_uncertain_creation_text_uses_classifier_without_writes(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=1700)
+    calls: list[str] = []
+
+    class UncertainRouter:
+        def classify(self, text, **kwargs):
+            calls.append(text)
+            return IntentRouteSuggestion(operation=IntentRoute.UNCERTAIN)
+
+    class FailingExtractor:
+        def interpret(self, *args, **kwargs):  # pragma: no cover - assertion below
+            raise AssertionError("uncertain intent must not reach extraction")
+
+    api_client.app.state.intent_router = UncertainRouter()
+    api_client.app.state.reminder_interpreter = FailingExtractor()
+    for update_id, text in (
+        (1702, "Remember to keep my gate code in mind"),
+        (1703, "Don't forget Ali's birthday"),
+    ):
+        assert route_message(text, pending=None).route is ConversationRoute.MODEL_FALLBACK
+        assert post_update(api_client, update_factory(update_id, text=text)).status_code == 200
+
+    assert calls == [
+        "Remember to keep my gate code in mind",
+        "Don't forget Ali's birthday",
+    ]
+    assert "not sure" in telegram_client.messages[-1][1].lower()
+    assert db.scalar(select(func.count()).select_from(MemoryFact)) == 0
+    assert db.scalar(select(func.count()).select_from(Reminder)) == 0
+    assert db.scalar(select(func.count()).select_from(ReminderOccurrence)) == 0
+    assert db.scalar(select(func.count()).select_from(Notification)) == 0
 
 
 def test_saved_memory_secret_is_omitted_from_idempotency_and_recent_history(

@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.orm import Session
 
 from reminder_agent.db.models import MemoryFact
+from reminder_agent.intent_routing_rules import ExplicitCreateRoute, explicit_create_route
 
 MEMORY_OPERATION = "SAVE_MEMORY"
 _MEMORY_PREFIX = re.compile(
@@ -84,7 +85,7 @@ class SavedMemory:
 
 
 def is_memory_save_command(text: str) -> bool:
-    return _MEMORY_PREFIX.match(text) is not None
+    return explicit_create_route(text) is ExplicitCreateRoute.SAVE_MEMORY
 
 
 def is_memory_intent_evidence_grounded(
@@ -120,6 +121,10 @@ def is_memory_content_grounded(source: str, content: str) -> bool:
 
 
 def extract_memory_content(text: str) -> str | None:
+    """Extract content only after the shared routing rule selected memory."""
+
+    if not is_memory_save_command(text):
+        return None
     match = _MEMORY_PREFIX.match(text)
     if match is None:
         return None

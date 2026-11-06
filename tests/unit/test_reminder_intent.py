@@ -32,6 +32,30 @@ from reminder_agent.request_policy import OUT_OF_SCOPE_RESPONSE
 NOW = datetime(2026, 10, 30, 12, 0, tzinfo=timezone.utc)
 
 
+def test_rule_interpreter_extracts_remember_to_as_a_reminder() -> None:
+    result = RuleBasedIntentInterpreter().interpret(
+        "Remember to call Ali tomorrow at 9 AM",
+        selected_route=IntentRoute.NEW_REQUEST,
+        timezone_name="Asia/Karachi",
+        now=NOW,
+    )
+
+    assert result.intent is not None
+    assert result.intent.task == "call Ali"
+
+
+def test_rule_interpreter_clarifies_remember_to_without_a_time() -> None:
+    result = RuleBasedIntentInterpreter().interpret(
+        "Remember to call Ali",
+        selected_route=IntentRoute.NEW_REQUEST,
+        timezone_name="Asia/Karachi",
+        now=NOW,
+    )
+
+    assert result.clarification is not None
+    assert result.clarification.pending.task == "call Ali"
+
+
 def test_monthly_ordinal_request_preserves_recurrence_while_asking_for_time() -> None:
     result = RuleBasedIntentInterpreter().interpret(
         "Remind me on the first day of every month to pay rent",

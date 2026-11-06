@@ -100,6 +100,33 @@ def test_router_recognizes_explicit_memory_save_deterministically() -> None:
         )
 
 
+def test_router_distinguishes_unambiguous_reminders_from_memory_facts() -> None:
+    assert route_message(
+        "Remember to call Ali tomorrow at 9 AM", pending=None
+    ).route is ConversationRoute.NEW_REQUEST
+    assert route_message("Remember to call Ali", pending=None).route is (
+        ConversationRoute.NEW_REQUEST
+    )
+    assert route_message("Save a reminder to call Ali tomorrow at 9", pending=None).route is (
+        ConversationRoute.NEW_REQUEST
+    )
+    assert route_message("Remember my gate code is 4512", pending=None).route is (
+        ConversationRoute.SAVE_MEMORY_REQUEST
+    )
+    assert route_message("Remember that my birthday is January 10", pending=None).route is (
+        ConversationRoute.SAVE_MEMORY_REQUEST
+    )
+
+
+def test_router_defers_overlapping_or_ambiguous_creation_language() -> None:
+    for text in (
+        "Remember to keep my gate code in mind",
+        "Don't forget Ali's birthday",
+        "My gate code is 4512",
+    ):
+        assert route_message(text, pending=None).route is ConversationRoute.MODEL_FALLBACK
+
+
 def test_router_allows_free_text_only_when_the_task_is_missing() -> None:
     pending_without_task = _pending(task=None)
 
