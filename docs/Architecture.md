@@ -1341,3 +1341,37 @@ after commit. Replayed Telegram updates return the stored response without
 inserting another fact. Memory request text is omitted from the classifier's
 durable recent-message history so secrets are not unnecessarily duplicated in
 idempotency payloads; logs contain only metadata such as content length.
+
+### 9.10 Retrieved memory facts (VS-14)
+
+VS-14 keeps memory reads on the same authenticated Telegram and shared-memory
+service boundary as saving. High-precision forms such as "What's my gate code?"
+extract their subject deterministically and query only facts owned by the
+canonical user. Reminder/date wording takes precedence over a question-shaped
+memory lookup: "What's my reminder for tomorrow?" and "What reminders do I
+have tomorrow?" are read-only reminder-list requests.
+
+If the deterministic router cannot reliably identify the requested subject, it
+may use the existing classifier to select `RETRIEVE_MEMORY`, then the existing
+typed extractor to propose only `RetrieveMemoryQuery.query`. The proposal is
+schema-checked, rejects answer/value and fact/user-ID fields, and must be
+grounded in the original request before an owner-scoped database search. The
+LLM cannot return a fact value, choose a fact ID, select a user, or authorize
+access; response text is formed only from a fact returned by the shared lookup
+service.
+
+Candidate matching treats every owner-scoped fact that contains the requested
+subject as plausible. It does not rank one lexical phrase match above another
+potentially conflicting fact; multiple matches produce a typed
+`RETRIEVE_MEMORY` clarification context with trusted candidate IDs, while an
+unknown subject returns an explicit unknown response. A narrowing reply reloads
+only the current owner's candidate rows. An expired lookup context is ended and
+returns a memory-specific expiration response rather than applying its stale
+candidate IDs.
+
+Direct, successful or unknown memory reads intentionally do not create an
+`IdempotencyRecord` because they do not change domain state. Consequently a
+replayed direct Telegram read can send the response again. This is an accepted
+VS-14 response-delivery limitation, not an idempotency or authorization gap;
+response-level deduplication remains future work if Telegram duplicate replies
+become operationally unacceptable.
