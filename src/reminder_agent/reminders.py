@@ -20,6 +20,7 @@ from reminder_agent.db.models import (
     ChannelIdentity,
     ConversationSession,
     IdempotencyRecord,
+    MemoryFact,
     Notification,
     Reminder,
     ReminderOccurrence,
@@ -80,9 +81,12 @@ from reminder_agent.memories import (
     is_memory_intent_evidence_grounded,
     is_memory_content_grounded,
     is_memory_lookup_query_grounded,
+    index_memory_fact,
     lookup_memory_fact,
     save_memory_fact,
+    MemoryRetrievalPolicy,
 )
+from reminder_agent.embeddings import EmbeddingPrivacyPolicy, EmbeddingProvider
 from reminder_agent.intent_routing_rules import is_memory_reminder_collision
 from reminder_agent.completion import (
     complete_occurrence,
@@ -2285,6 +2289,8 @@ def _handle_memory_text(
     model_content: str | None = None,
     from_model: bool = False,
     clarification_text: str | None = None,
+    embedding_provider: EmbeddingProvider | None = None,
+    embedding_privacy_policy: EmbeddingPrivacyPolicy = EmbeddingPrivacyPolicy(),
 ) -> ReminderReply:
     """Save an explicit memory command or continue a pending memory clarification."""
 
@@ -2378,7 +2384,12 @@ def _handle_memory_text(
                     operation="SAVE_MEMORY",
                     include_request_text=False,
                 )
-            save_memory_fact(db, user_id=locked_user.id, content=content, now=now)
+            saved = save_memory_fact(
+                db,
+                user_id=locked_user.id,
+                content=content,
+                now=now,
+            )
             if locked_session is not None:
                 end_session(locked_session, now=now)
             log_event(
@@ -2388,7 +2399,7 @@ def _handle_memory_text(
                 update_id=update.update_id,
                 content_length=len(content),
             )
-            return _store_response(
+            reply = _store_response(
                 db,
                 update=update,
                 user_id=locked_user.id,
@@ -2397,6 +2408,50 @@ def _handle_memory_text(
                 operation="SAVE_MEMORY",
                 include_request_text=False,
             )
+        # The authoritative fact and idempotency result are durable before any
+        # provider call. A concurrent/replayed update now observes the committed
+        # record and cannot duplicate embedding work. A crash here leaves a
+        # resumable PENDING fact rather than losing the memory.
+        if embedding_provider is not None:
+            try:
+                with db.begin():
+                    fact = db.scalar(
+                        select(MemoryFact)
+                        .where(
+                            MemoryFact.id == saved.fact_id,
+                            MemoryFact.user_id == user.id,
+                        )
+                        .with_for_update()
+                    )
+                    if fact is not None:
+                        index_memory_fact(
+                            fact,
+                            embedding_provider=embedding_provider,
+                            privacy_policy=embedding_privacy_policy,
+                            now=now,
+                        )
+                        embedding_status = fact.embedding_status
+                    else:  # pragma: no cover - protected by the committed insert
+                        embedding_status = "PENDING"
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "memory_embedding_indexing_completed",
+                    update_id=update.update_id,
+                    embedding_status=embedding_status,
+                )
+            except Exception as exc:
+                db.rollback()
+                # Saving already committed. Keep the fact PENDING for backfill
+                # and never turn an indexing outage into a false save failure.
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "memory_embedding_indexing_deferred",
+                    update_id=update.update_id,
+                    reason_type=type(exc).__name__,
+                )
+        return reply
     except IntegrityError:
         duplicate = _recover_from_idempotency_race(db, update)
         if duplicate is not None:
@@ -2455,6 +2510,9 @@ def _handle_memory_lookup_text(
     from_model: bool = False,
     now: datetime,
     session_ttl_seconds: int,
+    embedding_provider: EmbeddingProvider | None = None,
+    embedding_privacy_policy: EmbeddingPrivacyPolicy = EmbeddingPrivacyPolicy(),
+    memory_retrieval_policy: MemoryRetrievalPolicy = MemoryRetrievalPolicy(),
 ) -> ReminderReply:
     """Resolve one owned fact or persist a non-revealing clarification."""
 
@@ -2485,6 +2543,9 @@ def _handle_memory_lookup_text(
                 user_id=locked_user.id,
                 query=query,
                 candidate_ids=pending.candidate_ids if pending is not None else None,
+                embedding_provider=embedding_provider,
+                privacy_policy=embedding_privacy_policy,
+                retrieval_policy=memory_retrieval_policy,
             )
             if result.status == "FOUND" and result.fact is not None:
                 if pending is not None:
@@ -2749,9 +2810,14 @@ def handle_reminder_text(
     intent_router: IntentRouter | None = None,
     now: datetime,
     session_ttl_seconds: int = 900,
+    embedding_provider: EmbeddingProvider | None = None,
+    embedding_privacy_policy: EmbeddingPrivacyPolicy | None = None,
+    memory_retrieval_policy: MemoryRetrievalPolicy | None = None,
 ) -> ReminderReply:
     """Interpret and transactionally create one or more reminders for a Telegram user."""
     assert update.message is not None
+    embedding_privacy_policy = embedding_privacy_policy or EmbeddingPrivacyPolicy()
+    memory_retrieval_policy = memory_retrieval_policy or MemoryRetrievalPolicy()
     log_event(
         logger,
         logging.INFO,
@@ -2992,6 +3058,9 @@ def handle_reminder_text(
                     query=text,
                     now=now,
                     session_ttl_seconds=session_ttl_seconds,
+                    embedding_provider=embedding_provider,
+                    embedding_privacy_policy=embedding_privacy_policy,
+                    memory_retrieval_policy=memory_retrieval_policy,
                 )
             _end_pending_session(
                 db,
@@ -3043,6 +3112,9 @@ def handle_reminder_text(
             query=extract_memory_lookup_query(text),
             now=now,
             session_ttl_seconds=session_ttl_seconds,
+            embedding_provider=embedding_provider,
+            embedding_privacy_policy=embedding_privacy_policy,
+            memory_retrieval_policy=memory_retrieval_policy,
         )
 
     # A stale SAVE_MEMORY draft must not consume an arbitrary next statement as
@@ -3118,6 +3190,8 @@ def handle_reminder_text(
                 pending=pending_memory,
                 now=now,
                 session_ttl_seconds=session_ttl_seconds,
+                embedding_provider=embedding_provider,
+                embedding_privacy_policy=embedding_privacy_policy,
             )
 
     # A pending snooze remains in its original operation context unless the
@@ -3409,6 +3483,9 @@ def handle_reminder_text(
                 from_model=deterministic_route is ConversationRoute.MODEL_FALLBACK,
                 now=now,
                 session_ttl_seconds=session_ttl_seconds,
+                embedding_provider=embedding_provider,
+                embedding_privacy_policy=embedding_privacy_policy,
+                memory_retrieval_policy=memory_retrieval_policy,
             )
         elif route is ConversationRoute.SAVE_MEMORY_REQUEST:
             # A classifier-selected memory request is a new operation. End any
@@ -3447,6 +3524,8 @@ def handle_reminder_text(
                 model_content=memory_fact.content if memory_fact is not None else None,
                 from_model=deterministic_route is ConversationRoute.MODEL_FALLBACK,
                 clarification_text=interpretation.response_text,
+                embedding_provider=embedding_provider,
+                embedding_privacy_policy=embedding_privacy_policy,
             )
         elif route is ConversationRoute.SNOOZE_REQUEST:
             return _handle_snooze_text(
