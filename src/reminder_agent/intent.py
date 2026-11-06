@@ -21,7 +21,12 @@ from reminder_agent.intent_routing_rules import (
     REMINDER_COMMAND_PREFIX,
     is_disambiguated_reminder_command,
 )
-from reminder_agent.memories import MemoryIntentEvidence, SaveMemoryFact, extract_memory_content
+from reminder_agent.memories import (
+    MemoryIntentEvidence,
+    RetrieveMemoryQuery,
+    SaveMemoryFact,
+    extract_memory_content,
+)
 
 logger = get_logger()
 
@@ -38,6 +43,7 @@ _OPERATION_ENVELOPE_KEYS = {
     "RESCHEDULE_REMINDER",
     "SNOOZE_OCCURRENCE",
     "SAVE_MEMORY",
+    "RETRIEVE_MEMORY",
     "UPDATE_PENDING_REMINDER",
     "NEEDS_CLARIFICATION",
     "UNKNOWN",
@@ -112,6 +118,7 @@ class IntentRoute(StrEnum):
     COMPLETE_REQUEST = "COMPLETE_REQUEST"
     SNOOZE_REQUEST = "SNOOZE_REQUEST"
     SAVE_MEMORY = "SAVE_MEMORY"
+    RETRIEVE_MEMORY = "RETRIEVE_MEMORY"
     UPDATE_PENDING = "UPDATE_PENDING"
     CANCEL_PENDING = "CANCEL_PENDING"
     SOCIAL = "SOCIAL"
@@ -181,6 +188,8 @@ class OpenAICompatibleIntentRouter:
               user explicitly or clearly intentionally asks you to remember, store, note, keep in
               mind, or not forget information. An ordinary statement of fact is not permission to
               save anything.
+            - RETRIEVE_MEMORY: Recall one previously saved fact. Select this only for a specific
+              lookup question; do not provide a fact value, fact ID, user ID, or answer.
             - UPDATE_PENDING: Clarify or modify the pending reminder.
             - CANCEL_PENDING: Cancel the pending reminder.
             - SOCIAL: Casual chat.
@@ -631,6 +640,7 @@ class Interpretation:
     completion_target_text: str | None = None
     snooze_duration_seconds: int | None = None
     memory_fact: SaveMemoryFact | None = None
+    memory_query: RetrieveMemoryQuery | None = None
 
     @property
     def resolved_intents(
@@ -1196,6 +1206,7 @@ class RuleBasedIntentInterpreter:
     _list_request = re.compile(
         r"^\s*(?:can\s+you\s+)?(?:what\s+(?:do\s+i\s+have|are\s+my\s+reminders?|"
         r"reminders?\s+do\s+i\s+have)|"
+        r"what(?:'s|\s+is)\s+(?:my\s+)?reminders?(?:\s+(?:for|on|tomorrow|today))?|"
         r"(?:list|show)(?:\s+(?:my|me))?\s+(?:all\s+(?:the\s+)?)?(?:recurring\s+)?reminders?|"
         r"what(?:'s|\s+is)\s+(?:(?:on|in)\s+)?(?:my\s+)?schedule|"
         r"what\s+is\s+scheduled|anything\s+coming\s+up)\b",
@@ -1275,6 +1286,11 @@ class RuleBasedIntentInterpreter:
                 memory_fact=SaveMemoryFact(content=content),
                 fallback_allowed=False,
             )
+        if route is IntentRoute.RETRIEVE_MEMORY:
+            # Deterministic routing has already established this as a lookup,
+            # but no deterministic subject was available. The existing typed
+            # extractor may propose that subject; it never supplies an answer.
+            return Interpretation(fallback_allowed=True)
         if route is not IntentRoute.UPDATE_PENDING:
             context = None
         # An explicit new reminder command supersedes an unresolved clarification.
@@ -2388,6 +2404,13 @@ class OpenAICompatibleIntentInterpreter:
                 - If the user did not provide any content, return NEEDS_CLARIFICATION with a
                   focused question asking what information to remember.
 
+                RETRIEVE_MEMORY:
+                - RETRIEVE_MEMORY: query only, containing the exact requested subject words.
+                - Never return a fact value, answer, fact ID, memory ID, user ID, or candidate ID.
+                - Do not add synonyms or facts that are absent from the latest user message.
+                - If the subject is missing or ambiguous, return NEEDS_CLARIFICATION with a
+                  focused question asking which saved information to look up.
+
                 RESCHEDULE_REQUEST:
                 - RESCHEDULE_REMINDER: target_text, scope (OCCURRENCE/SERIES),
                 date_explicit, and exactly one of due_local or offset_minutes.
@@ -2561,6 +2584,28 @@ class OpenAICompatibleIntentInterpreter:
                     content_length=len(memory_fact.content),
                 )
                 return Interpretation(memory_fact=memory_fact, fallback_allowed=False)
+            if route is IntentRoute.RETRIEVE_MEMORY:
+                if operation != "RETRIEVE_MEMORY":
+                    if operation == "NEEDS_CLARIFICATION":
+                        question = data.get("question")
+                        if not isinstance(question, str) or not question.strip():
+                            raise ValueError("missing memory lookup clarification question")
+                        return Interpretation(
+                            response_text=question.strip(), fallback_allowed=False
+                        )
+                    raise ValueError("provider returned an unsupported memory lookup operation")
+                unexpected_fields = set(data) - {"operation", "query"}
+                if unexpected_fields:
+                    raise ValueError("memory lookup intent has unexpected fields")
+                memory_query = RetrieveMemoryQuery.model_validate(data)
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "memory_lookup_extraction_completed",
+                    model=self._model,
+                    query_length=len(memory_query.query),
+                )
+                return Interpretation(memory_query=memory_query, fallback_allowed=False)
             if route is IntentRoute.SNOOZE_REQUEST:
                 if operation not in {"SNOOZE_OCCURRENCE", "SNOOZE_REMINDER"}:
                     raise ValueError("provider returned an unsupported snooze operation")
@@ -3100,7 +3145,7 @@ class OpenAICompatibleIntentInterpreter:
                 has_pending_context=context is not None,
                 error_message=(
                     "provider_or_schema_error"
-                    if route is IntentRoute.SAVE_MEMORY
+                    if route in {IntentRoute.SAVE_MEMORY, IntentRoute.RETRIEVE_MEMORY}
                     else exc.errors(include_url=False)
                     if isinstance(exc, ValidationError)
                     else str(exc)
@@ -3109,6 +3154,11 @@ class OpenAICompatibleIntentInterpreter:
             if route is IntentRoute.SAVE_MEMORY:
                 return Interpretation(
                     response_text="What information should I remember?",
+                    fallback_allowed=False,
+                )
+            if route is IntentRoute.RETRIEVE_MEMORY:
+                return Interpretation(
+                    response_text="Which saved information should I look up?",
                     fallback_allowed=False,
                 )
             return Interpretation(
@@ -3126,13 +3176,18 @@ class OpenAICompatibleIntentInterpreter:
                 error_type=type(exc).__name__,
                 error_message=(
                     "provider_or_schema_error"
-                    if route is IntentRoute.SAVE_MEMORY
+                    if route in {IntentRoute.SAVE_MEMORY, IntentRoute.RETRIEVE_MEMORY}
                     else str(exc)
                 ),
             )
             if route is IntentRoute.SAVE_MEMORY:
                 return Interpretation(
                     response_text="What information should I remember?",
+                    fallback_allowed=False,
+                )
+            if route is IntentRoute.RETRIEVE_MEMORY:
+                return Interpretation(
+                    response_text="Which saved information should I look up?",
                     fallback_allowed=False,
                 )
             return Interpretation(
@@ -3344,6 +3399,7 @@ class ReminderIntentInterpreter:
             # a reminder intent, so omitting it here causes the provider fact
             # to be replaced by the rule-based reminder clarification.
             or provider_result.memory_fact is not None
+            or provider_result.memory_query is not None
         ):
             if (
                 context is None
