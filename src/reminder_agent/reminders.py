@@ -35,6 +35,7 @@ from reminder_agent.conversations import (
     pending_completion_from_session,
     pending_snooze_from_session,
     pending_memory_from_session,
+    pending_memory_lookup_from_session,
     session_expired,
     telegram_session_id,
 )
@@ -71,10 +72,15 @@ from reminder_agent.conversation_router import (
 )
 from reminder_agent.memories import (
     PendingMemory,
+    PendingMemoryLookup,
+    RetrieveMemoryQuery,
     SaveMemoryFact,
+    extract_memory_lookup_query,
     extract_memory_content,
     is_memory_intent_evidence_grounded,
     is_memory_content_grounded,
+    is_memory_lookup_query_grounded,
+    lookup_memory_fact,
     save_memory_fact,
 )
 from reminder_agent.intent_routing_rules import is_memory_reminder_collision
@@ -1532,6 +1538,8 @@ def _route_and_interpret(
             route = ConversationRoute.COMPLETE_REQUEST
         elif suggestion is IntentRoute.SNOOZE_REQUEST:
             route = ConversationRoute.SNOOZE_REQUEST
+        elif suggestion is IntentRoute.RETRIEVE_MEMORY:
+            route = ConversationRoute.RETRIEVE_MEMORY_REQUEST
         elif suggestion is IntentRoute.SAVE_MEMORY:
             route = ConversationRoute.SAVE_MEMORY_REQUEST
         elif suggestion is IntentRoute.NEW_REQUEST:
@@ -1655,6 +1663,16 @@ def _route_and_interpret(
             context=None,
             recent_messages=recent_messages or [],
         )
+    elif route is ConversationRoute.RETRIEVE_MEMORY_REQUEST:
+        interpretation = _interpret(
+            interpreter,
+            text,
+            selected_route=IntentRoute.RETRIEVE_MEMORY,
+            timezone_name=timezone_name,
+            now=now,
+            context=None,
+            recent_messages=recent_messages or [],
+        )
     elif route is ConversationRoute.SAVE_MEMORY_REQUEST:
         # Intent classification is still only a route proposal. On the model
         # fallback path, require typed, source-grounded classifier evidence;
@@ -1753,7 +1771,13 @@ def _upsert_clarification_session(
     *,
     user_id: UUID,
     external_session_id: str,
-    pending: PendingReminder | PendingCompletion | PendingSnooze | PendingMemory,
+    pending: (
+        PendingReminder
+        | PendingCompletion
+        | PendingSnooze
+        | PendingMemory
+        | PendingMemoryLookup
+    ),
     now: datetime,
 ) -> ConversationSession:
     values = {
@@ -2421,6 +2445,111 @@ def _handle_memory_text(
         )
 
 
+def _handle_memory_lookup_text(
+    db: Session,
+    update: TelegramUpdate,
+    *,
+    user: User,
+    pending: PendingMemoryLookup | None,
+    query: str | None,
+    from_model: bool = False,
+    now: datetime,
+    session_ttl_seconds: int,
+) -> ReminderReply:
+    """Resolve one owned fact or persist a non-revealing clarification."""
+
+    assert update.message is not None
+    try:
+        query = RetrieveMemoryQuery(query=query or "").query
+    except (TypeError, ValueError):
+        query = None
+    if query is None or (from_model and not is_memory_lookup_query_grounded(update.message.text or "", query)):
+        return ReminderReply(update.message.chat.id, "Which saved information should I look up?")
+
+    db.rollback()
+    try:
+        with db.begin():
+            existing = _existing_record(db, update)
+            if existing is not None:
+                return _reply_from_record(existing)
+            locked_user = db.get(User, user.id)
+            if (
+                locked_user is None
+                or locked_user.id != user.id
+                or locked_user.onboarding_status != ACTIVE
+            ):
+                return ReminderReply(update.message.chat.id, "I couldn't verify your account.")
+
+            result = lookup_memory_fact(
+                db,
+                user_id=locked_user.id,
+                query=query,
+                candidate_ids=pending.candidate_ids if pending is not None else None,
+            )
+            if result.status == "FOUND" and result.fact is not None:
+                if pending is not None:
+                    session = load_session(
+                        db,
+                        user_id=locked_user.id,
+                        external_session_id=telegram_session_id(update.message.chat.id),
+                        now=now,
+                        ttl_seconds=session_ttl_seconds,
+                        for_update=True,
+                    )
+                    if pending_memory_lookup_from_session(session) is not None:
+                        end_session(session, now=now)
+                return ReminderReply(
+                    update.message.chat.id,
+                    f'You told me: "{result.fact.content}"',
+                )
+            if result.status == "AMBIGUOUS":
+                lookup_pending = PendingMemoryLookup(
+                    query=query,
+                    candidate_ids=list(result.candidate_ids),
+                )
+                _upsert_clarification_session(
+                    db,
+                    user_id=locked_user.id,
+                    external_session_id=telegram_session_id(update.message.chat.id),
+                    pending=lookup_pending,
+                    now=now,
+                )
+                return _store_response(
+                    db,
+                    update=update,
+                    user_id=locked_user.id,
+                    text="I found more than one saved fact that could match. Please be more specific.",
+                    response_kind="memory_lookup_clarification",
+                    operation="RETRIEVE_MEMORY",
+                    include_request_text=False,
+                )
+            if pending is not None:
+                session = load_session(
+                    db,
+                    user_id=locked_user.id,
+                    external_session_id=telegram_session_id(update.message.chat.id),
+                    now=now,
+                    ttl_seconds=session_ttl_seconds,
+                    for_update=True,
+                )
+                if pending_memory_lookup_from_session(session) is not None:
+                    end_session(session, now=now)
+            return ReminderReply(update.message.chat.id, "I don't know that yet.")
+    except SQLAlchemyError:
+        db.rollback()
+        log_event(
+            logger,
+            logging.ERROR,
+            "memory_lookup_failed",
+            update_id=update.update_id,
+            reason="database_error",
+        )
+        return ReminderReply(
+            update.message.chat.id,
+            "I couldn't retrieve that information. Please try again.",
+        )
+
+
 def _end_pending_snooze(
     db: Session,
     update: TelegramUpdate,
@@ -2764,6 +2893,9 @@ def handle_reminder_text(
     pending_memory = (
         None if session_is_expired else pending_memory_from_session(session)
     )
+    pending_memory_lookup = (
+        None if session_is_expired else pending_memory_lookup_from_session(session)
+    )
     text = update.message.text or ""
     recent_messages = _recent_messages(db, user_id=user.id)
     recent_delivered_reminders = _recent_delivered_reminders(
@@ -2785,6 +2917,7 @@ def handle_reminder_text(
         has_pending_completion=pending_completion is not None,
         has_pending_snooze=pending_snooze is not None,
         has_pending_memory=pending_memory is not None,
+        has_pending_memory_lookup=pending_memory_lookup is not None,
         recent_message_count=len(recent_messages),
     )
     observed_session_version = None if session_is_expired or session is None else session.version
@@ -2806,6 +2939,111 @@ def handle_reminder_text(
 
     normalized_text = re.sub(r"[.!?]+$", "", text.strip().casefold()).strip()
     deterministic_route = route_message(text, pending=pending).route
+
+    # An ambiguous memory lookup keeps its own operation context. Read-only
+    # reminder queries leave it available; explicit new operations safely
+    # supersede it, and a plain follow-up narrows only its trusted candidates.
+    if pending_memory_lookup is not None:
+        if normalized_text in {
+            "cancel",
+            "cancel it",
+            "never mind",
+            "nevermind",
+            "not now",
+        }:
+            return _end_pending_session(
+                db,
+                update,
+                user=user,
+                now=now,
+                session_ttl_seconds=session_ttl_seconds,
+                response_text="Okay, I won't look that up.",
+                response_kind="memory_lookup_canceled",
+                operation="RETRIEVE_MEMORY",
+            ) or ReminderReply(update.message.chat.id, "Okay, I won't look that up.")
+        if deterministic_route in {
+            ConversationRoute.NEW_REQUEST,
+            ConversationRoute.SAVE_MEMORY_REQUEST,
+            ConversationRoute.RESCHEDULE_REQUEST,
+            ConversationRoute.CANCEL_REQUEST,
+            ConversationRoute.SNOOZE_REQUEST,
+        } or is_memory_reminder_collision(text):
+            _end_pending_session(
+                db,
+                update,
+                user=user,
+                now=now,
+                session_ttl_seconds=session_ttl_seconds,
+            )
+            pending_memory_lookup = None
+        elif deterministic_route in {
+            ConversationRoute.LIST_REQUEST,
+            ConversationRoute.SUMMARY_REQUEST,
+        }:
+            pending_memory_lookup = None
+        else:
+            explicit_lookup = extract_memory_lookup_query(text)
+            if explicit_lookup is None:
+                return _handle_memory_lookup_text(
+                    db,
+                    update,
+                    user=user,
+                    pending=pending_memory_lookup,
+                    query=text,
+                    now=now,
+                    session_ttl_seconds=session_ttl_seconds,
+                )
+            _end_pending_session(
+                db,
+                update,
+                user=user,
+                now=now,
+                session_ttl_seconds=session_ttl_seconds,
+            )
+            pending_memory_lookup = None
+
+    # A free-form narrowing reply must never be applied to candidates from an
+    # expired lookup session. A complete, explicit lookup is a new read-only
+    # request and may proceed independently after the old session is ended.
+    expired_memory_lookup = (
+        session_is_expired
+        and session is not None
+        and isinstance(session.pending_clarification, dict)
+        and session.pending_clarification.get("operation") == "RETRIEVE_MEMORY"
+    )
+    if expired_memory_lookup and deterministic_route is not ConversationRoute.RETRIEVE_MEMORY_REQUEST:
+        return _end_pending_session(
+            db,
+            update,
+            user=user,
+            now=now,
+            session_ttl_seconds=session_ttl_seconds,
+            response_text="That memory lookup expired. Please ask what you want to look up again.",
+            response_kind="memory_lookup_clarification_expired",
+            operation="RETRIEVE_MEMORY",
+        ) or ReminderReply(
+            update.message.chat.id,
+            "That memory lookup expired. Please ask what you want to look up again.",
+        )
+
+    if deterministic_route is ConversationRoute.RETRIEVE_MEMORY_REQUEST:
+        if pending_memory is not None:
+            _end_pending_session(
+                db,
+                update,
+                user=user,
+                now=now,
+                session_ttl_seconds=session_ttl_seconds,
+            )
+        return _handle_memory_lookup_text(
+            db,
+            update,
+            user=user,
+            pending=None,
+            query=extract_memory_lookup_query(text),
+            now=now,
+            session_ttl_seconds=session_ttl_seconds,
+        )
 
     # A stale SAVE_MEMORY draft must not consume an arbitrary next statement as
     # its fact. Explicit memory and reminder commands remain new operations.
@@ -3156,6 +3394,21 @@ def handle_reminder_text(
                 identity=identity,
                 now=now,
                 target_text=interpretation.completion_target_text,
+            )
+        elif route is ConversationRoute.RETRIEVE_MEMORY_REQUEST:
+            return _handle_memory_lookup_text(
+                db,
+                update,
+                user=user,
+                pending=None,
+                query=(
+                    interpretation.memory_query.query
+                    if interpretation.memory_query is not None
+                    else None
+                ),
+                from_model=deterministic_route is ConversationRoute.MODEL_FALLBACK,
+                now=now,
+                session_ttl_seconds=session_ttl_seconds,
             )
         elif route is ConversationRoute.SAVE_MEMORY_REQUEST:
             # A classifier-selected memory request is a new operation. End any
