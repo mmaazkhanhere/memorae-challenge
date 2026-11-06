@@ -10,17 +10,31 @@ from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from reminder_agent.db.models import MemoryFact
 from reminder_agent.intent_routing_rules import ExplicitCreateRoute, explicit_create_route
 
 MEMORY_OPERATION = "SAVE_MEMORY"
+MEMORY_LOOKUP_OPERATION = "RETRIEVE_MEMORY"
 _MEMORY_PREFIX = re.compile(
     r"^\s*(?:please\s+)?(?:remember|save|(?:make|take)\s+(?:a\s+)?note)\b",
     re.IGNORECASE,
 )
 _LEADING_FILLER = re.compile(r"^(?:that|this|of|to|for\s+me)\s+", re.IGNORECASE)
+_LOOKUP_PATTERNS = (
+    re.compile(
+        r"^\s*(?:what(?:['’]s|\s+is)|do\s+you\s+(?:remember|know)|tell\s+me)\s+"
+        r"(?:my|the)\s+(?P<query>.+?)\s*[?!.]*\s*$",
+        re.IGNORECASE,
+    ),
+)
+_LOOKUP_IDENTIFIER = re.compile(
+    r"\b(?:fact|memory|user)\s*(?:id|uuid)\b|"
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+    re.IGNORECASE,
+)
 
 
 class MemoryIntentEvidence(BaseModel):
@@ -76,6 +90,50 @@ class PendingMemory(BaseModel):
 
     operation: Literal["SAVE_MEMORY"] = MEMORY_OPERATION
     content: None = None
+
+
+class PendingMemoryLookup(BaseModel):
+    """Typed context for narrowing an ambiguous owner-scoped lookup."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    operation: Literal["RETRIEVE_MEMORY"] = MEMORY_LOOKUP_OPERATION
+    query: str = Field(min_length=1, max_length=300)
+    candidate_ids: list[UUID] = Field(min_length=1, max_length=50)
+
+    @field_validator("query")
+    @classmethod
+    def query_must_not_be_blank(cls, value: str) -> str:
+        value = " ".join(value.split()).strip()
+        if not value:
+            raise ValueError("memory lookup query must not be blank")
+        return value
+
+
+class RetrieveMemoryQuery(BaseModel):
+    """A subject-only lookup proposal accepted from the existing extractor."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    operation: Literal["RETRIEVE_MEMORY"] = MEMORY_LOOKUP_OPERATION
+    query: str = Field(min_length=1, max_length=300)
+
+    @field_validator("query")
+    @classmethod
+    def query_must_be_a_subject_not_an_identifier(cls, value: str) -> str:
+        value = " ".join(value.split()).strip(" .!?")
+        if not value or not _lookup_tokens(value):
+            raise ValueError("memory lookup query must contain a subject")
+        if _LOOKUP_IDENTIFIER.search(value):
+            raise ValueError("memory lookup query must not contain an identifier")
+        return value
+
+
+@dataclass(frozen=True)
+class MemoryLookupResult:
+    status: Literal["FOUND", "UNKNOWN", "AMBIGUOUS"]
+    fact: MemoryFact | None = None
+    candidate_ids: tuple[UUID, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -142,6 +200,33 @@ def extract_memory_content(text: str) -> str | None:
         return None
 
 
+def extract_memory_lookup_query(text: str) -> str | None:
+    """Extract only a specific, deterministic memory lookup subject."""
+
+    for pattern in _LOOKUP_PATTERNS:
+        match = pattern.match(text)
+        if match is None:
+            continue
+        query = " ".join(match.group("query").split()).strip(" .!?\t")
+        if query and _lookup_tokens(query):
+            return query
+    return None
+
+
+def is_memory_lookup_query_grounded(source: str, query: str) -> bool:
+    """Require a model lookup subject to be expressed by the user's request.
+
+    The model may name only the requested subject.  It cannot select a fact,
+    user, or value: the application searches the current owner's facts itself.
+    """
+
+    try:
+        query = RetrieveMemoryQuery(query=query).query
+    except (TypeError, ValueError):
+        return False
+    return set(_lookup_tokens(query)).issubset(set(_lookup_tokens(source)))
+
+
 def save_memory_fact(
     db: Session,
     *,
@@ -162,3 +247,77 @@ def save_memory_fact(
     db.add(fact)
     db.flush()
     return SavedMemory(fact_id=fact.id, saved_at=saved_at)
+
+
+_LOOKUP_STOP_WORDS = {
+    "a",
+    "an",
+    "and",
+    "for",
+    "my",
+    "of",
+    "the",
+    "to",
+}
+
+
+def _normalize_lookup_text(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value).casefold()
+    value = value.replace("-", "").replace("_", "")
+    return " ".join(value.split())
+
+
+def _lookup_tokens(value: str) -> tuple[str, ...]:
+    normalized = _normalize_lookup_text(value)
+    return tuple(
+        token
+        for token in re.findall(r"[^\W_]+", normalized, flags=re.UNICODE)
+        if token not in _LOOKUP_STOP_WORDS and len(token) > 1
+    )
+
+
+def lookup_memory_fact(
+    db: Session,
+    *,
+    user_id: UUID,
+    query: str,
+    candidate_ids: list[UUID] | tuple[UUID, ...] | None = None,
+) -> MemoryLookupResult:
+    """Find one exact owner-scoped fact without modifying memory state."""
+
+    query = " ".join(query.split()).strip()
+    query_tokens = _lookup_tokens(query)
+    if not query_tokens:
+        return MemoryLookupResult(status="UNKNOWN")
+
+    filters = [MemoryFact.user_id == user_id]
+    if candidate_ids is not None:
+        if not candidate_ids:
+            return MemoryLookupResult(status="UNKNOWN")
+        filters.append(MemoryFact.id.in_(candidate_ids))
+    facts = list(
+        db.scalars(
+            select(MemoryFact)
+            .where(*filters)
+            .order_by(MemoryFact.created_at.desc(), MemoryFact.id.asc())
+        ).all()
+    )
+
+    matches: list[MemoryFact] = []
+    for fact in facts:
+        content_tokens = set(_lookup_tokens(fact.content))
+        if not set(query_tokens).issubset(content_tokens):
+            continue
+        matches.append(fact)
+
+    if not matches:
+        return MemoryLookupResult(status="UNKNOWN")
+    # Do not let an exact phrase score conceal a different fact that has the
+    # same requested subject. A clarification is safer than guessing whether
+    # an older or more specific-looking value is still authoritative.
+    if len(matches) != 1:
+        return MemoryLookupResult(
+            status="AMBIGUOUS",
+            candidate_ids=tuple(fact.id for fact in matches),
+        )
+    return MemoryLookupResult(status="FOUND", fact=matches[0])
