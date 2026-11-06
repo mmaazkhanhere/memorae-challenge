@@ -6,11 +6,14 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from reminder_agent.db.models import Base, MemoryFact
+from reminder_agent.embeddings import EmbeddingProviderError
 from reminder_agent.memories import (
+    MemoryRetrievalPolicy,
     MemoryIntentEvidence,
     PendingMemory,
     RetrieveMemoryQuery,
     SaveMemoryFact,
+    backfill_memory_embeddings,
     extract_memory_content,
     extract_memory_lookup_query,
     is_memory_intent_evidence_grounded,
@@ -18,7 +21,35 @@ from reminder_agent.memories import (
     is_memory_save_command,
     lookup_memory_fact,
     save_memory_fact,
+    update_memory_fact_content,
 )
+
+
+def _vector(*coordinates: float) -> list[float]:
+    return [*coordinates, *([0.0] * (1536 - len(coordinates)))]
+
+
+class FakeEmbeddingProvider:
+    model = "fake-semantic-v1"
+    dimensions = 1536
+    is_external = False
+
+    def __init__(self, vectors: dict[str, list[float]] | None = None) -> None:
+        self.vectors = vectors or {}
+        self.calls: list[str] = []
+
+    def embed(self, text: str) -> list[float]:
+        self.calls.append(text)
+        for phrase, vector in self.vectors.items():
+            if phrase.casefold() in text.casefold():
+                return vector
+        return _vector(0, 0, 0, 1)
+
+
+class FailingEmbeddingProvider(FakeEmbeddingProvider):
+    def embed(self, text: str) -> list[float]:
+        self.calls.append(text)
+        raise EmbeddingProviderError()
 
 
 def test_explicit_memory_command_is_detected_and_extracted() -> None:
@@ -112,6 +143,7 @@ def test_save_memory_fact_persists_only_to_memory_table() -> None:
         assert fact is not None
         assert fact.user_id == user_id
         assert fact.content == "Wi-Fi password is Andorra2026"
+        assert fact.embedding_status == "PENDING"
     engine.dispose()
 
 
@@ -225,3 +257,187 @@ def test_memory_lookup_query_is_high_precision(text: str, expected: str) -> None
 @pytest.mark.parametrize("text", ["What do I have tomorrow?", "Remember my gate code is 4512"])
 def test_non_lookup_text_is_not_parsed_as_memory_lookup(text: str) -> None:
     assert extract_memory_lookup_query(text) is None
+
+
+def test_embedding_failure_keeps_authoritative_fact_pending_for_retry() -> None:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    provider = FailingEmbeddingProvider()
+    with Session(engine) as db:
+        saved = save_memory_fact(
+            db,
+            user_id=uuid4(),
+            content="my favorite food is biryani",
+            embedding_provider=provider,
+        )
+        db.commit()
+        fact = db.get(MemoryFact, saved.fact_id)
+        assert fact is not None and fact.content == "my favorite food is biryani"
+        assert saved.embedding_status == "FAILED"
+        assert fact.embedding is None
+        assert fact.embedding_attempts == 1
+        assert fact.embedding_last_error == "PROVIDER_UNAVAILABLE"
+    engine.dispose()
+
+
+def test_sensitive_memory_is_not_sent_to_external_provider_by_default() -> None:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    provider = FakeEmbeddingProvider()
+    provider.is_external = True
+    with Session(engine) as db:
+        saved = save_memory_fact(
+            db,
+            user_id=uuid4(),
+            content="my gate code is 4512",
+            embedding_provider=provider,
+        )
+        db.commit()
+        fact = db.get(MemoryFact, saved.fact_id)
+        assert fact is not None and fact.embedding_status == "SKIPPED_SENSITIVE"
+        assert fact.embedding is None
+        assert provider.calls == []
+    engine.dispose()
+
+
+def test_backfill_and_content_regeneration_are_resumable_and_idempotent() -> None:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    provider = FakeEmbeddingProvider(
+        {"biryani": _vector(1, 0), "nihari": _vector(0, 1)}
+    )
+    owner_id = uuid4()
+    with Session(engine) as db:
+        saved = save_memory_fact(
+            db,
+            user_id=owner_id,
+            content="my favorite food is biryani",
+        )
+        db.commit()
+        assert backfill_memory_embeddings(db, embedding_provider=provider) == 1
+        db.commit()
+        assert backfill_memory_embeddings(db, embedding_provider=provider) == 0
+        db.commit()
+        assert provider.calls == ["my favorite food is biryani"]
+
+        fact = update_memory_fact_content(
+            db,
+            user_id=owner_id,
+            fact_id=saved.fact_id,
+            content="my favorite food is biryani",
+            embedding_provider=provider,
+        )
+        assert fact is not None
+        assert provider.calls == ["my favorite food is biryani"]
+        fact = update_memory_fact_content(
+            db,
+            user_id=owner_id,
+            fact_id=saved.fact_id,
+            content="my favorite food is nihari",
+            embedding_provider=provider,
+        )
+        db.commit()
+        assert fact is not None and fact.content == "my favorite food is nihari"
+        assert fact.embedding_status == "INDEXED"
+        assert provider.calls[-1] == "my favorite food is nihari"
+    engine.dispose()
+
+
+def test_semantic_lookup_is_owner_scoped_and_threshold_calibrated() -> None:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    provider = FakeEmbeddingProvider(
+        {
+            "parking slot": _vector(1, 0),
+            "where do i park": _vector(1, 0),
+            "unrelated": _vector(0, 1),
+        }
+    )
+    owner_id = uuid4()
+    other_id = uuid4()
+    with Session(engine) as db:
+        owned = save_memory_fact(
+            db,
+            user_id=owner_id,
+            content="my parking slot is B17",
+            embedding_provider=provider,
+        )
+        save_memory_fact(
+            db,
+            user_id=other_id,
+            content="my parking slot is A99",
+            embedding_provider=provider,
+        )
+        save_memory_fact(
+            db,
+            user_id=owner_id,
+            content="an unrelated fact",
+            embedding_provider=provider,
+        )
+        db.commit()
+
+        result = lookup_memory_fact(
+            db,
+            user_id=owner_id,
+            query="where do I park",
+            embedding_provider=provider,
+            retrieval_policy=MemoryRetrievalPolicy(
+                semantic_relevance_threshold=0.80,
+                semantic_ambiguity_margin=0.04,
+            ),
+        )
+        assert result.status == "FOUND"
+        assert result.fact is not None and result.fact.id == owned.fact_id
+
+        unknown = lookup_memory_fact(
+            db,
+            user_id=owner_id,
+            query="unknown subject",
+            embedding_provider=provider,
+            retrieval_policy=MemoryRetrievalPolicy(
+                semantic_relevance_threshold=0.80,
+                semantic_ambiguity_margin=0.04,
+            ),
+        )
+        assert unknown.status == "UNKNOWN"
+    engine.dispose()
+
+
+def test_close_semantic_conflicts_trigger_typed_ambiguity() -> None:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    provider = FakeEmbeddingProvider(
+        {
+            "office is in lahore": _vector(1, 0),
+            "workplace is karachi": _vector(0.999, 0.02),
+            "office located": _vector(1, 0),
+        }
+    )
+    owner_id = uuid4()
+    with Session(engine) as db:
+        first = save_memory_fact(
+            db,
+            user_id=owner_id,
+            content="my office is in Lahore",
+            embedding_provider=provider,
+        )
+        second = save_memory_fact(
+            db,
+            user_id=owner_id,
+            content="my workplace is Karachi",
+            embedding_provider=provider,
+        )
+        db.commit()
+        result = lookup_memory_fact(
+            db,
+            user_id=owner_id,
+            query="office located",
+            embedding_provider=provider,
+            retrieval_policy=MemoryRetrievalPolicy(
+                semantic_relevance_threshold=0.80,
+                semantic_ambiguity_margin=0.04,
+            ),
+        )
+        assert result.status == "AMBIGUOUS"
+        assert set(result.candidate_ids) == {first.fact_id, second.fact_id}
+    engine.dispose()

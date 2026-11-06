@@ -11,6 +11,7 @@ from reminder_agent.intent import (
     ReminderIntentInterpreter,
 )
 from reminder_agent.main import create_app
+from reminder_agent.embeddings import EmbeddingProviderError
 from reminder_agent.memories import MemoryIntentEvidence, RetrieveMemoryQuery, SaveMemoryFact
 
 from reminder_agent.db.models import (
@@ -25,6 +26,38 @@ from reminder_agent.db.models import (
 
 
 HEADERS = {"X-Telegram-Bot-Api-Secret-Token": "test-secret"}
+
+
+def _semantic_vector(axis: int) -> list[float]:
+    vector = [0.0] * 1536
+    vector[axis] = 1.0
+    return vector
+
+
+class DeterministicFakeEmbeddings:
+    model = "fake-semantic-v1"
+    dimensions = 1536
+    is_external = False
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def embed(self, text: str) -> list[float]:
+        self.calls.append(text)
+        normalized = text.casefold()
+        if "food" in normalized or "biryani" in normalized:
+            return _semantic_vector(0)
+        if any(token in normalized for token in ("park", "b17", "leave", "car")):
+            return _semantic_vector(1)
+        if "office" in normalized or "lahore" in normalized or "located" in normalized:
+            return _semantic_vector(2)
+        return _semantic_vector(3)
+
+
+class FailingFakeEmbeddings(DeterministicFakeEmbeddings):
+    def embed(self, text: str) -> list[float]:
+        self.calls.append(text)
+        raise EmbeddingProviderError()
 
 
 def post_update(client, update: dict):
@@ -874,3 +907,112 @@ def test_expired_pending_memory_does_not_save_follow_up_as_a_new_fact(
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == 0
     db.expire_all()
     assert db.scalar(select(ConversationSession)).pending_clarification is None
+
+
+def test_required_lexical_and_semantic_memory_phrases(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    provider = DeterministicFakeEmbeddings()
+    api_client.app.state.embedding_provider = provider
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=2000)
+
+    cases = (
+        (2002, "Remember my favorite food is biryani.", "What's my favorite food?", "biryani"),
+        (2004, None, "Which food do I like most?", "biryani"),
+        (
+            2005,
+            "Remember my parking slot is B17.",
+            "Where do I leave my car?",
+            "B17",
+        ),
+        (
+            2007,
+            "Remember my office location is Lahore.",
+            "Where is my office located?",
+            "Lahore",
+        ),
+    )
+    next_query_id = 2003
+    for save_id, save_text, query_text, expected in cases:
+        if save_text is not None:
+            assert post_update(
+                api_client, update_factory(save_id, text=save_text)
+            ).status_code == 200
+            next_query_id = save_id + 1
+        assert post_update(
+            api_client, update_factory(next_query_id, text=query_text)
+        ).status_code == 200
+        assert expected in telegram_client.messages[-1][1]
+        next_query_id += 1
+
+    assert db.scalar(select(func.count()).select_from(MemoryFact)) == 3
+    assert db.scalar(select(func.count()).select_from(Reminder)) == 0
+    assert db.scalar(select(func.count()).select_from(ReminderOccurrence)) == 0
+    assert db.scalar(select(func.count()).select_from(Notification)) == 0
+
+
+def test_disabled_embedding_provider_falls_back_to_deterministic_lexical_lookup(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=2050)
+    api_client.app.state.embedding_provider = None
+    assert post_update(
+        api_client,
+        update_factory(2052, text="Remember my parking slot is B17"),
+    ).status_code == 200
+    assert post_update(
+        api_client,
+        update_factory(2053, text="What's my parking slot?"),
+    ).status_code == 200
+    assert telegram_client.messages[-1][1] == 'You told me: "my parking slot is B17"'
+    fact = db.scalar(select(MemoryFact))
+    assert fact is not None and fact.embedding is None
+
+
+def test_exact_lookup_does_not_call_embedding_or_llm(
+    api_client, telegram_client, update_factory
+) -> None:
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=2100)
+    assert post_update(
+        api_client,
+        update_factory(2102, text="Remember my favorite food is biryani"),
+    ).status_code == 200
+
+    class MustNotRun:
+        model = "fake-semantic-v1"
+        dimensions = 1536
+        is_external = False
+
+        def embed(self, text):
+            raise AssertionError("exact lexical lookup must not invoke embeddings")
+
+    class MustNotClassify:
+        def classify(self, *args, **kwargs):
+            raise AssertionError("exact memory lookup must not invoke classification")
+
+    api_client.app.state.embedding_provider = MustNotRun()
+    api_client.app.state.intent_router = MustNotClassify()
+    assert post_update(
+        api_client,
+        update_factory(2103, text="What's my favorite food?"),
+    ).status_code == 200
+    assert "biryani" in telegram_client.messages[-1][1]
+
+
+def test_embedding_failure_saves_once_and_replay_does_not_repeat_work(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    provider = FailingFakeEmbeddings()
+    api_client.app.state.embedding_provider = provider
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=2200)
+    update = update_factory(2202, text="Remember my favorite food is biryani")
+    assert post_update(api_client, update).status_code == 200
+    assert telegram_client.messages[-1][1] == "I saved that information."
+    assert post_update(api_client, update).status_code == 200
+
+    fact = db.scalar(select(MemoryFact))
+    assert fact is not None and fact.content == "my favorite food is biryani"
+    assert fact.embedding_status == "FAILED"
+    assert fact.embedding is None
+    assert len(provider.calls) == 1
+    assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
