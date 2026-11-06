@@ -327,6 +327,66 @@ def test_malformed_memory_extraction_is_clarification_only(monkeypatch) -> None:
     assert result.fallback_allowed is False
 
 
+def test_openai_compatible_extractor_returns_groundable_memory_lookup_query(monkeypatch) -> None:
+    captured: dict = {}
+
+    def fake_post(*args, **kwargs):
+        captured.update(kwargs["json"])
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={
+                "choices": [
+                    {"message": {"content": '{"operation":"RETRIEVE_MEMORY","query":"color"}'}}
+                ]
+            },
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    result = OpenAICompatibleIntentInterpreter(
+        "https://llm.example/v1", "secret", "provider-model"
+    ).interpret(
+        "Which color do I like?",
+        selected_route=IntentRoute.RETRIEVE_MEMORY,
+        timezone_name="UTC",
+        now=NOW,
+    )
+
+    assert result.memory_query is not None and result.memory_query.query == "color"
+    assert "RETRIEVE_MEMORY" in captured["messages"][0]["content"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"operation":"RETRIEVE_MEMORY","query":"color","answer":"blue"}',
+        '{"operation":"RETRIEVE_MEMORY","query":"color","fact_id":"9d03e6c2-ef28-40d7-80f1-c5720151d129"}',
+        '{"operation":"RETRIEVE_MEMORY","query":"color","user_id":"9d03e6c2-ef28-40d7-80f1-c5720151d129"}',
+        '{"operation":"RETRIEVE_MEMORY","query":"user ID 9d03e6c2-ef28-40d7-80f1-c5720151d129"}',
+    ],
+)
+def test_malformed_memory_lookup_extraction_is_clarification_only(monkeypatch, payload: str) -> None:
+    def fake_post(*args, **kwargs):
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={"choices": [{"message": {"content": payload}}]},
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    result = OpenAICompatibleIntentInterpreter(
+        "https://llm.example/v1", "secret", "provider-model"
+    ).interpret(
+        "Which color do I like?",
+        selected_route=IntentRoute.RETRIEVE_MEMORY,
+        timezone_name="UTC",
+        now=NOW,
+    )
+
+    assert result.memory_query is None
+    assert result.response_text == "Which saved information should I look up?"
+
+
 def test_memory_classifier_and_extractor_logs_redact_fact_content(monkeypatch) -> None:
     secret = "gate code is SECRET-4512"
     responses = iter(
