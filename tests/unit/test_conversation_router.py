@@ -1,8 +1,11 @@
 from datetime import date
 
+import pytest
+
 from reminder_agent.conversation_router import (
     ConversationRoute,
     is_completion_command,
+    is_memory_lookup_command,
     is_memory_save_command,
     is_list_request_command,
     is_summary_request_command,
@@ -98,6 +101,20 @@ def test_router_recognizes_explicit_memory_save_deterministically() -> None:
         assert route_message(text, pending=None).route is (
             ConversationRoute.SAVE_MEMORY_REQUEST
         )
+
+
+def test_router_recognizes_memory_lookup_without_model_fallback() -> None:
+    for text in ("What's my gate code?", "What is my Wi-Fi password?"):
+        assert is_memory_lookup_command(text) is True
+        assert route_message(text, pending=None).route is ConversationRoute.RETRIEVE_MEMORY_REQUEST
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["What's my reminder for tomorrow?", "What reminders do I have tomorrow?"],
+)
+def test_router_prefers_reminder_listing_over_memory_lookup_collision(text: str) -> None:
+    assert route_message(text, pending=None).route is ConversationRoute.LIST_REQUEST
 
 
 def test_router_distinguishes_unambiguous_reminders_from_memory_facts() -> None:
