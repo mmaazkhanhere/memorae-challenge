@@ -9,6 +9,7 @@ from enum import StrEnum
 from reminder_agent.intent import PendingReminder
 from reminder_agent.cancellation import is_cancel_command
 from reminder_agent.intent_routing_rules import ExplicitCreateRoute, explicit_create_route
+from reminder_agent.memories import extract_memory_lookup_query
 from reminder_agent.snooze import is_snooze_command
 
 
@@ -21,6 +22,7 @@ class ConversationRoute(StrEnum):
     COMPLETE_REQUEST = "COMPLETE_REQUEST"
     SNOOZE_REQUEST = "SNOOZE_REQUEST"
     SAVE_MEMORY_REQUEST = "SAVE_MEMORY_REQUEST"
+    RETRIEVE_MEMORY_REQUEST = "RETRIEVE_MEMORY_REQUEST"
     CLARIFICATION_REPLY = "CLARIFICATION_REPLY"
     CANCELLATION = "CANCELLATION"
     SOCIAL = "SOCIAL"
@@ -36,6 +38,7 @@ class RouteDecision:
 _LIST_REMINDERS = re.compile(
     r"^\s*(?:can\s+you\s+)?(?:what\s+(?:do\s+i\s+have|are\s+my\s+reminders?|"
     r"reminders?\s+do\s+i\s+have)|"
+    r"what(?:['â€™]s|\s+is)\s+(?:my\s+)?reminders?(?:\s+(?:for|on|tomorrow|today))?|"
     r"(?:list|show)(?:\s+(?:my|me))?\s+(?:all\s+(?:the\s+)?)?(?:recurring\s+)?reminders?)\b",
     re.IGNORECASE,
 )
@@ -117,6 +120,11 @@ def is_memory_save_command(text: str) -> bool:
     return explicit_create_route(text) is ExplicitCreateRoute.SAVE_MEMORY
 
 
+def is_memory_lookup_command(text: str) -> bool:
+    """Return whether text is a high-precision saved-fact lookup question."""
+    return extract_memory_lookup_query(text) is not None
+
+
 def is_list_request_command(text: str) -> bool:
     """Return whether text explicitly asks to view reminders or a schedule."""
     raw = text.strip()
@@ -146,6 +154,13 @@ def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecisio
         return RouteDecision(ConversationRoute.COMPLETE_REQUEST)
     if is_snooze_command(raw):
         return RouteDecision(ConversationRoute.SNOOZE_REQUEST)
+    # Reminder/date wording wins over a broad question-shaped memory lookup.
+    # For example, "What's my reminder for tomorrow?" is a schedule query,
+    # while "What's my gate code?" remains an exact memory lookup.
+    if is_list_request_command(raw):
+        return RouteDecision(ConversationRoute.LIST_REQUEST)
+    if is_memory_lookup_command(raw):
+        return RouteDecision(ConversationRoute.RETRIEVE_MEMORY_REQUEST)
     creation_route = explicit_create_route(raw)
     if creation_route is ExplicitCreateRoute.SAVE_MEMORY:
         return RouteDecision(ConversationRoute.SAVE_MEMORY_REQUEST)
@@ -163,8 +178,6 @@ def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecisio
     if pending is None:
         if is_summary_request_command(raw):
             return RouteDecision(ConversationRoute.SUMMARY_REQUEST)
-        if is_list_request_command(raw):
-            return RouteDecision(ConversationRoute.LIST_REQUEST)
         if is_cancel_command(raw):
             return RouteDecision(ConversationRoute.CANCEL_REQUEST)
         if _BARE_CLOCK.fullmatch(raw):
