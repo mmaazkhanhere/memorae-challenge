@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from reminder_agent.observability import get_logger, log_event
 from reminder_agent.recurrence import WeeklyRecurrence
 from reminder_agent.request_policy import OUT_OF_SCOPE_RESPONSE
+from reminder_agent.memories import MemoryIntentEvidence, SaveMemoryFact
 
 logger = get_logger()
 
@@ -32,6 +33,7 @@ _OPERATION_ENVELOPE_KEYS = {
     "CANCEL_REMINDER",
     "RESCHEDULE_REMINDER",
     "SNOOZE_OCCURRENCE",
+    "SAVE_MEMORY",
     "UPDATE_PENDING_REMINDER",
     "NEEDS_CLARIFICATION",
     "UNKNOWN",
@@ -105,6 +107,7 @@ class IntentRoute(StrEnum):
     CANCEL_REQUEST = "CANCEL_REQUEST"
     COMPLETE_REQUEST = "COMPLETE_REQUEST"
     SNOOZE_REQUEST = "SNOOZE_REQUEST"
+    SAVE_MEMORY = "SAVE_MEMORY"
     UPDATE_PENDING = "UPDATE_PENDING"
     CANCEL_PENDING = "CANCEL_PENDING"
     SOCIAL = "SOCIAL"
@@ -119,6 +122,7 @@ class IntentRouteSuggestion(BaseModel):
 
     operation: IntentRoute
     target_text: str | None = None
+    memory_intent_evidence: MemoryIntentEvidence | None = None
 
 
 class IntentRouter(Protocol):
@@ -169,6 +173,10 @@ class OpenAICompatibleIntentRouter:
             - CANCEL_REQUEST: Cancel an existing reminder or recurring series.
             - COMPLETE_REQUEST: Mark one already-delivered reminder occurrence done.
             - SNOOZE_REQUEST: Postpone one already-delivered reminder occurrence by a positive duration.
+            - SAVE_MEMORY: Save a user-provided fact for later recall. Select this only when the
+              user explicitly or clearly intentionally asks you to remember, store, note, keep in
+              mind, or not forget information. An ordinary statement of fact is not permission to
+              save anything.
             - UPDATE_PENDING: Clarify or modify the pending reminder.
             - CANCEL_PENDING: Cancel the pending reminder.
             - SOCIAL: Casual chat.
@@ -177,8 +185,16 @@ class OpenAICompatibleIntentRouter:
 
             Use pending state, conversation context, and trusted recently-delivered reminders. If the message refers to a specific task, return that task in target_text. If multiple delivered reminders exist and no target is clear, return UNCERTAIN. If unclear, return UNCERTAIN.
 
-            Do not extract fields or execute actions.
-            Return JSON only: {"operation": "<OPERATION>", "target_text": "<task or null>"}.
+            Do not extract fields or execute actions. For memory-related input, distinguish
+            EXPLICIT_SAVE_REQUEST, ORDINARY_STATEMENT, QUOTED_INSTRUCTION, NEGATED_SAVE_REQUEST,
+            REMINDER_REQUEST, and UNCERTAIN. Select SAVE_MEMORY only for a clear explicit save
+            request. Return the exact source span that demonstrates save intent, preserving its
+            language, in memory_intent_evidence.evidence_text. Do not select SAVE_MEMORY for
+            ordinary statements, quoted instructions, negated requests, reminder requests, or
+            uncertain input. Return JSON only:
+            {"operation":"<OPERATION>","target_text":"<task or null>",
+             "memory_intent_evidence":{"kind":"<KIND>","confidence":"<CLEAR|UNCERTAIN>",
+             "evidence_text":"<exact source span or null>"}}.
             """
         )
         payload = {
@@ -209,10 +225,10 @@ class OpenAICompatibleIntentRouter:
             logging.INFO,
             "intent_classification_input",
             model=self._model,
-            latest_message=text[:500],
+            input_length=len(text.strip()),
             active_pending=bool(pending),
-            recent_messages=relevant_history,
-            recent_delivered_reminders=list(recent_delivered_reminders),
+            recent_message_count=len(relevant_history),
+            recent_delivered_reminder_count=len(recent_delivered_reminders),
         )
         try:
             response = httpx.post(
@@ -231,16 +247,33 @@ class OpenAICompatibleIntentRouter:
                 "intent_classification_completed",
                 model=self._model,
                 operation=suggestion.operation,
-                provider_response=data,
+                target_text_present=suggestion.target_text is not None,
+                provider_response={
+                    "operation": data.get("operation"),
+                    "target_text_present": data.get("target_text") is not None,
+                    "memory_evidence_kind": (
+                        data.get("memory_intent_evidence", {}).get("kind")
+                        if isinstance(data.get("memory_intent_evidence"), dict)
+                        else None
+                    ),
+                },
             )
             return suggestion
-        except (httpx.HTTPError, KeyError, TypeError, ValueError, ValidationError, json.JSONDecodeError):
+        except (
+            httpx.HTTPError,
+            KeyError,
+            TypeError,
+            ValueError,
+            ValidationError,
+            json.JSONDecodeError,
+        ) as exc:
             log_event(
                 logger,
                 logging.WARNING,
                 "intent_router_failed",
                 model=self._model,
                 reason="provider_or_schema_error",
+                error_type=type(exc).__name__,
             )
             return IntentRouteSuggestion(operation=IntentRoute.UNCERTAIN)
 
@@ -593,6 +626,7 @@ class Interpretation:
     clear_context: bool = False
     completion_target_text: str | None = None
     snooze_duration_seconds: int | None = None
+    memory_fact: SaveMemoryFact | None = None
 
     @property
     def resolved_intents(
@@ -2329,6 +2363,14 @@ class OpenAICompatibleIntentInterpreter:
                 - SNOOZE_OCCURRENCE: duration_seconds only, as a positive integer.
                 - Do not return occurrence IDs, user IDs, or delivery destinations.
 
+                SAVE_MEMORY:
+                - SAVE_MEMORY: content only, as the user's fact to retain.
+                - Preserve the user's meaning and do not invent, summarize away, or add facts.
+                - This route is already an intentional memory request; ordinary statements must
+                  never be treated as permission to save.
+                - If the user did not provide any content, return NEEDS_CLARIFICATION with a
+                  focused question asking what information to remember.
+
                 RESCHEDULE_REQUEST:
                 - RESCHEDULE_REMINDER: target_text, scope (OCCURRENCE/SERIES),
                 date_explicit, and exactly one of due_local or offset_minutes.
@@ -2416,7 +2458,12 @@ class OpenAICompatibleIntentInterpreter:
             "reminder_intent_provider_request",
             endpoint_host=endpoint_host,
             model=self._model,
-            payload=request_payload,
+            route=route,
+            input_length=len(text.strip()),
+            recent_message_count=len(recent_messages),
+            has_pending_context=context is not None,
+            reschedule_candidate_count=len(reschedule_candidates),
+            cancellation_candidate_count=len(cancellation_candidates),
         )
         try:
             response = httpx.post(
@@ -2464,9 +2511,39 @@ class OpenAICompatibleIntentInterpreter:
                 endpoint_host=endpoint_host,
                 model=self._model,
                 route=route,
-                provider_response=data,
+                operation=data.get("operation"),
+                field_names=sorted(data.keys()),
+                content_length=(
+                    len(data["content"])
+                    if isinstance(data.get("content"), str)
+                    else None
+                ),
+                has_question=isinstance(data.get("question"), str),
             )
             operation = data.get("operation")
+            if route is IntentRoute.SAVE_MEMORY:
+                if operation != "SAVE_MEMORY":
+                    if operation == "NEEDS_CLARIFICATION":
+                        question = data.get("question")
+                        if not isinstance(question, str) or not question.strip():
+                            raise ValueError("missing memory clarification question")
+                        return Interpretation(
+                            response_text=question.strip(),
+                            fallback_allowed=False,
+                        )
+                    raise ValueError("provider returned an unsupported memory operation")
+                unexpected_fields = set(data) - {"operation", "content"}
+                if unexpected_fields:
+                    raise ValueError("memory intent has unexpected fields")
+                memory_fact = SaveMemoryFact.model_validate(data)
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "memory_extraction_completed",
+                    model=self._model,
+                    content_length=len(memory_fact.content),
+                )
+                return Interpretation(memory_fact=memory_fact, fallback_allowed=False)
             if route is IntentRoute.SNOOZE_REQUEST:
                 if operation not in {"SNOOZE_OCCURRENCE", "SNOOZE_REMINDER"}:
                     raise ValueError("provider returned an unsupported snooze operation")
@@ -3005,11 +3082,18 @@ class OpenAICompatibleIntentInterpreter:
                 error_type="provider_or_schema_error",
                 has_pending_context=context is not None,
                 error_message=(
-                    exc.errors(include_url=False)
+                    "provider_or_schema_error"
+                    if route is IntentRoute.SAVE_MEMORY
+                    else exc.errors(include_url=False)
                     if isinstance(exc, ValidationError)
                     else str(exc)
                 ),
             )
+            if route is IntentRoute.SAVE_MEMORY:
+                return Interpretation(
+                    response_text="What information should I remember?",
+                    fallback_allowed=False,
+                )
             return Interpretation(
                 response_text=(
                     "I couldn't understand that reminder. Please provide the task and future time."
@@ -3023,8 +3107,17 @@ class OpenAICompatibleIntentInterpreter:
                 endpoint_host=endpoint_host,
                 model=self._model,
                 error_type=type(exc).__name__,
-                error_message=str(exc),
+                error_message=(
+                    "provider_or_schema_error"
+                    if route is IntentRoute.SAVE_MEMORY
+                    else str(exc)
+                ),
             )
+            if route is IntentRoute.SAVE_MEMORY:
+                return Interpretation(
+                    response_text="What information should I remember?",
+                    fallback_allowed=False,
+                )
             return Interpretation(
                 response_text=(
                     "I couldn't understand that reminder. Please provide the task and future time."
