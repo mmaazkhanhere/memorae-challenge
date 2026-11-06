@@ -2,6 +2,8 @@
 
 from datetime import datetime, timezone
 
+import pytest
+
 from reminder_agent.conversation_router import ConversationRoute
 from reminder_agent.intent import (
     CreateOneTimeReminderIntent,
@@ -13,6 +15,7 @@ from reminder_agent.intent import (
     ReminderIntentInterpreter,
 )
 from reminder_agent.reminders import _route_and_interpret
+from reminder_agent.memories import MemoryIntentEvidence, SaveMemoryFact
 from reminder_agent.request_policy import OUT_OF_SCOPE_RESPONSE
 
 
@@ -143,3 +146,133 @@ def test_incomplete_parameters_invoke_extractor_only_after_intent_is_resolved() 
     assert extractor.selected_route is IntentRoute.NEW_REQUEST
     assert result.clarification is not None
     assert result.clarification.question == "When should I remind you to call the bank?"
+
+
+def test_classifier_selected_memory_reaches_existing_extractor_as_save_route() -> None:
+    class MemoryRouter:
+        def classify(self, *args, **kwargs):
+            return IntentRouteSuggestion(
+                operation=IntentRoute.SAVE_MEMORY,
+                memory_intent_evidence=MemoryIntentEvidence(
+                    kind="EXPLICIT_SAVE_REQUEST",
+                    confidence="CLEAR",
+                    evidence_text="Make a note",
+                ),
+            )
+
+    class MemoryExtractor:
+        selected_route = None
+
+        def interpret(self, text, *, selected_route, **kwargs):
+            self.selected_route = selected_route
+            return Interpretation(memory_fact=SaveMemoryFact(content="gate code is 4512"))
+
+    extractor = MemoryExtractor()
+    route, result = _route_and_interpret(
+        extractor,
+        "Make a note that my gate code is 4512",
+        timezone_name="UTC",
+        now=NOW,
+        pending=None,
+        user_name="Ada",
+        intent_router=MemoryRouter(),
+    )
+
+    assert route is ConversationRoute.SAVE_MEMORY_REQUEST
+    assert extractor.selected_route is IntentRoute.SAVE_MEMORY
+    assert result.memory_fact is not None
+
+
+def test_classifier_memory_route_without_save_language_does_not_extract() -> None:
+    class OvereagerRouter:
+        def classify(self, *args, **kwargs):
+            return IntentRouteSuggestion(operation=IntentRoute.SAVE_MEMORY)
+
+    class FailingExtractor:
+        def interpret(self, *args, **kwargs):  # pragma: no cover - assertion below
+            raise AssertionError("ordinary statements must not reach memory extraction")
+
+    route, result = _route_and_interpret(
+        FailingExtractor(),
+        "My gate code is 4512",
+        timezone_name="UTC",
+        now=NOW,
+        pending=None,
+        user_name="Ada",
+        intent_router=OvereagerRouter(),
+    )
+
+    assert route is ConversationRoute.UNRELATED
+    assert result.memory_fact is None
+    assert result.fallback_allowed is False
+
+
+def test_classifier_evidence_supports_multilingual_save_intent_without_english_rules() -> None:
+    text = "Por favor, recuerda que mi perro se llama Bruno"
+
+    class MultilingualRouter:
+        def classify(self, *args, **kwargs):
+            return IntentRouteSuggestion(
+                operation=IntentRoute.SAVE_MEMORY,
+                memory_intent_evidence=MemoryIntentEvidence(
+                    kind="EXPLICIT_SAVE_REQUEST",
+                    confidence="CLEAR",
+                    evidence_text="recuerda que",
+                ),
+            )
+
+    class RecordingExtractor:
+        called = False
+
+        def interpret(self, *args, **kwargs):
+            self.called = True
+            return Interpretation(memory_fact=SaveMemoryFact(content="mi perro se llama Bruno"))
+
+    extractor = RecordingExtractor()
+    route, result = _route_and_interpret(
+        extractor,
+        text,
+        timezone_name="UTC",
+        now=NOW,
+        pending=None,
+        user_name="Ada",
+        intent_router=MultilingualRouter(),
+    )
+
+    assert route is ConversationRoute.SAVE_MEMORY_REQUEST
+    assert extractor.called is True
+    assert result.memory_fact is not None
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["QUOTED_INSTRUCTION", "NEGATED_SAVE_REQUEST", "REMINDER_REQUEST", "UNCERTAIN"],
+)
+def test_adversarial_memory_evidence_does_not_reach_extractor(kind: str) -> None:
+    class AdversarialRouter:
+        def classify(self, *args, **kwargs):
+            return IntentRouteSuggestion(
+                operation=IntentRoute.SAVE_MEMORY,
+                memory_intent_evidence=MemoryIntentEvidence(
+                    kind=kind,
+                    confidence="CLEAR",
+                    evidence_text="remember this",
+                ),
+            )
+
+    class FailingExtractor:
+        def interpret(self, *args, **kwargs):  # pragma: no cover - assertion below
+            raise AssertionError("non-save evidence must not reach extraction")
+
+    route, result = _route_and_interpret(
+        FailingExtractor(),
+        "This is a quoted instruction: remember this, but do not save it.",
+        timezone_name="UTC",
+        now=NOW,
+        pending=None,
+        user_name="Ada",
+        intent_router=AdversarialRouter(),
+    )
+
+    assert route is ConversationRoute.UNRELATED
+    assert result.memory_fact is None

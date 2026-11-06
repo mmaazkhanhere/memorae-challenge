@@ -52,6 +52,28 @@ class User(Base):
     )
 
 
+class MemoryFact(Base):
+    """A user-owned fact saved for later recall."""
+
+    __tablename__ = "memory_facts"
+    __table_args__ = (
+        CheckConstraint("length(trim(content)) > 0", name="ck_memory_facts_content_nonempty"),
+        Index("ix_memory_facts_user_created", "user_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    user_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
 class ChannelIdentity(Base):
     __tablename__ = "channel_identities"
     __table_args__ = (

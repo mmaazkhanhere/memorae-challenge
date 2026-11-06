@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from pydantic import ValidationError
 
@@ -34,6 +34,7 @@ from reminder_agent.conversations import (
     pending_cancellation_from_session,
     pending_completion_from_session,
     pending_snooze_from_session,
+    pending_memory_from_session,
     session_expired,
     telegram_session_id,
 )
@@ -68,6 +69,15 @@ from reminder_agent.conversation_router import (
     social_response,
     unrelated_response,
 )
+from reminder_agent.memories import (
+    PendingMemory,
+    SaveMemoryFact,
+    extract_memory_content,
+    is_memory_intent_evidence_grounded,
+    is_memory_content_grounded,
+    save_memory_fact,
+)
+from reminder_agent.intent_routing_rules import is_memory_reminder_collision
 from reminder_agent.completion import (
     complete_occurrence,
     match_completion_candidates,
@@ -288,6 +298,7 @@ def _store_response(
     text: str,
     response_kind: str = "clarification",
     operation: str = "CREATE_REMINDER",
+    include_request_text: bool = True,
 ) -> ReminderReply:
     assert update.message is not None
     reply = ReminderReply(
@@ -296,6 +307,16 @@ def _store_response(
         idempotency_key=str(update.update_id),
     )
     now = datetime.now(timezone.utc)
+    response = {
+        "chat_id": reply.chat_id,
+        "text": reply.text,
+        "reply_markup": None,
+    }
+    if include_request_text:
+        # Kept only in the durable idempotency record so the intent classifier
+        # can receive recent turns; memory commands opt out because their text
+        # may contain secrets.
+        response["request_text"] = update.message.text or ""
     db.add(
         IdempotencyRecord(
             source=TELEGRAM,
@@ -305,14 +326,7 @@ def _store_response(
             request_hash=_request_hash(update),
             status="SUCCEEDED",
             delivery_status="PENDING",
-            response={
-                "chat_id": reply.chat_id,
-                "text": reply.text,
-                "reply_markup": None,
-                # Kept only in the durable idempotency record so the intent
-                # classifier can receive the last 34 turns; never log it.
-                "request_text": update.message.text or "",
-            },
+            response=response,
             created_at=now,
             updated_at=now,
         )
@@ -1453,10 +1467,14 @@ def _route_and_interpret(
     intent_router: IntentRouter | None = None,
     recent_messages: list[str] | None = None,
     recent_delivered_reminders: list[dict[str, str]] | None = None,
+    deterministic_route: ConversationRoute | None = None,
 ) -> tuple[ConversationRoute, Interpretation]:
     """Route first, then interpret only the route that permits it."""
-    route = route_message(text, pending=pending).route
+    route = deterministic_route or route_message(text, pending=pending).route
+    deterministic_route = route
     classifier_selected_update = False
+    classifier_selected = False
+    classifier_memory_evidence = None
     completion_target_text: str | None = None
     log_event(
         logger,
@@ -1465,7 +1483,17 @@ def _route_and_interpret(
         route=route,
         has_pending=pending is not None,
     )
-    if route is ConversationRoute.MODEL_FALLBACK and intent_router is not None:
+    if route is ConversationRoute.MODEL_FALLBACK and intent_router is None:
+        log_event(
+            logger,
+            logging.WARNING,
+            "reminder_route_classifier_skipped",
+            reason="not_configured",
+            fallback_intent_route=_selected_intent_route(route, pending=pending),
+            has_pending=pending is not None,
+        )
+    elif route is ConversationRoute.MODEL_FALLBACK and intent_router is not None:
+        classifier_selected = True
         log_event(
             logger,
             logging.INFO,
@@ -1482,12 +1510,15 @@ def _route_and_interpret(
             classify_kwargs.pop("recent_delivered_reminders")
         suggestion_result = intent_router.classify(text, **classify_kwargs)
         suggestion = suggestion_result.operation
+        classifier_memory_evidence = getattr(suggestion_result, "memory_intent_evidence", None)
         completion_target_text = getattr(suggestion_result, "target_text", None)
         log_event(
             logger,
             logging.INFO,
             "reminder_route_classifier_selected",
             operation=suggestion,
+            target_text_present=completion_target_text is not None,
+            deterministic_route=deterministic_route,
         )
         if suggestion is IntentRoute.LIST_REQUEST:
             route = ConversationRoute.LIST_REQUEST
@@ -1501,6 +1532,8 @@ def _route_and_interpret(
             route = ConversationRoute.COMPLETE_REQUEST
         elif suggestion is IntentRoute.SNOOZE_REQUEST:
             route = ConversationRoute.SNOOZE_REQUEST
+        elif suggestion is IntentRoute.SAVE_MEMORY:
+            route = ConversationRoute.SAVE_MEMORY_REQUEST
         elif suggestion is IntentRoute.NEW_REQUEST:
             route = ConversationRoute.NEW_REQUEST
         elif suggestion is IntentRoute.UPDATE_PENDING:
@@ -1528,6 +1561,15 @@ def _route_and_interpret(
             # A classifier has identified this as a clearly unsupported
             # request. Keep deterministic conversational handling separate,
             # but return the project-wide scope limitation here.
+            log_event(
+                logger,
+                logging.INFO,
+                "reminder_route_classifier_mapped",
+                classifier_operation=suggestion,
+                deterministic_route=deterministic_route,
+                mapped_route=ConversationRoute.UNRELATED,
+                has_pending=pending is not None,
+            )
             return ConversationRoute.UNRELATED, Interpretation(
                 response_text=OUT_OF_SCOPE_RESPONSE,
                 fallback_allowed=False,
@@ -1539,6 +1581,16 @@ def _route_and_interpret(
                 "reminder_route_uncertain",
                 has_pending=pending is not None,
             )
+            log_event(
+                logger,
+                logging.INFO,
+                "reminder_route_classifier_mapped",
+                classifier_operation=suggestion,
+                deterministic_route=deterministic_route,
+                mapped_route=ConversationRoute.UNRELATED,
+                has_pending=pending is not None,
+                mapping_reason="uncertain_or_unsupported_classifier_operation",
+            )
             return ConversationRoute.UNRELATED, Interpretation(
                 response_text=(
                     "I’m not sure whether you want a new reminder or to update your unfinished "
@@ -1546,6 +1598,15 @@ def _route_and_interpret(
                 ),
                 fallback_allowed=False,
             )
+        log_event(
+            logger,
+            logging.INFO,
+            "reminder_route_classifier_mapped",
+            classifier_operation=suggestion,
+            deterministic_route=deterministic_route,
+            mapped_route=route,
+            has_pending=pending is not None,
+        )
     if route is ConversationRoute.CANCELLATION:
         interpretation = Interpretation(
             response_text="Okay, I won't create that reminder.",
@@ -1589,6 +1650,48 @@ def _route_and_interpret(
             interpreter,
             text,
             selected_route=IntentRoute.SNOOZE_REQUEST,
+            timezone_name=timezone_name,
+            now=now,
+            context=None,
+            recent_messages=recent_messages or [],
+        )
+    elif route is ConversationRoute.SAVE_MEMORY_REQUEST:
+        # Intent classification is still only a route proposal. On the model
+        # fallback path, require typed, source-grounded classifier evidence;
+        # the extractor and its content cannot authorize a write by themselves.
+        evidence_grounded = (
+            not classifier_selected
+            or is_memory_intent_evidence_grounded(text, classifier_memory_evidence)
+        )
+        log_event(
+            logger,
+            logging.INFO,
+            "memory_route_selected",
+            source=("llm_classifier" if classifier_selected else "deterministic_router"),
+            has_pending=pending is not None,
+            memory_evidence_grounded=evidence_grounded,
+            memory_evidence_kind=(
+                getattr(classifier_memory_evidence, "kind", None)
+                if classifier_selected
+                else None
+            ),
+        )
+        if not evidence_grounded:
+            log_event(
+                logger,
+                logging.WARNING,
+                "memory_route_rejected",
+                reason="missing_or_ungrounded_memory_intent_evidence",
+                source=("llm_classifier" if classifier_selected else "deterministic_router"),
+            )
+            return ConversationRoute.UNRELATED, Interpretation(
+                response_text="What information would you like me to remember?",
+                fallback_allowed=False,
+            )
+        interpretation = _interpret(
+            interpreter,
+            text,
+            selected_route=IntentRoute.SAVE_MEMORY,
             timezone_name=timezone_name,
             now=now,
             context=None,
@@ -1650,7 +1753,7 @@ def _upsert_clarification_session(
     *,
     user_id: UUID,
     external_session_id: str,
-    pending: PendingReminder | PendingCompletion | PendingSnooze,
+    pending: PendingReminder | PendingCompletion | PendingSnooze | PendingMemory,
     now: datetime,
 ) -> ConversationSession:
     values = {
@@ -2147,6 +2250,177 @@ def _end_pending_session(
         )
 
 
+def _handle_memory_text(
+    db: Session,
+    update: TelegramUpdate,
+    *,
+    user: User,
+    pending: PendingMemory | None,
+    now: datetime,
+    session_ttl_seconds: int,
+    model_content: str | None = None,
+    from_model: bool = False,
+    clarification_text: str | None = None,
+) -> ReminderReply:
+    """Save an explicit memory command or continue a pending memory clarification."""
+
+    assert update.message is not None
+    text = update.message.text or ""
+    if from_model:
+        content = model_content
+    else:
+        content = extract_memory_content(text) if pending is None else text.strip()
+
+    # Re-validate model output at the application boundary before any database
+    # work. The shared persistence service validates again inside its own
+    # transaction, but malformed provider output must become clarification-only.
+    if content is not None:
+        try:
+            content = SaveMemoryFact(content=content).content
+        except (TypeError, ValueError):
+            content = None
+        if from_model and content is not None and not is_memory_content_grounded(text, content):
+            content = None
+
+    if content is None:
+        db.rollback()
+        with db.begin():
+            existing = _existing_record(db, update)
+            if existing is not None:
+                return _reply_from_record(existing)
+            locked_session = load_session(
+                db,
+                user_id=user.id,
+                external_session_id=telegram_session_id(update.message.chat.id),
+                now=now,
+                ttl_seconds=session_ttl_seconds,
+                for_update=True,
+            )
+            if pending is not None and pending_memory_from_session(locked_session) is None:
+                return _store_response(
+                    db,
+                    update=update,
+                    user_id=user.id,
+                    text="That memory request expired. Please tell me what to remember.",
+                    response_kind="memory_clarification_expired",
+                    operation="SAVE_MEMORY",
+                    include_request_text=False,
+                )
+            _upsert_clarification_session(
+                db,
+                user_id=user.id,
+                external_session_id=telegram_session_id(update.message.chat.id),
+                pending=PendingMemory(),
+                now=now,
+            )
+            return _store_response(
+                db,
+                update=update,
+                user_id=user.id,
+                text=clarification_text or "What information should I remember?",
+                response_kind="memory_clarification",
+                operation="SAVE_MEMORY",
+                include_request_text=False,
+            )
+
+    try:
+        db.rollback()
+        with db.begin():
+            existing = _existing_record(db, update)
+            if existing is not None:
+                return _reply_from_record(existing)
+            locked_user = db.get(User, user.id)
+            if (
+                locked_user is None
+                or locked_user.id != user.id
+                or locked_user.onboarding_status != ACTIVE
+            ):
+                return ReminderReply(update.message.chat.id, "I couldn't verify your account.")
+            locked_session = load_session(
+                db,
+                user_id=user.id,
+                external_session_id=telegram_session_id(update.message.chat.id),
+                now=now,
+                ttl_seconds=session_ttl_seconds,
+                for_update=True,
+            )
+            if pending is not None and pending_memory_from_session(locked_session) is None:
+                return _store_response(
+                    db,
+                    update=update,
+                    user_id=user.id,
+                    text="That memory request expired. Please send the complete request again.",
+                    response_kind="memory_clarification_expired",
+                    operation="SAVE_MEMORY",
+                    include_request_text=False,
+                )
+            save_memory_fact(db, user_id=locked_user.id, content=content, now=now)
+            if locked_session is not None:
+                end_session(locked_session, now=now)
+            log_event(
+                logger,
+                logging.INFO,
+                "memory_fact_saved",
+                update_id=update.update_id,
+                content_length=len(content),
+            )
+            return _store_response(
+                db,
+                update=update,
+                user_id=locked_user.id,
+                text="I saved that information.",
+                response_kind="memory_confirmation",
+                operation="SAVE_MEMORY",
+                include_request_text=False,
+            )
+    except IntegrityError:
+        duplicate = _recover_from_idempotency_race(db, update)
+        if duplicate is not None:
+            return duplicate
+        db.rollback()
+        log_event(
+            logger,
+            logging.ERROR,
+            "memory_fact_save_failed",
+            update_id=update.update_id,
+            reason="integrity_error",
+        )
+        return ReminderReply(
+            update.message.chat.id,
+            "I couldn't save that information. Please try again.",
+        )
+    except SQLAlchemyError:
+        db.rollback()
+        log_event(
+            logger,
+            logging.ERROR,
+            "memory_fact_save_failed",
+            update_id=update.update_id,
+            reason="database_error",
+        )
+        return ReminderReply(
+            update.message.chat.id,
+            "I couldn't save that information. Please try again.",
+        )
+    except Exception as exc:
+        # The transaction context has already rolled back any flushed fact.
+        # Keep provider/application failures truthful without exposing the
+        # exception message, which could contain user-provided secret data.
+        db.rollback()
+        log_event(
+            logger,
+            logging.ERROR,
+            "memory_fact_save_failed",
+            update_id=update.update_id,
+            reason="unexpected_error",
+            reason_type=type(exc).__name__,
+        )
+        return ReminderReply(
+            update.message.chat.id,
+            "I couldn't save that information. Please try again.",
+        )
+
+
 def _end_pending_snooze(
     db: Session,
     update: TelegramUpdate,
@@ -2487,6 +2761,9 @@ def handle_reminder_text(
     pending_snooze = (
         None if session_is_expired else pending_snooze_from_session(session)
     )
+    pending_memory = (
+        None if session_is_expired else pending_memory_from_session(session)
+    )
     text = update.message.text or ""
     recent_messages = _recent_messages(db, user_id=user.id)
     recent_delivered_reminders = _recent_delivered_reminders(
@@ -2507,6 +2784,7 @@ def handle_reminder_text(
         has_pending_cancellation=pending_cancellation is not None,
         has_pending_completion=pending_completion is not None,
         has_pending_snooze=pending_snooze is not None,
+        has_pending_memory=pending_memory is not None,
         recent_message_count=len(recent_messages),
     )
     observed_session_version = None if session_is_expired or session is None else session.version
@@ -2526,10 +2804,87 @@ def handle_reminder_text(
         db.rollback()
         return ReminderReply(update.message.chat.id, OUT_OF_SCOPE_RESPONSE)
 
+    normalized_text = re.sub(r"[.!?]+$", "", text.strip().casefold()).strip()
+    deterministic_route = route_message(text, pending=pending).route
+
+    # A stale SAVE_MEMORY draft must not consume an arbitrary next statement as
+    # its fact. Explicit memory and reminder commands remain new operations.
+    expired_memory_pending = (
+        session_is_expired
+        and session is not None
+        and isinstance(session.pending_clarification, dict)
+        and session.pending_clarification.get("operation") == "SAVE_MEMORY"
+    )
+    if expired_memory_pending and deterministic_route not in {
+        ConversationRoute.SAVE_MEMORY_REQUEST,
+        ConversationRoute.NEW_REQUEST,
+    }:
+        return _end_pending_session(
+            db,
+            update,
+            user=user,
+            now=now,
+            session_ttl_seconds=session_ttl_seconds,
+            response_text="That memory request expired. Please send the complete request again.",
+            response_kind="memory_clarification_expired",
+            operation="SAVE_MEMORY",
+        ) or ReminderReply(
+            update.message.chat.id,
+            "That memory request expired. Please send the complete request again.",
+        )
+
+    # A pending memory accepts a plain fact as its answer. Explicit commands
+    # continue through the shared route decision so they can supersede this
+    # operation safely instead of being silently saved as content.
+    if pending_memory is not None:
+        if normalized_text in {
+            "cancel",
+            "cancel it",
+            "never mind",
+            "nevermind",
+            "not now",
+        }:
+            return _end_pending_session(
+                db,
+                update,
+                user=user,
+                now=now,
+                session_ttl_seconds=session_ttl_seconds,
+                response_text="Okay, I won't save anything.",
+                response_kind="memory_canceled",
+                operation="SAVE_MEMORY",
+            ) or ReminderReply(update.message.chat.id, "Okay, I won't save anything.")
+
+        if deterministic_route in {
+            ConversationRoute.NEW_REQUEST,
+            ConversationRoute.RESCHEDULE_REQUEST,
+            ConversationRoute.CANCEL_REQUEST,
+            ConversationRoute.SNOOZE_REQUEST,
+        } or is_memory_reminder_collision(text):
+            _end_pending_session(
+                db,
+                update,
+                user=user,
+                now=now,
+                session_ttl_seconds=session_ttl_seconds,
+            )
+            pending_memory = None
+        elif deterministic_route not in {
+            ConversationRoute.LIST_REQUEST,
+            ConversationRoute.SUMMARY_REQUEST,
+        }:
+            return _handle_memory_text(
+                db,
+                update,
+                user=user,
+                pending=pending_memory,
+                now=now,
+                session_ttl_seconds=session_ttl_seconds,
+            )
+
     # A pending snooze remains in its original operation context unless the
     # user explicitly starts a new mutation or safely cancels it. Read-only
     # list/summary requests do not consume the pending question.
-    normalized_text = re.sub(r"[.!?]+$", "", text.strip().casefold()).strip()
     if is_snooze_command(text) and pending_snooze is None and (
         pending is not None
         or pending_reschedule is not None
@@ -2744,6 +3099,8 @@ def handle_reminder_text(
             user_name=user.name,
             intent_router=intent_router,
             recent_messages=recent_messages,
+            recent_delivered_reminders=recent_delivered_reminders,
+            deterministic_route=deterministic_route,
         )
         if route is ConversationRoute.RESCHEDULE_REQUEST:
             reschedule_reply = _handle_reschedule_text(
@@ -2799,6 +3156,44 @@ def handle_reminder_text(
                 identity=identity,
                 now=now,
                 target_text=interpretation.completion_target_text,
+            )
+        elif route is ConversationRoute.SAVE_MEMORY_REQUEST:
+            # A classifier-selected memory request is a new operation. End any
+            # older pending reminder context, then use the same canonical-user,
+            # transaction, and idempotency path as deterministic memory saves.
+            if (
+                pending is not None
+                or pending_reschedule is not None
+                or pending_cancellation is not None
+                or pending_completion is not None
+                or pending_snooze is not None
+            ):
+                _end_pending_session(
+                    db,
+                    update,
+                    user=user,
+                    now=now,
+                    session_ttl_seconds=session_ttl_seconds,
+                )
+            memory_fact = interpretation.memory_fact
+            log_event(
+                logger,
+                logging.INFO,
+                "memory_execution_selected",
+                route=route,
+                has_memory_fact=memory_fact is not None,
+                has_clarification=interpretation.response_text is not None,
+            )
+            return _handle_memory_text(
+                db,
+                update,
+                user=user,
+                pending=None,
+                now=now,
+                session_ttl_seconds=session_ttl_seconds,
+                model_content=memory_fact.content if memory_fact is not None else None,
+                from_model=deterministic_route is ConversationRoute.MODEL_FALLBACK,
+                clarification_text=interpretation.response_text,
             )
         elif route is ConversationRoute.SNOOZE_REQUEST:
             return _handle_snooze_text(

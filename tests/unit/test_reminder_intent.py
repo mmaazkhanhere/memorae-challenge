@@ -1,4 +1,5 @@
 import json
+import logging
 from datetime import date, datetime, timezone
 
 import httpx
@@ -22,12 +23,37 @@ from reminder_agent.intent import (
     resolve_pending_due_at,
 )
 from reminder_agent.reminders import _route_and_interpret
+from reminder_agent.memories import SaveMemoryFact
 from reminder_agent.rescheduling import RescheduleRequest, RescheduleScope
 from reminder_agent.settings import Settings
 from reminder_agent.request_policy import OUT_OF_SCOPE_RESPONSE
 
 
 NOW = datetime(2026, 10, 30, 12, 0, tzinfo=timezone.utc)
+
+
+def test_rule_interpreter_extracts_remember_to_as_a_reminder() -> None:
+    result = RuleBasedIntentInterpreter().interpret(
+        "Remember to call Ali tomorrow at 9 AM",
+        selected_route=IntentRoute.NEW_REQUEST,
+        timezone_name="Asia/Karachi",
+        now=NOW,
+    )
+
+    assert result.intent is not None
+    assert result.intent.task == "call Ali"
+
+
+def test_rule_interpreter_clarifies_remember_to_without_a_time() -> None:
+    result = RuleBasedIntentInterpreter().interpret(
+        "Remember to call Ali",
+        selected_route=IntentRoute.NEW_REQUEST,
+        timezone_name="Asia/Karachi",
+        now=NOW,
+    )
+
+    assert result.clarification is not None
+    assert result.clarification.pending.task == "call Ali"
 
 
 def test_monthly_ordinal_request_preserves_recurrence_while_asking_for_time() -> None:
@@ -207,6 +233,196 @@ def test_intent_router_accepts_reschedule_request_route(monkeypatch) -> None:
     )
 
     assert suggestion.operation is IntentRoute.RESCHEDULE_REQUEST
+
+
+def test_intent_router_accepts_save_memory_route_and_teaches_conservative_prompt(monkeypatch) -> None:
+    captured: dict = {}
+
+    def fake_post(*args, **kwargs):
+        captured.update(kwargs["json"])
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"operation":"SAVE_MEMORY",'
+                                '"memory_intent_evidence":{"kind":"EXPLICIT_SAVE_REQUEST",'
+                                '"confidence":"CLEAR","evidence_text":"Make a note"}}'
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    suggestion = OpenAICompatibleIntentRouter(
+        "https://api.groq.example/openai/v1", "secret", "openai/gpt-oss-20b"
+    ).classify(
+        "Make a note that my gate code is 4512",
+        pending=None,
+        recent_messages=(),
+    )
+
+    assert suggestion.operation is IntentRoute.SAVE_MEMORY
+    assert suggestion.memory_intent_evidence is not None
+    assert suggestion.memory_intent_evidence.kind == "EXPLICIT_SAVE_REQUEST"
+    prompt = captured["messages"][0]["content"]
+    assert "ordinary statement" in prompt
+    assert "SAVE_MEMORY" in prompt
+
+
+def test_openai_compatible_extractor_returns_typed_memory_content(monkeypatch) -> None:
+    captured: dict = {}
+
+    def fake_post(*args, **kwargs):
+        captured.update(kwargs["json"])
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={
+                "choices": [
+                    {"message": {"content": '{"operation":"SAVE_MEMORY","content":"gate code is 4512"}'}},
+                ]
+            },
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    result = OpenAICompatibleIntentInterpreter(
+        "https://llm.example/v1", "secret", "provider-model"
+    ).interpret(
+        "Make a note that my gate code is 4512",
+        selected_route=IntentRoute.SAVE_MEMORY,
+        timezone_name="UTC",
+        now=NOW,
+    )
+
+    assert result.memory_fact == SaveMemoryFact(content="gate code is 4512")
+    assert "SAVE_MEMORY" in captured["messages"][0]["content"]
+
+
+def test_malformed_memory_extraction_is_clarification_only(monkeypatch) -> None:
+    def fake_post(*args, **kwargs):
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={"choices": [{"message": {"content": '{"operation":"SAVE_MEMORY","content":"   "}'}}]},
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    result = OpenAICompatibleIntentInterpreter(
+        "https://llm.example/v1", "secret", "provider-model"
+    ).interpret(
+        "Please remember something",
+        selected_route=IntentRoute.SAVE_MEMORY,
+        timezone_name="UTC",
+        now=NOW,
+    )
+
+    assert result.memory_fact is None
+    assert result.response_text == "What information should I remember?"
+    assert result.fallback_allowed is False
+
+
+def test_memory_classifier_and_extractor_logs_redact_fact_content(monkeypatch) -> None:
+    secret = "gate code is SECRET-4512"
+    responses = iter(
+        [
+            '{"operation":"SAVE_MEMORY",'
+            '"memory_intent_evidence":{"kind":"EXPLICIT_SAVE_REQUEST",'
+            '"confidence":"CLEAR","evidence_text":"Keep in mind"}}',
+            '{"operation":"SAVE_MEMORY","content":"gate code is SECRET-4512"}',
+        ]
+    )
+
+    def fake_post(*args, **kwargs):
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={"choices": [{"message": {"content": next(responses)}}]},
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    logger = logging.getLogger("reminder_agent")
+    captured: list[logging.LogRecord] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(record)
+
+    handler = Capture()
+    logger.addHandler(handler)
+    try:
+        OpenAICompatibleIntentRouter(
+            "https://llm.example/v1", "secret", "intent-model"
+        ).classify(
+            f"Keep in mind that my {secret}",
+            pending=None,
+            recent_messages=(f"user: {secret}",),
+        )
+        result = OpenAICompatibleIntentInterpreter(
+            "https://llm.example/v1", "secret", "extract-model"
+        ).interpret(
+            f"Keep in mind that my {secret}",
+            selected_route=IntentRoute.SAVE_MEMORY,
+            timezone_name="UTC",
+            now=NOW,
+            recent_messages=(f"user: {secret}",),
+        )
+    finally:
+        logger.removeHandler(handler)
+
+    assert result.memory_fact is not None
+    log_text = " ".join(
+        f"{record.getMessage()} {getattr(record, 'context', {})}" for record in captured
+    )
+    assert secret not in log_text
+
+
+def test_malformed_memory_provider_exception_log_redacts_fact_content(monkeypatch) -> None:
+    secret = "gate code is SECRET-4512"
+
+    def fake_post(*args, **kwargs):
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={
+                "choices": [
+                    {"message": {"content": f'{{"operation":"SAVE_MEMORY","content":null,"fact":"{secret}"}}'}},
+                ]
+            },
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    logger = logging.getLogger("reminder_agent")
+    captured: list[logging.LogRecord] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(record)
+
+    handler = Capture()
+    logger.addHandler(handler)
+    try:
+        result = OpenAICompatibleIntentInterpreter(
+            "https://llm.example/v1", "secret", "extract-model"
+        ).interpret(
+            f"Keep in mind that my {secret}",
+            selected_route=IntentRoute.SAVE_MEMORY,
+            timezone_name="UTC",
+            now=NOW,
+        )
+    finally:
+        logger.removeHandler(handler)
+
+    assert result.memory_fact is None
+    log_text = " ".join(
+        f"{record.getMessage()} {getattr(record, 'context', {})}" for record in captured
+    )
+    assert secret not in log_text
 
 
 def test_intent_router_accepts_cancel_request_route_and_prompt(monkeypatch) -> None:

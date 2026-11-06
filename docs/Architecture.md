@@ -2,7 +2,7 @@
 
 > Cleaned and formatted version of the original challenge planning document. Architecture choices, workflows, open questions, diagrams, and data definitions are preserved; obvious typographical errors and duplicate lines have been tidied.
 
-> **Implementation status:** Sections 1–8 preserve the original design; Section 9 is authoritative for the implementation through VS-11.
+> **Implementation status:** Sections 1–8 preserve the original design; Section 9 is authoritative for the implementation through VS-13.
 
 ## 1. Overview and Scope
 
@@ -1018,13 +1018,13 @@ flowchart TB
 
 ```
 
-## 9. Implemented Architecture: VS-01 through VS-12
+## 9. Implemented Architecture: VS-01 through VS-13
 
-This section records the architecture implemented for VS-01 through VS-12 only. It is an implementation supplement to the original design material above: it does not change the existing requirements, workflows, or designs for later slices.
+This section records the architecture implemented for VS-01 through VS-13 only. It is an implementation supplement to the original design material above: it does not change the existing requirements, workflows, or designs for later slices.
 
 ### 9.1 Current Component Architecture
 
-The running system consists of a Telegram webhook adapter, shared reminder application services, PostgreSQL persistence, and a separate worker process. The implemented Telegram path supports onboarding and verified phone linking, one-time and recurring reminders, clarification, unsupported-request responses, listing, rescheduling, cancellation, and completion of delivered occurrences.
+The running system consists of a Telegram webhook adapter, shared reminder and memory application services, PostgreSQL persistence, and a separate worker process. The implemented Telegram path supports onboarding and verified phone linking, one-time and recurring reminders, memory saving, clarification, unsupported-request responses, listing, rescheduling, cancellation, and completion of delivered occurrences.
 
 `api.telegram.telegram_webhook` verifies Telegram's webhook secret, validates the incoming `TelegramUpdate`, and calls `onboarding.handle_update`. Once onboarding is active, that function delegates text requests to `reminders.handle_reminder_text`. The handler resolves the trusted Telegram identity, checks idempotency, applies request policy, and then invokes the appropriate service. It does not accept user-supplied identifiers as authority.
 
@@ -1060,6 +1060,7 @@ Implemented service boundaries are deliberately small and operation-specific:
 - `completion.py` resolves and completes only an owned, already-delivered occurrence.
 - `reminder_listing.py`, `rescheduling.py`, and `cancellation.py` implement owned-reminder lookup, candidate selection, grounding, and transactional change rules.
 - `recurrence_service.py` materializes upcoming recurring instances.
+- `memories.py` validates and persists owner-scoped memory facts without reminder side effects.
 - `worker.py` contains `NotificationWorker` and `ConfirmationWorker`.
 
 ### 9.2 Deterministic-First Natural-Language Processing
@@ -1073,10 +1074,15 @@ The primary execution order for a Telegram text request is:
 1. The webhook authenticates and validates the update; `handle_update` resolves the Telegram identity.
 2. `handle_reminder_text` verifies the active user, linked Telegram identity, idempotency key, onboarding state, and saved IANA time zone.
 3. `conversation_router.route_message` makes a deterministic routing decision from the text and any pending creation context.
-4. Only a `MODEL_FALLBACK` route calls `OpenAICompatibleIntentRouter.classify`, when a router is configured.
+   It recognizes only high-precision creation forms: `remember to <action>` and
+   `save a reminder to <action>` select reminder creation, while `remember
+   that/my <fact>` selects memory saving. Mixed cues such as `remember to keep
+   <fact> in mind`, and otherwise ambiguous wording, select `MODEL_FALLBACK`
+   rather than guessing.
+4. Only a `MODEL_FALLBACK` route calls `OpenAICompatibleIntentRouter.classify`, when a router is configured. The classifier may select `SAVE_MEMORY` for a clearly intentional indirect save request, but not for an ordinary statement. For memory fallback, it also returns typed `MemoryIntentEvidence`: a clear `EXPLICIT_SAVE_REQUEST` plus an exact source span. `reminders.py` accepts that evidence only when its kind, confidence, and source grounding validate; English phrase matching is not used as authorization.
 5. The selected route reaches the applicable deterministic parser: `RuleBasedIntentInterpreter`, listing parsing, `parse_reschedule_request`, or `parse_cancellation_request`.
    A `COMPLETE_REQUEST` route bypasses extraction and resolves the delivered occurrence from trusted Telegram context.
-6. If that parser permits fallback, `ReminderIntentInterpreter` can ask its configured extraction adapter for a structured proposal. Rescheduling and cancellation first parse and find owned candidates deterministically; their contextual model proposals remain non-authoritative.
+6. If that parser permits fallback, `ReminderIntentInterpreter` can ask its configured extraction adapter for a structured proposal. `SAVE_MEMORY` extraction returns typed `SaveMemoryFact` content, which is deterministically schema-validated and grounded in the source text before the shared memory service is called. The classifier evidence and extracted content are both required; extraction content never supplies intent authority. Rescheduling and cancellation first parse and find owned candidates deterministically; their contextual model proposals remain non-authoritative.
 7. Parsers, grounding functions, typed Pydantic schemas, and application services validate the result before a transaction changes data. Insufficient information becomes a clarification; unsupported or unsafe input becomes a non-mutating response.
 
 There is no single centralized verifier. Verification is distributed across the parsers and typed schemas in `intent.py`, `restrict_to_explicit_field_updates`, candidate and grounding functions in `rescheduling.py` and `cancellation.py`, identity/ownership checks in `reminders.py`, and eligibility checks in `worker.py`.
@@ -1191,6 +1197,7 @@ The current SQLAlchemy schema and Alembic migrations provide these implemented t
 - `notifications`: a due Telegram delivery linked to an occurrence and destination identity, with sequence, status, attempts, provider result, and lease fields.
 - `conversation_sessions`: typed pending clarification payloads, channel/session identity, status, optional active reminder reference, version, and update time.
 - `idempotency_records`: a unique `(source, idempotency_key)` record with request hash, durable response, business outcome, and confirmation-delivery state.
+- `memory_facts`: non-empty user-owned fact content with creation/update timestamps and an owner/date index.
 
 The implemented relationships are user-to-identities/reminders/sessions, reminder-to-occurrences/recurrence-exceptions, occurrence-to-notifications, and notification-to-a destination identity. Foreign keys cascade from user to owned rows and from reminder to occurrences/exceptions; notification destinations use `RESTRICT` to preserve delivery ownership. Application transactions persist a state change and its idempotency response together. Outbound Telegram calls occur only after the transaction commits. Rescheduling and cancellation lock the target reminder, relevant occurrences, and pending notifications; they fail safely if a notification is already `SENDING`.
 
@@ -1307,3 +1314,30 @@ its existing eligibility and lease path. Once sent, the occurrence becomes
 pending snooze clarification retains its typed candidate context, can be safely
 canceled, is superseded by an explicit new mutation, and is not consumed by a
 read-only list or summary request.
+
+### 9.9 Saved memory facts (VS-13)
+
+VS-13 adds a minimal `memory_facts` table and a shared `memories.py` service. A
+high-precision explicit fact command such as “Remember my …” or “Remember
+that my …” is recognized deterministically. Explicit reminder wording such as
+“Remember to call …” and “Save a reminder to …” is routed to reminder
+creation instead. Mixed creation cues and other natural-language variants use
+the existing classifier,
+which returns structured save-intent evidence rather than relying on a growing
+English phrase allowlist. Evidence must be a clear explicit-save classification
+with a grounded source span; ordinary statements, quoted instructions, negated
+requests, reminder requests, and uncertain classifications do not reach memory
+extraction. The fact body is
+validated for non-empty content and saved under the canonical Telegram user's
+ID; message text, model output, and user-supplied identifiers never select the
+owner. Saving a fact does not create a reminder, occurrence, or notification.
+
+An incomplete command such as “Remember” persists a typed `SAVE_MEMORY`
+clarification in the existing `conversation_sessions` table. A valid follow-up
+executes that original operation once; cancellation, expiry, and explicit new
+commands are handled without mutation of the old draft. The save and its
+`IdempotencyRecord` commit together, and the Telegram confirmation is sent only
+after commit. Replayed Telegram updates return the stored response without
+inserting another fact. Memory request text is omitted from the classifier's
+durable recent-message history so secrets are not unnecessarily duplicated in
+idempotency payloads; logs contain only metadata such as content length.

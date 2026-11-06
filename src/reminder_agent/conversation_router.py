@@ -8,6 +8,7 @@ from enum import StrEnum
 
 from reminder_agent.intent import PendingReminder
 from reminder_agent.cancellation import is_cancel_command
+from reminder_agent.intent_routing_rules import ExplicitCreateRoute, explicit_create_route
 from reminder_agent.snooze import is_snooze_command
 
 
@@ -19,6 +20,7 @@ class ConversationRoute(StrEnum):
     CANCEL_REQUEST = "CANCEL_REQUEST"
     COMPLETE_REQUEST = "COMPLETE_REQUEST"
     SNOOZE_REQUEST = "SNOOZE_REQUEST"
+    SAVE_MEMORY_REQUEST = "SAVE_MEMORY_REQUEST"
     CLARIFICATION_REPLY = "CLARIFICATION_REPLY"
     CANCELLATION = "CANCELLATION"
     SOCIAL = "SOCIAL"
@@ -31,10 +33,6 @@ class RouteDecision:
     route: ConversationRoute
 
 
-_NEW_REMINDER = re.compile(
-    r"^\s*(?:please\s+)?(?:remind\s+me|set\s+(?:a\s+)?reminder)(?:\s+|$)",
-    re.IGNORECASE,
-)
 _LIST_REMINDERS = re.compile(
     r"^\s*(?:can\s+you\s+)?(?:what\s+(?:do\s+i\s+have|are\s+my\s+reminders?|"
     r"reminders?\s+do\s+i\s+have)|"
@@ -111,7 +109,12 @@ _QUESTION = re.compile(r"^(?:what|when|where|who|why|how|can|could|do|does|is|ar
 
 def is_new_reminder_command(text: str) -> bool:
     """Return whether text explicitly starts a separate reminder request."""
-    return _NEW_REMINDER.match(text.strip()) is not None
+    return explicit_create_route(text) is ExplicitCreateRoute.NEW_REMINDER
+
+
+def is_memory_save_command(text: str) -> bool:
+    """Return whether text explicitly asks to save information."""
+    return explicit_create_route(text) is ExplicitCreateRoute.SAVE_MEMORY
 
 
 def is_list_request_command(text: str) -> bool:
@@ -143,6 +146,13 @@ def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecisio
         return RouteDecision(ConversationRoute.COMPLETE_REQUEST)
     if is_snooze_command(raw):
         return RouteDecision(ConversationRoute.SNOOZE_REQUEST)
+    creation_route = explicit_create_route(raw)
+    if creation_route is ExplicitCreateRoute.SAVE_MEMORY:
+        return RouteDecision(ConversationRoute.SAVE_MEMORY_REQUEST)
+    if creation_route is ExplicitCreateRoute.NEW_REMINDER:
+        return RouteDecision(ConversationRoute.NEW_REQUEST)
+    if creation_route is ExplicitCreateRoute.MODEL_FALLBACK:
+        return RouteDecision(ConversationRoute.MODEL_FALLBACK)
 
     # An acknowledgement is conversational only when there is no active
     # clarification.  With pending context it must be interpreted as an answer
@@ -151,8 +161,6 @@ def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecisio
         return RouteDecision(ConversationRoute.SOCIAL)
 
     if pending is None:
-        if is_new_reminder_command(raw):
-            return RouteDecision(ConversationRoute.NEW_REQUEST)
         if is_summary_request_command(raw):
             return RouteDecision(ConversationRoute.SUMMARY_REQUEST)
         if is_list_request_command(raw):
@@ -175,10 +183,6 @@ def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecisio
         return RouteDecision(ConversationRoute.LIST_REQUEST)
     if is_summary_request_command(raw):
         return RouteDecision(ConversationRoute.SUMMARY_REQUEST)
-    if is_new_reminder_command(raw):
-        # A complete new command intentionally supersedes a stale draft rather
-        # than being parsed as an edit to its task or schedule.
-        return RouteDecision(ConversationRoute.NEW_REQUEST)
     # Only explicit new-reminder commands are classified before considering
     # the active conversation.  A message containing a date/time may still be
     # a new reminder, an answer to the pending question, or something else;
