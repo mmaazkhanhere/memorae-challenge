@@ -57,7 +57,6 @@ def test_every_supported_operation_is_explicitly_allowed(operation: str) -> None
     "operation",
     [
         "SNOOZE_REMINDER",
-        "SAVE_MEMORY",
         "RETRIEVE_MEMORY",
     ],
 )
@@ -102,3 +101,8 @@ def test_completion_is_in_scope_but_snooze_remains_deferred() -> None:
     assert assess_request("Done").is_rejected is False
     assert is_supported_operation("COMPLETE_REMINDER") is True
     assert is_supported_operation("SNOOZE_REMINDER") is False
+
+
+def test_explicit_memory_save_is_in_scope() -> None:
+    assert assess_request("Remember my gate code is 4512").is_rejected is False
+    assert is_supported_operation("SAVE_MEMORY") is True

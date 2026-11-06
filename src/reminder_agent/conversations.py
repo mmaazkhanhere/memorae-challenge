@@ -11,6 +11,7 @@ from reminder_agent.db.models import ConversationSession
 from reminder_agent.completion import PendingCompletion
 from reminder_agent.snooze import PendingSnooze
 from reminder_agent.intent import PendingReminder
+from reminder_agent.memories import PendingMemory
 from reminder_agent.observability import get_logger, log_event
 
 TELEGRAM = "TELEGRAM"
@@ -122,6 +123,16 @@ def pending_snooze_from_session(session: ConversationSession | None):
     if session.pending_clarification.get("operation") != "SNOOZE_OCCURRENCE":
         return None
     return PendingSnooze.model_validate(session.pending_clarification)
+
+
+def pending_memory_from_session(session: ConversationSession | None) -> PendingMemory | None:
+    """Load a pending memory-save clarification without treating it as authority."""
+
+    if session is None or session.pending_clarification is None:
+        return None
+    if session.pending_clarification.get("operation") != "SAVE_MEMORY":
+        return None
+    return PendingMemory.model_validate(session.pending_clarification)
 
 
 def end_session(session: ConversationSession, *, now: datetime) -> None:

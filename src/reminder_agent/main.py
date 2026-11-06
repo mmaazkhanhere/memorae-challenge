@@ -32,8 +32,9 @@ REQUIRED_SCHEMA_TABLES = (
     "reminder_recurrence_exceptions",
     "notifications",
     "conversation_sessions",
+    "memory_facts",
 )
-REQUIRED_SCHEMA_VERSION = "0014_recurrence_exceptions"
+REQUIRED_SCHEMA_VERSION = "0015_memory_facts"
 REQUIRED_SCHEMA_COLUMNS = {
     "notifications": {
         "claimed_by",
@@ -59,6 +60,7 @@ REQUIRED_SCHEMA_COLUMNS = {
     },
     "reminder_occurrences": {"recurrence_instance_key"},
     "reminder_recurrence_exceptions": {"reminder_id", "occurrence_date"},
+    "memory_facts": {"user_id", "content", "created_at", "updated_at"},
 }
 
 

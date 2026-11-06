@@ -57,7 +57,6 @@ _OUT_OF_SCOPE_PATTERNS = (
         r"math|stock price|sports score|write code|debug code)\b",
         re.IGNORECASE,
     ),
-    re.compile(r"\bremember\b", re.IGNORECASE),
 )
 
 
@@ -99,4 +98,5 @@ def is_supported_operation(operation: object) -> bool:
         "CANCEL_REMINDER",
         "COMPLETE_REMINDER",
         "SNOOZE_OCCURRENCE",
+        "SAVE_MEMORY",
     }
