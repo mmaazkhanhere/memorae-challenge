@@ -72,6 +72,9 @@ from reminder_agent.conversation_router import (
     unrelated_response,
 )
 from reminder_agent.memories import (
+    MemoryAnswerer,
+    MemoryAnswerProposal,
+    MemoryLookupResult,
     PendingMemory,
     PendingMemoryLookup,
     RetrieveMemoryQuery,
@@ -83,10 +86,15 @@ from reminder_agent.memories import (
     is_memory_lookup_query_grounded,
     index_memory_fact,
     lookup_memory_fact,
+    memory_answer_preserves_exact_values,
     save_memory_fact,
     MemoryRetrievalPolicy,
 )
-from reminder_agent.embeddings import EmbeddingPrivacyPolicy, EmbeddingProvider
+from reminder_agent.embeddings import (
+    EmbeddingPrivacyPolicy,
+    EmbeddingProvider,
+    contains_sensitive_memory,
+)
 from reminder_agent.intent_routing_rules import is_memory_reminder_collision
 from reminder_agent.completion import (
     complete_occurrence,
@@ -2510,6 +2518,7 @@ def _handle_memory_lookup_text(
     from_model: bool = False,
     now: datetime,
     session_ttl_seconds: int,
+    memory_answerer: MemoryAnswerer | None = None,
     embedding_provider: EmbeddingProvider | None = None,
     embedding_privacy_policy: EmbeddingPrivacyPolicy = EmbeddingPrivacyPolicy(),
     memory_retrieval_policy: MemoryRetrievalPolicy = MemoryRetrievalPolicy(),
@@ -2517,11 +2526,30 @@ def _handle_memory_lookup_text(
     """Resolve one owned fact or persist a non-revealing clarification."""
 
     assert update.message is not None
+    log_event(
+        logger,
+        logging.INFO,
+        "memory_lookup_request_received",
+        update_id=update.update_id,
+        extraction_source="llm" if from_model else "deterministic_or_clarification",
+        query_present=query is not None,
+        query_length=len(query or ""),
+        pending_candidate_count=len(pending.candidate_ids) if pending is not None else 0,
+        embedding_provider_configured=embedding_provider is not None,
+    )
     try:
         query = RetrieveMemoryQuery(query=query or "").query
     except (TypeError, ValueError):
         query = None
     if query is None or (from_model and not is_memory_lookup_query_grounded(update.message.text or "", query)):
+        log_event(
+            logger,
+            logging.INFO,
+            "memory_lookup_query_rejected",
+            update_id=update.update_id,
+            reason="missing_or_ungrounded_query",
+            from_model=from_model,
+        )
         return ReminderReply(update.message.chat.id, "Which saved information should I look up?")
 
     db.rollback()
@@ -2542,11 +2570,153 @@ def _handle_memory_lookup_text(
                 db,
                 user_id=locked_user.id,
                 query=query,
+                semantic_query=update.message.text,
                 candidate_ids=pending.candidate_ids if pending is not None else None,
                 embedding_provider=embedding_provider,
                 privacy_policy=embedding_privacy_policy,
                 retrieval_policy=memory_retrieval_policy,
             )
+            log_event(
+                logger,
+                logging.INFO,
+                "memory_lookup_result_observed",
+                update_id=update.update_id,
+                status=result.status,
+                candidate_count=len(result.candidate_ids),
+                from_model=from_model,
+            )
+            answer_text: str | None = None
+            if result.status == "CANDIDATES":
+                safe_candidates = tuple(
+                    fact
+                    for fact in result.candidates
+                    if fact.user_id == locked_user.id
+                    and not contains_sensitive_memory(fact.content)
+                )
+                proposal = None
+                if memory_answerer is not None and safe_candidates:
+                    try:
+                        proposal = memory_answerer.answer(
+                            question=update.message.text or query,
+                            memories=tuple(fact.content for fact in safe_candidates),
+                        )
+                    except Exception as exc:
+                        log_event(
+                            logger,
+                            logging.WARNING,
+                            "memory_answer_generation_failed",
+                            update_id=update.update_id,
+                            reason=type(exc).__name__,
+                        )
+                if (
+                    not isinstance(proposal, MemoryAnswerProposal)
+                    or not proposal.validates_candidate_count(len(safe_candidates))
+                ):
+                    log_event(
+                        logger,
+                        logging.ERROR,
+                        "memory_answer_validation_failed",
+                        update_id=update.update_id,
+                        reason=(
+                            "malformed_answer"
+                            if not isinstance(proposal, MemoryAnswerProposal)
+                            else "unsupported_candidate_index"
+                        ),
+                        candidate_count=len(safe_candidates),
+                    )
+                    result = MemoryLookupResult(
+                        status=result.fallback_status,
+                        candidate_ids=result.fallback_candidate_ids,
+                    )
+                elif proposal.decision == "ANSWER":
+                    proposed_selected = tuple(
+                        safe_candidates[index] for index in proposal.candidate_indices
+                    )
+                    refreshed = {
+                        fact.id: fact
+                        for fact in db.scalars(
+                            select(MemoryFact)
+                            .where(
+                                MemoryFact.user_id == locked_user.id,
+                                MemoryFact.id.in_(fact.id for fact in proposed_selected),
+                            )
+                            .execution_options(populate_existing=True)
+                        ).all()
+                    }
+                    selected = tuple(
+                        refreshed[fact.id]
+                        for fact in proposed_selected
+                        if fact.id in refreshed and refreshed[fact.id].content == fact.content
+                    )
+                    rejection_reason = None
+                    if len(selected) != len(proposed_selected):
+                        rejection_reason = "candidate_revalidation_failed"
+                    elif any(fact.user_id != locked_user.id for fact in selected):
+                        rejection_reason = "candidate_ownership_failed"
+                    elif proposal.answer is None:
+                        rejection_reason = "missing_answer"
+                    elif not memory_answer_preserves_exact_values(
+                        proposal.answer,
+                        tuple(fact.content for fact in selected),
+                    ):
+                        rejection_reason = "exact_value_preservation_failed"
+                    if rejection_reason is not None:
+                        log_event(
+                            logger,
+                            logging.ERROR,
+                            "memory_answer_validation_failed",
+                            update_id=update.update_id,
+                            reason=rejection_reason,
+                            selected_candidate_count=len(selected),
+                        )
+                        result = MemoryLookupResult(status="UNKNOWN")
+                    else:
+                        answer_text = proposal.answer
+                        result = MemoryLookupResult(status="FOUND", fact=selected[0])
+                elif proposal.decision == "AMBIGUOUS":
+                    proposed_selected = tuple(
+                        safe_candidates[index] for index in proposal.candidate_indices
+                    )
+                    refreshed = {
+                        fact.id: fact
+                        for fact in db.scalars(
+                            select(MemoryFact)
+                            .where(
+                                MemoryFact.user_id == locked_user.id,
+                                MemoryFact.id.in_(fact.id for fact in proposed_selected),
+                            )
+                            .execution_options(populate_existing=True)
+                        ).all()
+                    }
+                    selected = tuple(
+                        refreshed[fact.id]
+                        for fact in proposed_selected
+                        if fact.id in refreshed and refreshed[fact.id].content == fact.content
+                    )
+                    if len(selected) != len(proposed_selected) or any(
+                        fact.user_id != locked_user.id for fact in selected
+                    ):
+                        log_event(
+                            logger,
+                            logging.ERROR,
+                            "memory_answer_validation_failed",
+                            update_id=update.update_id,
+                            reason=(
+                                "candidate_revalidation_failed"
+                                if len(selected) != len(proposed_selected)
+                                else "candidate_ownership_failed"
+                            ),
+                            selected_candidate_count=len(selected),
+                        )
+                        result = MemoryLookupResult(status="UNKNOWN")
+                    else:
+                        result = MemoryLookupResult(
+                            status="AMBIGUOUS",
+                            candidate_ids=tuple(fact.id for fact in selected),
+                        )
+                        answer_text = proposal.clarification_question
+                else:
+                    result = MemoryLookupResult(status="UNKNOWN")
             if result.status == "FOUND" and result.fact is not None:
                 if pending is not None:
                     session = load_session(
@@ -2559,10 +2729,19 @@ def _handle_memory_lookup_text(
                     )
                     if pending_memory_lookup_from_session(session) is not None:
                         end_session(session, now=now)
-                return ReminderReply(
+                reply = ReminderReply(
                     update.message.chat.id,
-                    f'You told me: "{result.fact.content}"',
+                    answer_text or f'You told me: "{result.fact.content}"',
                 )
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "memory_lookup_response_created",
+                    update_id=update.update_id,
+                    status="FOUND",
+                    response_contains_fact=True,
+                )
+                return reply
             if result.status == "AMBIGUOUS":
                 lookup_pending = PendingMemoryLookup(
                     query=query,
@@ -2575,15 +2754,20 @@ def _handle_memory_lookup_text(
                     pending=lookup_pending,
                     now=now,
                 )
-                return _store_response(
-                    db,
-                    update=update,
-                    user_id=locked_user.id,
-                    text="I found more than one saved fact that could match. Please be more specific.",
-                    response_kind="memory_lookup_clarification",
-                    operation="RETRIEVE_MEMORY",
-                    include_request_text=False,
+                reply = ReminderReply(
+                    update.message.chat.id,
+                    answer_text
+                    or "I found more than one saved fact that could match. Please be more specific.",
                 )
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "memory_lookup_response_created",
+                    update_id=update.update_id,
+                    status="AMBIGUOUS",
+                    response_contains_fact=False,
+                )
+                return reply
             if pending is not None:
                 session = load_session(
                     db,
@@ -2595,7 +2779,16 @@ def _handle_memory_lookup_text(
                 )
                 if pending_memory_lookup_from_session(session) is not None:
                     end_session(session, now=now)
-            return ReminderReply(update.message.chat.id, "I don't know that yet.")
+            reply = ReminderReply(update.message.chat.id, "I don't know that yet.")
+            log_event(
+                logger,
+                logging.INFO,
+                "memory_lookup_response_created",
+                update_id=update.update_id,
+                status="UNKNOWN",
+                response_contains_fact=False,
+            )
+            return reply
     except SQLAlchemyError:
         db.rollback()
         log_event(
@@ -2810,6 +3003,7 @@ def handle_reminder_text(
     intent_router: IntentRouter | None = None,
     now: datetime,
     session_ttl_seconds: int = 900,
+    memory_answerer: MemoryAnswerer | None = None,
     embedding_provider: EmbeddingProvider | None = None,
     embedding_privacy_policy: EmbeddingPrivacyPolicy | None = None,
     memory_retrieval_policy: MemoryRetrievalPolicy | None = None,
@@ -3005,6 +3199,16 @@ def handle_reminder_text(
 
     normalized_text = re.sub(r"[.!?]+$", "", text.strip().casefold()).strip()
     deterministic_route = route_message(text, pending=pending).route
+    log_event(
+        logger,
+        logging.INFO,
+        "reminder_route_decision",
+        update_id=update.update_id,
+        route=deterministic_route,
+        route_source="deterministic",
+        has_pending=pending is not None,
+        classifier_invoked=False,
+    )
 
     # An ambiguous memory lookup keeps its own operation context. Read-only
     # reminder queries leave it available; explicit new operations safely
@@ -3058,6 +3262,7 @@ def handle_reminder_text(
                     query=text,
                     now=now,
                     session_ttl_seconds=session_ttl_seconds,
+                    memory_answerer=memory_answerer,
                     embedding_provider=embedding_provider,
                     embedding_privacy_policy=embedding_privacy_policy,
                     memory_retrieval_policy=memory_retrieval_policy,
@@ -3104,14 +3309,33 @@ def handle_reminder_text(
                 now=now,
                 session_ttl_seconds=session_ttl_seconds,
             )
+        extracted_query = extract_memory_lookup_query(text)
+        log_event(
+            logger,
+            logging.INFO,
+            "memory_lookup_query_extracted",
+            update_id=update.update_id,
+            extraction_source="deterministic",
+            query_present=extracted_query is not None,
+            query_length=len(extracted_query or ""),
+            classifier_invoked=False,
+        )
+        log_event(
+            logger,
+            logging.INFO,
+            "memory_lookup_classifier_skipped",
+            update_id=update.update_id,
+            reason="deterministic_retrieve_memory_route",
+        )
         return _handle_memory_lookup_text(
             db,
             update,
             user=user,
             pending=None,
-            query=extract_memory_lookup_query(text),
+            query=extracted_query,
             now=now,
             session_ttl_seconds=session_ttl_seconds,
+            memory_answerer=memory_answerer,
             embedding_provider=embedding_provider,
             embedding_privacy_policy=embedding_privacy_policy,
             memory_retrieval_policy=memory_retrieval_policy,
@@ -3483,6 +3707,7 @@ def handle_reminder_text(
                 from_model=deterministic_route is ConversationRoute.MODEL_FALLBACK,
                 now=now,
                 session_ttl_seconds=session_ttl_seconds,
+                memory_answerer=memory_answerer,
                 embedding_provider=embedding_provider,
                 embedding_privacy_policy=embedding_privacy_policy,
                 memory_retrieval_policy=memory_retrieval_policy,

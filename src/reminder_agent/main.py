@@ -18,6 +18,8 @@ from reminder_agent.embeddings import EmbeddingPrivacyPolicy, create_embedding_p
 from reminder_agent.intent import (
     OpenAICompatibleIntentInterpreter,
     OpenAICompatibleIntentRouter,
+    OpenAICompatibleLLMClient,
+    OpenAICompatibleMemoryAnswerer,
     ReminderIntentInterpreter,
 )
 from reminder_agent.memories import MemoryRetrievalPolicy
@@ -85,6 +87,7 @@ def create_app(
     session_factory: Callable[[], Session] | None = None,
     reminder_interpreter=None,
     intent_router=None,
+    memory_answerer=None,
     embedding_provider=None,
     clock: Callable[[], datetime] | None = None,
 ) -> FastAPI:
@@ -109,24 +112,40 @@ def create_app(
     app.state.settings = runtime_settings
     app.state.telegram_client = telegram_client
     model_interpreter = None
+    configured_memory_answerer = None
     if app.state.settings.llm_api_key:
+        llm_client = OpenAICompatibleLLMClient(
+            app.state.settings.llm_base_url,
+            app.state.settings.llm_api_key,
+            app.state.settings.llm_timeout_seconds,
+        )
         model_interpreter = OpenAICompatibleIntentInterpreter(
             app.state.settings.llm_base_url,
             app.state.settings.llm_api_key,
             app.state.settings.llm_extract_model,
             app.state.settings.llm_timeout_seconds,
+            client=llm_client,
         )
         app.state.intent_router = intent_router or OpenAICompatibleIntentRouter(
             app.state.settings.llm_base_url,
             app.state.settings.llm_api_key,
             app.state.settings.llm_intent_model,
             app.state.settings.llm_timeout_seconds,
+            client=llm_client,
+        )
+        configured_memory_answerer = OpenAICompatibleMemoryAnswerer(
+            app.state.settings.llm_base_url,
+            app.state.settings.llm_api_key,
+            app.state.settings.llm_extract_model,
+            app.state.settings.llm_timeout_seconds,
+            client=llm_client,
         )
     else:
         app.state.intent_router = intent_router
     app.state.reminder_interpreter = reminder_interpreter or ReminderIntentInterpreter(
         model_interpreter
     )
+    app.state.memory_answerer = memory_answerer or configured_memory_answerer
     app.state.clock = clock or (lambda: datetime.now(timezone.utc))
     app.state.embedding_provider = embedding_provider or create_embedding_provider(
         runtime_settings
