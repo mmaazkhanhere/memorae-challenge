@@ -33,6 +33,14 @@ fallback; in a multi-country deployment, users with local-format contacts can
 set their own region with `/phone_region XX`. Set the Telegram webhook to
 `POST /webhook/telegram` with the same secret token.
 
+Telegram voice notes are downloaded only after the sender is authenticated,
+validated as bounded OGG voice media, and transcribed through the configured
+Groq Whisper-compatible `STT_*` endpoint. The transcript then uses the same
+deterministic-first command router and shared reminder/memory services as typed
+text. Audio and transcripts are not retained or written to logs; voice replies
+are Telegram text messages. Failed or inaudible notes never mutate reminders
+or memories.
+
 Production startup fails fast unless `DATABASE_URL` uses PostgreSQL,
 `TELEGRAM_BOT_TOKEN` is configured, and `TELEGRAM_WEBHOOK_SECRET` is a unique value of at
 least 32 characters. The sample placeholders and local SQLite defaults are intended only for

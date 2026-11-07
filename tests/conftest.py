@@ -19,6 +19,9 @@ class FakeTelegramClient:
         self.messages: list[tuple[int, str]] = []
         self.reply_markups: list[dict | None] = []
         self.callback_acknowledgements: list[str] = []
+        self.file_paths: dict[str, str] = {}
+        self.file_bytes: bytes = b"OggS-test-audio"
+        self.downloaded_file_ids: list[str] = []
 
     def send_message(self, chat_id: int, text: str, *, reply_markup=None) -> None:
         self.messages.append((chat_id, text))
@@ -26,6 +29,15 @@ class FakeTelegramClient:
 
     def answer_callback_query(self, callback_query_id: str) -> None:
         self.callback_acknowledgements.append(callback_query_id)
+
+    def get_file_path(self, file_id: str) -> str:
+        self.downloaded_file_ids.append(file_id)
+        return self.file_paths.get(file_id, "voice/test.ogg")
+
+    def download_file(self, file_path: str, *, max_bytes: int) -> bytes:
+        if len(self.file_bytes) > max_bytes:
+            raise RuntimeError("test media too large")
+        return self.file_bytes
 
 
 @pytest.fixture()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -15,7 +16,13 @@ from sqlalchemy.orm import Session
 from reminder_agent.db.models import ChannelIdentity, IdempotencyRecord, User
 from reminder_agent.completion import complete_occurrence, parse_callback_data
 from reminder_agent.observability import get_logger, log_event
-from reminder_agent.telegram import TelegramUpdate
+from reminder_agent.telegram import TelegramAPIError, TelegramClient, TelegramUpdate
+from reminder_agent.transcription import (
+    AudioTranscriber,
+    TranscriptionError,
+    is_ogg_voice_note,
+    log_transcription_failure,
+)
 
 TELEGRAM = "TELEGRAM"
 LINKED = "LINKED"
@@ -116,7 +123,15 @@ def _phone_shape(value: str) -> dict[str, int | bool]:
 
 
 def _request_hash(update: TelegramUpdate) -> str:
-    canonical = update.model_dump_json(by_alias=True, exclude_none=True)
+    if update.message is None or update.message.voice is None:
+        canonical = update.model_dump_json(by_alias=True, exclude_none=True)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    payload = update.model_dump(by_alias=True, exclude_none=True)
+    # A transient STT overlay must not change the digest of the original voice
+    # update. This keeps retries idempotent without persisting the transcript.
+    if update.message is not None and update.message.voice is not None:
+        payload.get("message", {}).pop("text", None)
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -824,6 +839,11 @@ def handle_update(
     now: datetime | None = None,
     session_ttl_seconds: int = 900,
     callback_secret: str = "development",
+    telegram_client: TelegramClient | None = None,
+    transcriber: AudioTranscriber | None = None,
+    voice_max_bytes: int = 20 * 1024 * 1024,
+    voice_max_duration_seconds: int = 300,
+    log_voice_transcript: bool = False,
 ) -> OnboardingReply | None:
     """Apply one Telegram update and return the committed response, if any."""
     if update.callback_query is not None and update.callback_query.message is not None:
@@ -974,6 +994,24 @@ def handle_update(
     phone_region = _phone_region_from_text(update)
     if phone_region is not None:
         return _handle_phone_region(db, update, phone_region)
+    if update.message.voice is not None:
+        return _handle_voice_message(
+            db,
+            update,
+            telegram_client=telegram_client,
+            transcriber=transcriber,
+            max_bytes=voice_max_bytes,
+            max_duration_seconds=voice_max_duration_seconds,
+            log_transcript=log_voice_transcript,
+            reminder_interpreter=reminder_interpreter,
+            intent_router=intent_router,
+            memory_answerer=memory_answerer,
+            embedding_provider=embedding_provider,
+            embedding_privacy_policy=embedding_privacy_policy,
+            memory_retrieval_policy=memory_retrieval_policy,
+            now=now,
+            session_ttl_seconds=session_ttl_seconds,
+        )
     return _handle_message(
         db,
         update,
@@ -986,6 +1024,186 @@ def handle_update(
         now=now,
         session_ttl_seconds=session_ttl_seconds,
     )
+
+
+def _handle_voice_message(
+    db: Session,
+    update: TelegramUpdate,
+    *,
+    telegram_client: TelegramClient | None,
+    transcriber: AudioTranscriber | None,
+    max_bytes: int,
+    max_duration_seconds: int,
+    log_transcript: bool = False,
+    reminder_interpreter=None,
+    intent_router=None,
+    memory_answerer=None,
+    embedding_provider=None,
+    embedding_privacy_policy=None,
+    memory_retrieval_policy=None,
+    now: datetime | None = None,
+    session_ttl_seconds: int = 900,
+) -> OnboardingReply:
+    """Download and transcribe one authenticated voice note, then reuse text handling."""
+    assert update.message is not None and update.message.voice is not None
+    db.rollback()
+    log_event(
+        logger,
+        logging.INFO,
+        "telegram_voice_processing_started",
+        update_id=update.update_id,
+        telegram_user_id=update.message.from_user.id,
+        chat_id=update.message.chat.id,
+        duration_seconds=update.message.voice.duration,
+        declared_file_size=update.message.voice.file_size,
+        mime_type=update.message.voice.mime_type,
+    )
+    existing = _existing_record(db, update)
+    if existing is not None:
+        log_event(logger, logging.INFO, "telegram_voice_replay_skipped", update_id=update.update_id)
+        return _reply_from_record(existing)
+    identity = _find_identity(db, update)
+    if identity is None:
+        log_event(logger, logging.WARNING, "telegram_voice_rejected", update_id=update.update_id, reason="unknown_sender")
+        with db.begin():
+            return _store_result(
+                db,
+                update=update,
+                user_id=None,
+                operation="VOICE_NOTE_UNKNOWN_SENDER",
+                text="Please send /start to begin onboarding.",
+            )
+    user = db.get(User, identity.user_id)
+    assert user is not None
+    db.rollback()
+    if user.onboarding_status != ACTIVE:
+        log_event(logger, logging.INFO, "telegram_voice_rejected", update_id=update.update_id, reason="onboarding_incomplete")
+        with db.begin():
+            return _store_result(
+                db,
+                update=update,
+                user_id=user.id,
+                operation="VOICE_NOTE_REQUIRES_ONBOARDING",
+                text="Please finish Telegram onboarding with your IANA time zone first.",
+            )
+
+    voice = update.message.voice
+    if voice.duration > max_duration_seconds or (
+        voice.file_size is not None and voice.file_size > max_bytes
+    ):
+        log_event(logger, logging.WARNING, "telegram_voice_rejected", update_id=update.update_id, reason="size_or_duration_limit")
+        with db.begin():
+            return _store_result(
+                db,
+                update=update,
+                user_id=user.id,
+                operation="VOICE_NOTE_REJECTED",
+                text="That voice note is too large or too long. Please send a shorter note.",
+            )
+    if voice.mime_type is not None and voice.mime_type not in {"audio/ogg", "audio/opus"}:
+        log_event(logger, logging.WARNING, "telegram_voice_rejected", update_id=update.update_id, reason="unsupported_mime_type")
+        with db.begin():
+            return _store_result(
+                db,
+                update=update,
+                user_id=user.id,
+                operation="VOICE_NOTE_REJECTED",
+                text="Please send a Telegram voice note, not another audio format.",
+            )
+    if telegram_client is None or transcriber is None:
+        log_event(logger, logging.ERROR, "telegram_voice_processing_failed", update_id=update.update_id, failure_kind="dependency_unavailable")
+        return _store_voice_failure(
+            db, update, user.id, "Voice notes are temporarily unavailable. Please try text instead."
+        )
+    try:
+        log_event(logger, logging.INFO, "telegram_voice_download_started", update_id=update.update_id)
+        file_path = telegram_client.get_file_path(voice.file_id)
+        audio = telegram_client.download_file(file_path, max_bytes=max_bytes)
+        log_event(logger, logging.INFO, "telegram_voice_download_succeeded", update_id=update.update_id, downloaded_bytes=len(audio))
+        if not is_ogg_voice_note(audio):
+            raise TelegramAPIError("Voice note format is invalid", failure_kind="invalid_media")
+        log_event(logger, logging.INFO, "telegram_voice_transcription_started", update_id=update.update_id, audio_bytes=len(audio))
+        result = transcriber.transcribe(
+            audio,
+            filename="voice-note.ogg",
+            media_type=voice.mime_type or "audio/ogg",
+        )
+    except (TelegramAPIError, TranscriptionError, ValueError) as exc:
+        if isinstance(exc, TranscriptionError):
+            log_transcription_failure(update_id=update.update_id, error=exc)
+        else:
+            log_event(
+                logger,
+                logging.WARNING,
+                "telegram_voice_rejected",
+                update_id=update.update_id,
+                failure_kind=getattr(exc, "failure_kind", "invalid_media"),
+            )
+        return _store_voice_failure(
+            db,
+            update,
+            user.id,
+            "I couldn't understand that voice note. Please try again or send the request as text.",
+        )
+    except Exception:
+        log_event(
+            logger,
+            logging.ERROR,
+            "telegram_voice_processing_failed",
+            update_id=update.update_id,
+            failure_kind="provider_error",
+            exc_info=True,
+        )
+        return _store_voice_failure(
+            db,
+            update,
+            user.id,
+            "I couldn't process that voice note. Please try again or send the request as text.",
+        )
+
+    # Keep the original voice metadata and update digest while exposing the
+    # transient transcript to the already-tested text command pipeline.
+    command_update = update.model_copy(
+        deep=True,
+        update={
+            "message": update.message.model_copy(update={"text": result.text}),
+        },
+    )
+    log_event(
+        logger,
+        logging.INFO,
+        "telegram_voice_transcription_succeeded",
+        update_id=update.update_id,
+        transcript_length=len(result.text),
+        transcript=result.text if log_transcript else None,
+    )
+    log_event(logger, logging.INFO, "telegram_voice_command_handoff", update_id=update.update_id)
+    return _handle_message(
+        db,
+        command_update,
+        reminder_interpreter=reminder_interpreter,
+        intent_router=intent_router,
+        memory_answerer=memory_answerer,
+        embedding_provider=embedding_provider,
+        embedding_privacy_policy=embedding_privacy_policy,
+        memory_retrieval_policy=memory_retrieval_policy,
+        now=now,
+        session_ttl_seconds=session_ttl_seconds,
+    )
+
+
+def _store_voice_failure(
+    db: Session, update: TelegramUpdate, user_id, text: str
+) -> OnboardingReply:
+    db.rollback()
+    with db.begin():
+        return _store_result(
+            db,
+            update=update,
+            user_id=user_id,
+            operation="VOICE_NOTE_FAILED",
+            text=text,
+        )
 
 
 def claim_delivery(db: Session, idempotency_key: str) -> bool:

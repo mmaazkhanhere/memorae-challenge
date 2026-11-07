@@ -1448,3 +1448,26 @@ authoritative database content. Raw memories, query contents, vectors, provider
 responses, and credentials are not logged. If Gemini, GPT-OSS, or the semantic
 index is unavailable, retrieval falls back to deterministic lexical behavior and
 otherwise responds unknown or asks for clarification; it never invents a value.
+
+### 9.12 Telegram voice notes (VS-15)
+
+Telegram voice updates are authenticated and resolved to the canonical Telegram
+user before the Bot API file is downloaded. The adapter accepts only private,
+bounded OGG voice media, streams it into a size-limited in-memory buffer, and
+passes it to the provider-agnostic `AudioTranscriber` boundary. The production
+adapter targets the configured Groq Whisper-compatible endpoint. Audio is not
+persisted.
+
+The returned transcript is a transient command overlay on the original Telegram
+update. It is sent through the same pending-context handling, deterministic-first
+routing, typed extraction fallback, authorization, ownership checks, and shared
+application services as typed text. The original voice update ID and raw payload
+digest remain the Telegram idempotency identity; adding a transient transcript
+cannot turn a replay into a new request. Voice confirmations, clarification
+questions, scope responses, and retry instructions are Telegram text messages.
+
+Empty, inaudible, malformed, oversized, unavailable, or failed transcription
+results create no reminder or memory mutation. Durable mutation results and
+clarification responses retain the existing Telegram idempotency and
+post-commit-delivery behavior. Transcripts, audio bytes, provider credentials,
+and personal content are excluded from logs and durable response metadata.

@@ -10,6 +10,9 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_webhook_secret: str = Field(default="change-me", min_length=1)
     telegram_api_timeout_seconds: float = Field(default=10.0, gt=0)
+    telegram_voice_max_bytes: int = Field(default=20 * 1024 * 1024, ge=1024, le=50 * 1024 * 1024)
+    telegram_voice_max_duration_seconds: int = Field(default=300, ge=1, le=3600)
+    telegram_voice_log_transcript: bool = False
     telegram_confirmation_max_attempts: int = Field(default=3, ge=1, le=5)
     telegram_confirmation_retry_delay_seconds: float = Field(default=0.25, ge=0, le=5)
     telegram_confirmation_background_max_attempts: int = Field(default=3, ge=1, le=3)
@@ -28,6 +31,10 @@ class Settings(BaseSettings):
     llm_extract_model: str = "openai/gpt-oss-120b"
     llm_intent_model: str = "openai/gpt-oss-20b"
     llm_timeout_seconds: float = Field(default=10.0, gt=0)
+    stt_base_url: str = "https://api.groq.com/openai/v1"
+    stt_api_key: str | None = None
+    stt_model: str = "whisper-large-v3-turbo"
+    stt_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
     embedding_provider: str = "disabled"
     embedding_base_url: str = "https://api.openai.com/v1"
     embedding_gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
@@ -71,6 +78,9 @@ def validate_runtime_settings(settings: Settings, *, allow_local_database: bool 
 
     if not (settings.llm_api_key or "").strip():
         errors.append("LLM_API_KEY must be configured before production startup")
+
+    if not (settings.stt_api_key or "").strip():
+        errors.append("STT_API_KEY must be configured before production startup")
 
     embedding_provider = settings.embedding_provider.strip().casefold()
     if embedding_provider not in {"disabled", "openai_compatible", "gemini"}:

@@ -26,6 +26,7 @@ from reminder_agent.memories import MemoryRetrievalPolicy
 from reminder_agent.observability import configure_logging, log_event, request_id
 from reminder_agent.settings import Settings, get_settings, validate_runtime_settings
 from reminder_agent.telegram import TelegramClient
+from reminder_agent.transcription import AudioTranscriber, GroqWhisperTranscriber
 
 REQUIRED_SCHEMA_TABLES = (
     "users",
@@ -89,6 +90,7 @@ def create_app(
     intent_router=None,
     memory_answerer=None,
     embedding_provider=None,
+    transcriber: AudioTranscriber | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> FastAPI:
     runtime_settings = settings or get_settings()
@@ -111,6 +113,16 @@ def create_app(
     app = FastAPI(title="Memorae", lifespan=lifespan)
     app.state.settings = runtime_settings
     app.state.telegram_client = telegram_client
+    app.state.transcriber = transcriber or (
+        GroqWhisperTranscriber(
+            runtime_settings.stt_base_url,
+            runtime_settings.stt_api_key,
+            runtime_settings.stt_model,
+            runtime_settings.stt_timeout_seconds,
+        )
+        if runtime_settings.stt_api_key
+        else None
+    )
     model_interpreter = None
     configured_memory_answerer = None
     if app.state.settings.llm_api_key:
