@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -240,7 +241,13 @@ def list_owned_reminders(
 
 
 def _request_hash(update: TelegramUpdate) -> str:
-    canonical = update.model_dump_json(by_alias=True, exclude_none=True)
+    if update.message is None or update.message.voice is None:
+        canonical = update.model_dump_json(by_alias=True, exclude_none=True)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    payload = update.model_dump(by_alias=True, exclude_none=True)
+    if update.message is not None and update.message.voice is not None:
+        payload.get("message", {}).pop("text", None)
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -330,7 +337,7 @@ def _store_response(
         "text": reply.text,
         "reply_markup": None,
     }
-    if include_request_text:
+    if include_request_text and update.message.voice is None:
         # Kept only in the durable idempotency record so the intent classifier
         # can receive recent turns; memory commands opt out because their text
         # may contain secrets.

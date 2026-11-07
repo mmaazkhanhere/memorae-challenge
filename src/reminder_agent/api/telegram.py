@@ -126,6 +126,7 @@ def telegram_webhook(
         has_message=update.message is not None,
         chat_type=update.message.chat.type if update.message is not None else None,
         has_contact=update.message is not None and update.message.contact is not None,
+        has_voice=update.message is not None and update.message.voice is not None,
         contact_owner_present=(
             update.message is not None
             and update.message.contact is not None
@@ -134,6 +135,12 @@ def telegram_webhook(
     )
 
     try:
+        client = request.app.state.telegram_client
+        if update.message is not None and update.message.voice is not None and client is None:
+            client = HttpTelegramClient(
+                request.app.state.settings.telegram_bot_token,
+                request.app.state.settings.telegram_api_timeout_seconds,
+            )
         reply = handle_update(
             db,
             update,
@@ -147,6 +154,13 @@ def telegram_webhook(
             now=request.app.state.clock(),
             session_ttl_seconds=request.app.state.settings.conversation_session_ttl_seconds,
             callback_secret=request.app.state.settings.telegram_webhook_secret,
+            telegram_client=client,
+            transcriber=request.app.state.transcriber,
+            voice_max_bytes=request.app.state.settings.telegram_voice_max_bytes,
+            voice_max_duration_seconds=(
+                request.app.state.settings.telegram_voice_max_duration_seconds
+            ),
+            log_voice_transcript=request.app.state.settings.telegram_voice_log_transcript,
         )
         log_event(
             logger,
@@ -164,12 +178,12 @@ def telegram_webhook(
                 "telegram_update_duplicate",
                 update_id=update.update_id,
             )
-        client = None
         if reply is not None and update.callback_query is not None:
-            client = request.app.state.telegram_client or HttpTelegramClient(
-                request.app.state.settings.telegram_bot_token,
-                request.app.state.settings.telegram_api_timeout_seconds,
-            )
+            if client is None:
+                client = HttpTelegramClient(
+                    request.app.state.settings.telegram_bot_token,
+                    request.app.state.settings.telegram_api_timeout_seconds,
+                )
             acknowledge_callback = getattr(client, "answer_callback_query", None)
             if callable(acknowledge_callback):
                 try:
