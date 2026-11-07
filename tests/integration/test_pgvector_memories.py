@@ -27,7 +27,7 @@ class FakePgvectorEmbeddings:
 
     def embed(self, text: str) -> list[float]:
         normalized = text.casefold()
-        if "park" in normalized or "b17" in normalized:
+        if "park" in normalized or "leave my car" in normalized or "b17" in normalized:
             return _vector(0)
         return _vector(1)
 
@@ -81,10 +81,9 @@ def test_pgvector_owner_scoped_semantic_lookup_survives_new_session(
             query="where do I park",
             embedding_provider=provider,
         )
-        assert result.status == "FOUND"
-        assert result.fact is not None
-        assert result.fact.id == owned.fact_id
-        assert result.fact.content == "my parking slot is B17"
+        assert result.status == "CANDIDATES"
+        assert result.candidates[0].id == owned.fact_id
+        assert result.candidates[0].content == "my parking slot is B17"
         assert db.scalar(
             select(func.count())
             .select_from(MemoryFact)
@@ -142,3 +141,37 @@ def test_pgvector_old_fact_with_null_embedding_uses_lexical_fallback_only(
             embedding_provider=provider,
         )
         assert semantic_without_index.status == "UNKNOWN"
+
+
+def test_pgvector_exact_production_parking_query_uses_full_semantic_request(
+    session_factory,
+) -> None:
+    provider = FakePgvectorEmbeddings()
+    owner_id = uuid4()
+    with session_factory() as db, db.begin():
+        db.add(
+            User(
+                id=owner_id,
+                name="Owner",
+                timezone="Asia/Karachi",
+                onboarding_status="ACTIVE",
+            )
+        )
+        db.flush()
+        saved = save_memory_fact(
+            db,
+            user_id=owner_id,
+            content="my parking slot is B17",
+            embedding_provider=provider,
+        )
+
+    with session_factory() as db:
+        result = lookup_memory_fact(
+            db,
+            user_id=owner_id,
+            query="leave my car",
+            semantic_query="Where do I leave my car?",
+            embedding_provider=provider,
+        )
+        assert result.status == "CANDIDATES"
+        assert result.candidates[0].id == saved.fact_id

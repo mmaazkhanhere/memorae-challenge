@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from reminder_agent.db.models import Base, MemoryFact
 from reminder_agent.embeddings import EmbeddingProviderError
 from reminder_agent.memories import (
+    MemoryAnswerProposal,
     MemoryRetrievalPolicy,
     MemoryIntentEvidence,
     PendingMemory,
@@ -20,6 +21,7 @@ from reminder_agent.memories import (
     is_memory_lookup_query_grounded,
     is_memory_save_command,
     lookup_memory_fact,
+    memory_answer_preserves_exact_values,
     save_memory_fact,
     update_memory_fact_content,
 )
@@ -343,7 +345,7 @@ def test_backfill_and_content_regeneration_are_resumable_and_idempotent() -> Non
     engine.dispose()
 
 
-def test_semantic_lookup_is_owner_scoped_and_threshold_calibrated() -> None:
+def test_semantic_lookup_is_owner_scoped_and_threshold_does_not_reject_candidates() -> None:
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)
     provider = FakeEmbeddingProvider(
@@ -386,8 +388,9 @@ def test_semantic_lookup_is_owner_scoped_and_threshold_calibrated() -> None:
                 semantic_ambiguity_margin=0.04,
             ),
         )
-        assert result.status == "FOUND"
-        assert result.fact is not None and result.fact.id == owned.fact_id
+        assert result.status == "CANDIDATES"
+        assert result.candidates[0].id == owned.fact_id
+        assert {fact.user_id for fact in result.candidates} == {owner_id}
 
         unknown = lookup_memory_fact(
             db,
@@ -399,11 +402,12 @@ def test_semantic_lookup_is_owner_scoped_and_threshold_calibrated() -> None:
                 semantic_ambiguity_margin=0.04,
             ),
         )
-        assert unknown.status == "UNKNOWN"
+        assert unknown.status == "CANDIDATES"
+        assert len(unknown.candidates) == 2
     engine.dispose()
 
 
-def test_close_semantic_conflicts_trigger_typed_ambiguity() -> None:
+def test_close_semantic_conflicts_are_deferred_to_the_answer_model() -> None:
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)
     provider = FakeEmbeddingProvider(
@@ -438,6 +442,31 @@ def test_close_semantic_conflicts_trigger_typed_ambiguity() -> None:
                 semantic_ambiguity_margin=0.04,
             ),
         )
-        assert result.status == "AMBIGUOUS"
+        assert result.status == "CANDIDATES"
         assert set(result.candidate_ids) == {first.fact_id, second.fact_id}
     engine.dispose()
+
+
+def test_memory_answer_contract_and_exact_value_preservation() -> None:
+    answer = MemoryAnswerProposal(
+        decision="ANSWER",
+        candidate_indices=[0],
+        answer="Your parking slot is B17.",
+        clarification_question=None,
+    )
+    assert answer.validates_candidate_count(1)
+    assert not answer.validates_candidate_count(0)
+    assert memory_answer_preserves_exact_values(
+        answer.answer or "", ("my parking slot is B17",)
+    )
+    assert not memory_answer_preserves_exact_values(
+        "Your parking slot is B 17.", ("my parking slot is B17",)
+    )
+
+    with pytest.raises(ValueError):
+        MemoryAnswerProposal(
+            decision="UNKNOWN",
+            candidate_indices=[0],
+            answer="I guessed.",
+            clarification_question=None,
+        )
