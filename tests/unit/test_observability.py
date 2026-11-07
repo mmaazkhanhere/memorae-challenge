@@ -2,7 +2,12 @@ import logging
 
 from colorama import Fore
 
-from reminder_agent.observability import JsonFormatter, ReadableFormatter, log_event
+from reminder_agent.observability import (
+    JsonFormatter,
+    ReadableFormatter,
+    exception_details,
+    log_event,
+)
 
 
 def _record(level: int = logging.INFO) -> logging.LogRecord:
@@ -34,6 +39,34 @@ def test_readable_logs_can_disable_color_for_non_interactive_sinks() -> None:
 
     assert "\x1b[" not in rendered
     assert "WARNING" in rendered
+
+
+def test_error_logs_are_fully_red() -> None:
+    rendered = ReadableFormatter(use_color=True).format(_record(logging.ERROR))
+
+    assert Fore.RED in rendered
+    assert rendered.endswith("\x1b[0m")
+
+    failed = _record(logging.WARNING)
+    failed.event_name = "memory_answer_provider_failed"
+    failed_rendered = ReadableFormatter(use_color=True).format(failed)
+    assert Fore.RED in failed_rendered
+
+
+def test_exception_details_include_http_diagnostics_without_response_body() -> None:
+    import httpx
+
+    request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+    response = httpx.Response(400, request=request, text="secret response body")
+    error = httpx.HTTPStatusError("provider rejected request", request=request, response=response)
+
+    details = exception_details(error)
+
+    assert details["exception_type"] == "HTTPStatusError"
+    assert details["status_code"] == 400
+    assert details["request_method"] == "POST"
+    assert details["request_host"] == "api.groq.com"
+    assert "secret response body" not in str(details)
 
 
 def test_json_logs_stay_structured_and_uncolored() -> None:
