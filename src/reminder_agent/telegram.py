@@ -47,6 +47,16 @@ class TelegramContact(BaseModel):
     user_id: int | None = None
 
 
+class TelegramVoice(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    file_id: str
+    file_unique_id: str | None = None
+    duration: int = Field(gt=0)
+    mime_type: str | None = None
+    file_size: int | None = Field(default=None, gt=0)
+
+
 class TelegramMessage(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
@@ -55,6 +65,7 @@ class TelegramMessage(BaseModel):
     chat: TelegramChat
     text: str | None = None
     contact: TelegramContact | None = None
+    voice: TelegramVoice | None = None
     reply_to_message: "TelegramMessage | None" = None
 
 
@@ -87,6 +98,10 @@ class TelegramClient(Protocol):
 
     def answer_callback_query(self, callback_query_id: str) -> None: ...
 
+    def get_file_path(self, file_id: str) -> str: ...
+
+    def download_file(self, file_path: str, *, max_bytes: int) -> bytes: ...
+
 
 class TelegramAPIError(RuntimeError):
     """Raised when Telegram does not accept an outbound message."""
@@ -114,8 +129,96 @@ class HttpTelegramClient:
         if not token:
             raise TelegramAPIError("Telegram bot token is not configured")
         self._token = token
-        self._url = f"https://api.telegram.org/bot{token}/sendMessage"
+        self._api_base = f"https://api.telegram.org/bot{token}"
+        self._url = f"{self._api_base}/sendMessage"
+        self._file_base = f"https://api.telegram.org/file/bot{token}"
         self._timeout = timeout_seconds
+
+    def get_file_path(self, file_id: str) -> str:
+        """Resolve a Telegram file id without exposing it in application logs."""
+        if not file_id.strip():
+            raise TelegramAPIError("Telegram file id is empty", failure_kind="invalid_media")
+        try:
+            response = httpx.post(
+                f"{self._api_base}/getFile",
+                json={"file_id": file_id},
+                timeout=self._timeout,
+            )
+        except httpx.RequestError as exc:
+            raise TelegramAPIError(
+                "Telegram file lookup failed",
+                failure_kind="network",
+                cause=self._safe_cause(exc),
+            ) from exc
+        try:
+            payload = response.json()
+        except (TypeError, ValueError) as exc:
+            raise TelegramAPIError(
+                "Telegram returned an invalid file response",
+                status_code=response.status_code,
+                failure_kind="invalid_response",
+                cause=self._safe_cause(exc),
+            ) from exc
+        result = payload.get("result") if isinstance(payload, dict) else None
+        file_path = result.get("file_path") if isinstance(result, dict) else None
+        if (
+            isinstance(payload, dict)
+            and response.is_success
+            and payload.get("ok") is True
+            and isinstance(file_path, str)
+        ):
+            return file_path
+        raise TelegramAPIError(
+            "Telegram did not return a usable file path",
+            status_code=response.status_code,
+            telegram_description=self._safe_description(
+                payload.get("description") if isinstance(payload, dict) else None
+            ),
+            failure_kind="http_error" if not response.is_success else "invalid_response",
+        )
+
+    def download_file(self, file_path: str, *, max_bytes: int) -> bytes:
+        """Download a bounded Telegram file into memory for immediate STT processing."""
+        if not file_path or max_bytes < 1:
+            raise TelegramAPIError(
+                "Telegram media request is invalid", failure_kind="invalid_media"
+            )
+        try:
+            with httpx.stream(
+                "GET",
+                f"{self._file_base}/{file_path.lstrip('/')}",
+                timeout=self._timeout,
+            ) as response:
+                response.raise_for_status()
+                content_length = response.headers.get("content-length")
+                if content_length and content_length.isdigit() and int(content_length) > max_bytes:
+                    raise TelegramAPIError(
+                        "Telegram voice note is too large", failure_kind="too_large"
+                    )
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in response.iter_bytes():
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise TelegramAPIError(
+                            "Telegram voice note is too large", failure_kind="too_large"
+                        )
+                    chunks.append(chunk)
+                return b"".join(chunks)
+        except TelegramAPIError:
+            raise
+        except httpx.HTTPStatusError as exc:
+            raise TelegramAPIError(
+                "Telegram rejected the media download",
+                status_code=exc.response.status_code,
+                failure_kind="http_error",
+            ) from exc
+        except httpx.RequestError as exc:
+            raise TelegramAPIError(
+                "Telegram media download failed",
+                failure_kind="network",
+                cause=self._safe_cause(exc),
+            ) from exc
 
     def _redact_text(self, value: str) -> str:
         """Remove the configured token from provider-controlled diagnostic text."""
