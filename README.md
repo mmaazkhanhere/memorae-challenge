@@ -50,8 +50,9 @@ only handles short greetings and thanks plus unambiguous one-time reminders such
 It also accepts weekly schedules such as `Remind me every Monday at 8 AM to call the bank` and
 stores a typed weekly rule rather than trusting a model-generated recurrence string. Anything
 requiring context, a clarification, or conversational interpretation falls back to the configured
-model. By default, a configured API key uses
-OpenAI's `https://api.openai.com/v1` endpoint and the `gpt-6-luna` model. `LLM_BASE_URL`,
+model. By default, intent fallback uses `openai/gpt-oss-20b`, while typed extraction
+and grounded memory answering use `openai/gpt-oss-120b` through the same configured
+OpenAI-compatible client. `LLM_BASE_URL`,
 `LLM_API_KEY`, `LLM_INTENT_MODEL`, and `LLM_EXTRACT_MODEL` can instead target any OpenAI-compatible `/chat/completions`
 endpoint, including a Groq or Gemini-compatible gateway, without coupling reminder business
 rules to a provider. The model can only propose a task and time; the authenticated Telegram
@@ -147,6 +148,15 @@ tokens, and recovery secrets unless the deployment explicitly approves
 `EMBEDDING_ALLOW_SENSITIVE_EXTERNAL=true`. Original memory text remains the
 source of truth; failed or disabled indexing never deletes a fact and lexical
 retrieval continues to work.
+
+Memory retrieval remains deterministic-first. A single exact lexical match is
+returned without Gemini or GPT-OSS. Otherwise Gemini/pgvector ranks at most the
+authenticated user's top three non-sensitive candidates; similarity does not
+reject them before the dedicated 120B answer prompt returns a validated
+`ANSWER`, `AMBIGUOUS`, or `UNKNOWN` decision. Candidate indices and ownership are
+rechecked, exact values must remain unchanged, and sensitive memory content is
+never sent to the answer model. Provider failure falls back to the deterministic
+unknown or clarification result.
 
 Gemini's free tier is available for eligible projects, but Google does not
 publish one universal embedding RPM/TPM/RPD value: quotas are project- and

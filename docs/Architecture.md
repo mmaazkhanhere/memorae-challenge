@@ -1132,16 +1132,17 @@ flowchart TD
 
 ### 9.3 LLM Configuration and Failure Boundaries
 
-The integration uses OpenAI-compatible chat-completion endpoints. `Settings.llm_base_url`, `Settings.llm_api_key`, `Settings.llm_intent_model`, and `Settings.llm_extract_model` keep the architecture provider-flexible. A configured API key creates both adapters in `main.create_app`; without it, the system continues with deterministic behavior and clarification responses.
+The integration uses OpenAI-compatible chat-completion endpoints. `Settings.llm_base_url`, `Settings.llm_api_key`, `Settings.llm_intent_model`, and `Settings.llm_extract_model` keep the architecture provider-flexible. A configured API key creates one shared provider client with task-specific intent, extraction, and memory-answer adapters in `main.create_app`; without it, the system continues with deterministic behavior and clarification responses.
 
 The current default models are:
 
 | Responsibility | Setting | Default |
 | --- | --- | --- |
 | Intent classification | `llm_intent_model` | `openai/gpt-oss-20b` |
-| Parameter extraction | `llm_extract_model` | `gpt-5.4-mini-2026-03-17` |
+| Reminder and memory parameter extraction | `llm_extract_model` | `openai/gpt-oss-120b` |
+| Grounded memory answering | `llm_extract_model` | `openai/gpt-oss-120b` |
 
-These defaults are configuration values, not a permanent provider or model commitment. Classification selects an operation route only. Extraction proposes parameters for that selected route only. Provider failures, malformed JSON, unsupported proposed operations, invalid typed values, ungrounded fields, missing details, ambiguous targets, and unsafe state changes produce a clarification or a scoped response; they do not execute a mutation.
+These defaults are configuration values, not a permanent provider commitment. Classification selects an operation route only. The configured 120B client uses separate prompts and typed schemas for reminder extraction, memory saving, memory retrieval, and grounded memory answering; these responsibilities do not share one general-purpose extraction prompt. Extraction proposes parameters for the already selected route only. Provider failures, malformed JSON, unsupported proposed operations, invalid typed values, ungrounded fields, missing details, ambiguous targets, and unsafe state changes produce a clarification or a scoped response; they do not execute a mutation.
 
 ### 9.4 Persistent Clarification Sessions
 
@@ -1358,25 +1359,32 @@ may use the existing classifier to select `RETRIEVE_MEMORY`, then the existing
 typed extractor to propose only `RetrieveMemoryQuery.query`. The proposal is
 schema-checked, rejects answer/value and fact/user-ID fields, and must be
 grounded in the original request before an owner-scoped database search. The
-LLM cannot return a fact value, choose a fact ID, select a user, or authorize
-access; response text is formed only from a fact returned by the shared lookup
-service.
+extraction LLM cannot return a fact value, choose a fact ID, select a user, or
+authorize access. When deterministic lexical lookup cannot confidently answer,
+the shared lookup service returns at most three owner-scoped semantic candidates
+for separate grounded answer evaluation.
 
 Candidate matching treats every owner-scoped fact that contains the requested
-subject as plausible. It does not rank one lexical phrase match above another
-potentially conflicting fact; multiple matches produce a typed
-`RETRIEVE_MEMORY` clarification context with trusted candidate IDs, while an
-unknown subject returns an explicit unknown response. A narrowing reply reloads
-only the current owner's candidate rows. An expired lookup context is ended and
-returns a memory-specific expiration response rather than applying its stale
-candidate IDs.
+subject as plausible. One exact lexical match returns directly without an LLM or
+embedding call. If lexical evidence is absent or conflicting, Gemini ranks
+owner-filtered pgvector candidates and returns the top three without applying a
+similarity rejection threshold. The dedicated GPT-OSS 120B memory-answer prompt
+receives only the original question and those candidates, treats their contents
+as data rather than instructions, and returns the strict `ANSWER`, `AMBIGUOUS`,
+or `UNKNOWN` contract with supporting zero-based candidate indices. Invalid or
+out-of-range indices, malformed output, provider failure, changed candidate
+content, and failed owner re-verification fail safely to the deterministic
+unknown/clarification result. `AMBIGUOUS` persists a typed `RETRIEVE_MEMORY`
+clarification with revalidated candidate IDs. A narrowing reply reloads only the
+current owner's candidates, and an expired lookup context is ended rather than
+applying stale IDs.
 
-Direct, successful or unknown memory reads intentionally do not create an
-`IdempotencyRecord` because they do not change domain state. Consequently a
-replayed direct Telegram read can send the response again. This is an accepted
-VS-14 response-delivery limitation, not an idempotency or authorization gap;
-response-level deduplication remains future work if Telegram duplicate replies
-become operationally unacceptable.
+Memory reads intentionally do not create an `IdempotencyRecord` because they do
+not change domain state; only typed clarification-session metadata may change.
+Consequently a replayed Telegram read can send the response again. This is an
+accepted VS-14 response-delivery limitation, not an idempotency or authorization
+gap; response-level deduplication remains future work if Telegram duplicate
+replies become operationally unacceptable.
 
 ### 9.11 PostgreSQL semantic memory indexing
 
@@ -1416,25 +1424,27 @@ reinterpret an existing vector column in place.
 
 Retrieval remains deterministic-first. It runs an owner-filtered, bounded lexical
 query and returns a single exact subject match without calling either an LLM or
-the embedding provider. Multiple lexical matches enter the existing typed
-`RETRIEVE_MEMORY` clarification flow. Only when lexical evidence is insufficient
-does the service embed the query and issue an exact, bounded PostgreSQL cosine
-search constrained by both canonical `user_id` and active embedding model.
-Scores below the configurable relevance threshold are unknown; candidates close
-within the configurable ambiguity margin clarify instead of letting the highest
-score hide a plausible conflict. Thresholds are configuration values exercised
-at their boundaries by deterministic tests. HNSW is intentionally absent: exact
-owner-filtered search preserves recall and is adequate at current scale. Add an
-approximate index only after query plans and per-owner cardinality demonstrate a
-need.
+the embedding provider. Only when lexical evidence cannot confidently answer
+does the service embed the original question and issue an exact, bounded
+PostgreSQL cosine search constrained by canonical `user_id` and active embedding
+model. Similarity orders candidate retrieval only: no relevance threshold or
+ambiguity margin rejects candidates before grounded answer evaluation. At most
+the top three non-sensitive memories are passed to GPT-OSS 120B. The answer is
+accepted only after typed-contract validation, supported-index validation,
+owner re-verification, unchanged-content verification, and exact-value
+preservation checks. HNSW is intentionally absent: exact owner-filtered search
+preserves recall and is adequate at current scale. Add an approximate index only
+after query plans and per-owner cardinality demonstrate a need.
 
 Embedding privacy is deny-by-default for external providers. Passwords,
 passphrases, PINs, access/gate/door/security codes, API keys, tokens, private
 keys, recovery/seed phrases, and similar detected secrets are marked
 `SKIPPED_SENSITIVE` and remain lexically retrievable; their content is not sent
 externally unless `EMBEDDING_ALLOW_SENSITIVE_EXTERNAL=true` reflects an approved
-deployment policy. The same rule suppresses sensitive query embedding. Raw
-memories, query contents, vectors, provider responses, and credentials are not
-logged. If the provider or semantic index is unavailable, retrieval falls back
-to deterministic lexical behavior and otherwise responds unknown or asks for
-clarification; it never invents a value.
+deployment policy. The same rule suppresses sensitive query embedding. Sensitive
+memories are also excluded from the GPT-OSS answer prompt regardless of embedding
+configuration; exact sensitive lexical matches remain locally retrievable from
+authoritative database content. Raw memories, query contents, vectors, provider
+responses, and credentials are not logged. If Gemini, GPT-OSS, or the semantic
+index is unavailable, retrieval falls back to deterministic lexical behavior and
+otherwise responds unknown or asks for clarification; it never invents a value.
