@@ -9,6 +9,7 @@ from reminder_agent.embeddings import (
     GeminiEmbeddingProvider,
 )
 from reminder_agent.db.models import User
+from reminder_agent.intent import OpenAICompatibleMemoryAnswerer
 from reminder_agent.memories import lookup_memory_fact, save_memory_fact
 from reminder_agent.settings import Settings
 
@@ -19,6 +20,14 @@ def _configured_gemini_key() -> str:
         or os.getenv("GEMINI_API_KEY")
         or os.getenv("GOOGLE_API_KEY")
         or (Settings().embedding_api_key or "")
+    ).strip()
+
+
+def _configured_llm_key() -> str:
+    return (
+        os.getenv("LLM_API_KEY")
+        or os.getenv("GROQ_API_KEY")
+        or (Settings().llm_api_key or "")
     ).strip()
 
 
@@ -151,9 +160,74 @@ def test_live_gemini_save_then_retrieve_against_postgresql(session_factory) -> N
         result = lookup_memory_fact(
             db,
             user_id=owner.id,
-            query="Which food do I like most?",
+            query="food like most",
+            semantic_query="Which food do I like most?",
             embedding_provider=provider,
         )
-        assert result.status == "FOUND"
-        assert result.fact is not None
-        assert result.fact.content == "my favorite food is biryani"
+        assert result.status == "CANDIDATES"
+        assert result.candidates[0].content == "my favorite food is biryani"
+
+
+def test_live_gemini_groq_postgresql_memory_retrieval_end_to_end(session_factory) -> None:
+    if os.getenv("RUN_LIVE_MEMORY_RETRIEVAL") != "1":
+        pytest.skip("set RUN_LIVE_MEMORY_RETRIEVAL=1 to enable the live provider test")
+    if not os.getenv("TEST_DATABASE_URL", "").startswith("postgresql"):
+        pytest.skip("requires TEST_DATABASE_URL backed by PostgreSQL")
+    gemini_key = _configured_gemini_key()
+    llm_key = _configured_llm_key()
+    if not gemini_key or not llm_key:
+        pytest.skip("Gemini and Groq/LLM API keys are both required")
+
+    settings = Settings()
+    provider = GeminiEmbeddingProvider(
+        base_url=settings.embedding_gemini_base_url,
+        api_key=gemini_key,
+        model=settings.embedding_gemini_model,
+        dimensions=settings.embedding_dimensions,
+    )
+    answerer = OpenAICompatibleMemoryAnswerer(
+        "https://api.groq.com/openai/v1",
+        llm_key,
+        "openai/gpt-oss-120b",
+        settings.llm_timeout_seconds,
+    )
+    owner = User(
+        name="Live retrieval owner",
+        timezone="UTC",
+        onboarding_status="ACTIVE",
+    )
+    with session_factory() as db, db.begin():
+        db.add(owner)
+        db.flush()
+        for content in (
+            "my parking slot is B17",
+            "my favorite food is biryani",
+            "my office location is Lahore",
+            "my dog's name is Milo",
+        ):
+            saved = save_memory_fact(
+                db,
+                user_id=owner.id,
+                content=content,
+                embedding_provider=provider,
+            )
+            assert saved.embedding_status == "INDEXED"
+
+    with session_factory() as db:
+        result = lookup_memory_fact(
+            db,
+            user_id=owner.id,
+            query="leave my car",
+            semantic_query="Where do I leave my car?",
+            embedding_provider=provider,
+        )
+        assert result.status == "CANDIDATES"
+        assert 1 <= len(result.candidates) <= 3
+        assert {fact.user_id for fact in result.candidates} == {owner.id}
+        proposal = answerer.answer(
+            question="Where do I leave my car?",
+            memories=tuple(fact.content for fact in result.candidates),
+        )
+        assert proposal is not None and proposal.decision == "ANSWER"
+        assert proposal.answer is not None and "B17" in proposal.answer
+        assert proposal.validates_candidate_count(len(result.candidates))
