@@ -67,6 +67,11 @@ class ReadableFormatter(logging.Formatter):
         message = event.replace("_", " ")
         if not self.use_color:
             return f"{timestamp} {record.levelname:<8} {message}{suffix}"
+        failure_event = event.endswith("_failed") or event.endswith("_error")
+        if record.levelno >= logging.ERROR or failure_event:
+            # Keep the entire error/failure line visibly red, including the
+            # diagnostic context, so provider and application failures stand out.
+            return f"{Fore.RED}{timestamp} {record.levelname:<8} {message}{suffix}{Style.RESET_ALL}"
         colour = self._level_colours.get(record.levelno, Fore.WHITE)
         return (
             f"{Fore.LIGHTBLACK_EX}{timestamp}{Style.RESET_ALL} "
@@ -119,6 +124,38 @@ def log_event(
         exc_info=exc_info,
         extra={"event_name": event, "context": context},
     )
+
+
+def exception_details(exc: BaseException) -> dict[str, Any]:
+    """Return useful provider/schema diagnostics without logging raw payloads."""
+
+    details: dict[str, Any] = {"exception_type": type(exc).__name__}
+    response = getattr(exc, "response", None)
+    if response is not None:
+        status_code = getattr(response, "status_code", None)
+        reason_phrase = getattr(response, "reason_phrase", None)
+        if status_code is not None:
+            details["status_code"] = status_code
+        if reason_phrase:
+            details["reason_phrase"] = reason_phrase
+    request = getattr(exc, "request", None)
+    if request is not None:
+        method = getattr(request, "method", None)
+        url = getattr(request, "url", None)
+        host = getattr(url, "host", None) if url is not None else None
+        if method:
+            details["request_method"] = method
+        if host:
+            details["request_host"] = host
+    errors = getattr(exc, "errors", None)
+    if callable(errors):
+        try:
+            details["validation_error_types"] = [
+                item.get("type") for item in errors(include_url=False)
+            ]
+        except Exception:
+            details["validation_error_types"] = ["unavailable"]
+    return details
 
 
 def request_id() -> str:

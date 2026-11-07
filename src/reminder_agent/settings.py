@@ -25,9 +25,22 @@ class Settings(BaseSettings):
     notification_retry_base_delay_seconds: float = Field(default=30.0, gt=0, le=3600)
     llm_base_url: str = "https://api.openai.com/v1"
     llm_api_key: str | None = None
-    llm_extract_model: str = "gpt-5.4-mini-2026-03-17"
+    llm_extract_model: str = "openai/gpt-oss-120b"
     llm_intent_model: str = "openai/gpt-oss-20b"
     llm_timeout_seconds: float = Field(default=10.0, gt=0)
+    embedding_provider: str = "disabled"
+    embedding_base_url: str = "https://api.openai.com/v1"
+    embedding_gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
+    embedding_api_key: str | None = None
+    embedding_model: str = "text-embedding-3-small"
+    embedding_gemini_model: str = "gemini-embedding-001"
+    embedding_dimensions: int = Field(default=1536, ge=1)
+    embedding_timeout_seconds: float = Field(default=10.0, gt=0)
+    embedding_allow_sensitive_external: bool = False
+    memory_lexical_candidate_limit: int = Field(default=20, ge=2, le=50)
+    memory_semantic_candidate_limit: int = Field(default=3, ge=2, le=20)
+    memory_semantic_relevance_threshold: float = Field(default=0.68, ge=-1, le=1)
+    memory_semantic_ambiguity_margin: float = Field(default=0.04, ge=0, le=1)
     conversation_session_ttl_seconds: int = Field(default=900, ge=60, le=86400)
     phone_default_region: str | None = None
     log_level: str = "INFO"
@@ -58,6 +71,18 @@ def validate_runtime_settings(settings: Settings, *, allow_local_database: bool 
 
     if not (settings.llm_api_key or "").strip():
         errors.append("LLM_API_KEY must be configured before production startup")
+
+    embedding_provider = settings.embedding_provider.strip().casefold()
+    if embedding_provider not in {"disabled", "openai_compatible", "gemini"}:
+        errors.append("EMBEDDING_PROVIDER must be disabled, openai_compatible, or gemini")
+    if embedding_provider in {"openai_compatible", "gemini"} and not (
+        settings.embedding_api_key or ""
+    ).strip():
+        errors.append("EMBEDDING_API_KEY must be configured for semantic indexing")
+    if embedding_provider == "gemini" and settings.embedding_gemini_model != "gemini-embedding-001":
+        errors.append("EMBEDDING_GEMINI_MODEL must be gemini-embedding-001")
+    if settings.embedding_dimensions != 1536:
+        errors.append("EMBEDDING_DIMENSIONS must match the migrated vector(1536) schema")
 
     if errors:
         raise RuntimeError("Invalid production configuration: " + "; ".join(errors))

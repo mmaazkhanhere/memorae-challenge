@@ -38,7 +38,7 @@ Production startup fails fast unless `DATABASE_URL` uses PostgreSQL,
 least 32 characters. The sample placeholders and local SQLite defaults are intended only for
 injected test applications. `/ready` also verifies that the domain tables exist, so a stale
 `alembic_version` row cannot make an empty database appear healthy. Readiness also requires the
-current migration head (`0014_recurrence_exceptions`) and the worker/confirmation claim
+current migration head (`0016_memory_embeddings`) and the worker/confirmation claim
 columns, so a partially migrated database is rejected before webhooks are accepted.
 The additive schema-repair migrations also rebuild missing domain tables when a
 database was reset without resetting its Alembic version row.
@@ -50,8 +50,9 @@ only handles short greetings and thanks plus unambiguous one-time reminders such
 It also accepts weekly schedules such as `Remind me every Monday at 8 AM to call the bank` and
 stores a typed weekly rule rather than trusting a model-generated recurrence string. Anything
 requiring context, a clarification, or conversational interpretation falls back to the configured
-model. By default, a configured API key uses
-OpenAI's `https://api.openai.com/v1` endpoint and the `gpt-6-luna` model. `LLM_BASE_URL`,
+model. By default, intent fallback uses `openai/gpt-oss-20b`, while typed extraction
+and grounded memory answering use `openai/gpt-oss-120b` through the same configured
+OpenAI-compatible client. `LLM_BASE_URL`,
 `LLM_API_KEY`, `LLM_INTENT_MODEL`, and `LLM_EXTRACT_MODEL` can instead target any OpenAI-compatible `/chat/completions`
 endpoint, including a Groq or Gemini-compatible gateway, without coupling reminder business
 rules to a provider. The model can only propose a task and time; the authenticated Telegram
@@ -131,6 +132,39 @@ Run tests with:
 ```powershell
 uv run pytest
 ```
+
+Semantic memory uses PostgreSQL pgvector with `vector(1536)`, cosine distance,
+and a provider-agnostic embedding boundary. It is disabled by default. Configure
+the `EMBEDDING_*` values in `.env` (set `EMBEDDING_PROVIDER=gemini` and provide
+`EMBEDDING_API_KEY` to use Google's `gemini-embedding-001`), apply migrations, then index one resumable
+batch at a time with:
+
+```powershell
+uv run memory-embedding-backfill
+```
+
+External embedding calls exclude detected passwords, PINs, access codes, keys,
+tokens, and recovery secrets unless the deployment explicitly approves
+`EMBEDDING_ALLOW_SENSITIVE_EXTERNAL=true`. Original memory text remains the
+source of truth; failed or disabled indexing never deletes a fact and lexical
+retrieval continues to work.
+
+Memory retrieval remains deterministic-first. A single exact lexical match is
+returned without Gemini or GPT-OSS. Otherwise Gemini/pgvector ranks at most the
+authenticated user's top three non-sensitive candidates; similarity does not
+reject them before the dedicated 120B answer prompt returns a validated
+`ANSWER`, `AMBIGUOUS`, or `UNKNOWN` decision. Candidate indices and ownership are
+rechecked, exact values must remain unchanged, and sensitive memory content is
+never sent to the answer model. Provider failure falls back to the deterministic
+unknown or clarification result.
+
+Gemini's free tier is available for eligible projects, but Google does not
+publish one universal embedding RPM/TPM/RPD value: quotas are project- and
+tier-specific and must be checked in AI Studio. The adapter sends
+`RETRIEVAL_DOCUMENT` for saved facts and `RETRIEVAL_QUERY` for questions and
+normalizes the 1,536-dimensional truncated prefix. A Gemini key is not present
+in this checkout, so the live-provider test is skipped; fake-response coverage
+is included.
 
 When running PostgreSQL integration tests, set `TEST_DATABASE_URL` to the dedicated
 `memorae_test` database on port 5434. The test fixture refuses to run destructive cleanup if

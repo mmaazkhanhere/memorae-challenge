@@ -22,6 +22,11 @@ depends_on = None
 def upgrade() -> None:
     # The model metadata is the source of truth for this additive repair.  With
     # checkfirst=True, existing tables and data are left untouched.
+    # The metadata now includes the VS-16 pgvector column, so the PostgreSQL
+    # type must exist before create_all runs on a fresh database. Migration
+    # 0016 remains the authoritative extension/schema migration.
+    if op.get_bind().dialect.name == "postgresql":
+        op.execute("CREATE EXTENSION IF NOT EXISTS vector")
     Base.metadata.create_all(bind=op.get_bind(), checkfirst=True)
 
 

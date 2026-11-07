@@ -814,7 +814,7 @@ def test_multiple_partial_matches_require_clarification(
     assert post_update(
         api_client, update_factory(4108, text="Cancel call bank")
     ).status_code == 200
-    assert "multiple possible" in telegram_client.messages[-1][1].lower()
+    assert "multiple matching" in telegram_client.messages[-1][1].lower()
     assert db.scalars(select(Reminder.status)).all() == ["ACTIVE", "ACTIVE"]
 
 

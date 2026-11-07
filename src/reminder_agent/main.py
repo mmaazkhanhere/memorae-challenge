@@ -14,11 +14,15 @@ from sqlalchemy.orm import Session
 
 from reminder_agent.api.telegram import router as telegram_router
 from reminder_agent.db.session import get_db
+from reminder_agent.embeddings import EmbeddingPrivacyPolicy, create_embedding_provider
 from reminder_agent.intent import (
     OpenAICompatibleIntentInterpreter,
     OpenAICompatibleIntentRouter,
+    OpenAICompatibleLLMClient,
+    OpenAICompatibleMemoryAnswerer,
     ReminderIntentInterpreter,
 )
+from reminder_agent.memories import MemoryRetrievalPolicy
 from reminder_agent.observability import configure_logging, log_event, request_id
 from reminder_agent.settings import Settings, get_settings, validate_runtime_settings
 from reminder_agent.telegram import TelegramClient
@@ -34,7 +38,7 @@ REQUIRED_SCHEMA_TABLES = (
     "conversation_sessions",
     "memory_facts",
 )
-REQUIRED_SCHEMA_VERSION = "0015_memory_facts"
+REQUIRED_SCHEMA_VERSION = "0016_memory_embeddings"
 REQUIRED_SCHEMA_COLUMNS = {
     "notifications": {
         "claimed_by",
@@ -60,7 +64,19 @@ REQUIRED_SCHEMA_COLUMNS = {
     },
     "reminder_occurrences": {"recurrence_instance_key"},
     "reminder_recurrence_exceptions": {"reminder_id", "occurrence_date"},
-    "memory_facts": {"user_id", "content", "created_at", "updated_at"},
+    "memory_facts": {
+        "user_id",
+        "content",
+        "embedding",
+        "embedding_status",
+        "embedding_model",
+        "embedding_content_hash",
+        "embedding_attempts",
+        "embedding_last_error",
+        "embedding_updated_at",
+        "created_at",
+        "updated_at",
+    },
 }
 
 
@@ -71,6 +87,8 @@ def create_app(
     session_factory: Callable[[], Session] | None = None,
     reminder_interpreter=None,
     intent_router=None,
+    memory_answerer=None,
+    embedding_provider=None,
     clock: Callable[[], datetime] | None = None,
 ) -> FastAPI:
     runtime_settings = settings or get_settings()
@@ -94,25 +112,53 @@ def create_app(
     app.state.settings = runtime_settings
     app.state.telegram_client = telegram_client
     model_interpreter = None
+    configured_memory_answerer = None
     if app.state.settings.llm_api_key:
+        llm_client = OpenAICompatibleLLMClient(
+            app.state.settings.llm_base_url,
+            app.state.settings.llm_api_key,
+            app.state.settings.llm_timeout_seconds,
+        )
         model_interpreter = OpenAICompatibleIntentInterpreter(
             app.state.settings.llm_base_url,
             app.state.settings.llm_api_key,
             app.state.settings.llm_extract_model,
             app.state.settings.llm_timeout_seconds,
+            client=llm_client,
         )
         app.state.intent_router = intent_router or OpenAICompatibleIntentRouter(
             app.state.settings.llm_base_url,
             app.state.settings.llm_api_key,
             app.state.settings.llm_intent_model,
             app.state.settings.llm_timeout_seconds,
+            client=llm_client,
+        )
+        configured_memory_answerer = OpenAICompatibleMemoryAnswerer(
+            app.state.settings.llm_base_url,
+            app.state.settings.llm_api_key,
+            app.state.settings.llm_extract_model,
+            app.state.settings.llm_timeout_seconds,
+            client=llm_client,
         )
     else:
         app.state.intent_router = intent_router
     app.state.reminder_interpreter = reminder_interpreter or ReminderIntentInterpreter(
         model_interpreter
     )
+    app.state.memory_answerer = memory_answerer or configured_memory_answerer
     app.state.clock = clock or (lambda: datetime.now(timezone.utc))
+    app.state.embedding_provider = embedding_provider or create_embedding_provider(
+        runtime_settings
+    )
+    app.state.embedding_privacy_policy = EmbeddingPrivacyPolicy(
+        allow_sensitive_external=runtime_settings.embedding_allow_sensitive_external
+    )
+    app.state.memory_retrieval_policy = MemoryRetrievalPolicy(
+        lexical_candidate_limit=runtime_settings.memory_lexical_candidate_limit,
+        semantic_candidate_limit=runtime_settings.memory_semantic_candidate_limit,
+        semantic_relevance_threshold=runtime_settings.memory_semantic_relevance_threshold,
+        semantic_ambiguity_margin=runtime_settings.memory_semantic_ambiguity_margin,
+    )
 
     @app.middleware("http")
     async def request_logging(request: Request, call_next: TypingCallable[[Request], Awaitable[Response]]):

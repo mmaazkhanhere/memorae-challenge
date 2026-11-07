@@ -1018,9 +1018,9 @@ flowchart TB
 
 ```
 
-## 9. Implemented Architecture: VS-01 through VS-13
+## 9. Implemented Architecture: VS-01 through VS-14
 
-This section records the architecture implemented for VS-01 through VS-13 only. It is an implementation supplement to the original design material above: it does not change the existing requirements, workflows, or designs for later slices.
+This section records the architecture implemented for VS-01 through VS-14. It is an implementation supplement to the original design material above: it does not change the existing requirements, workflows, or designs for later slices.
 
 ### 9.1 Current Component Architecture
 
@@ -1132,16 +1132,17 @@ flowchart TD
 
 ### 9.3 LLM Configuration and Failure Boundaries
 
-The integration uses OpenAI-compatible chat-completion endpoints. `Settings.llm_base_url`, `Settings.llm_api_key`, `Settings.llm_intent_model`, and `Settings.llm_extract_model` keep the architecture provider-flexible. A configured API key creates both adapters in `main.create_app`; without it, the system continues with deterministic behavior and clarification responses.
+The integration uses OpenAI-compatible chat-completion endpoints. `Settings.llm_base_url`, `Settings.llm_api_key`, `Settings.llm_intent_model`, and `Settings.llm_extract_model` keep the architecture provider-flexible. A configured API key creates one shared provider client with task-specific intent, extraction, and memory-answer adapters in `main.create_app`; without it, the system continues with deterministic behavior and clarification responses.
 
 The current default models are:
 
 | Responsibility | Setting | Default |
 | --- | --- | --- |
 | Intent classification | `llm_intent_model` | `openai/gpt-oss-20b` |
-| Parameter extraction | `llm_extract_model` | `gpt-5.4-mini-2026-03-17` |
+| Reminder and memory parameter extraction | `llm_extract_model` | `openai/gpt-oss-120b` |
+| Grounded memory answering | `llm_extract_model` | `openai/gpt-oss-120b` |
 
-These defaults are configuration values, not a permanent provider or model commitment. Classification selects an operation route only. Extraction proposes parameters for that selected route only. Provider failures, malformed JSON, unsupported proposed operations, invalid typed values, ungrounded fields, missing details, ambiguous targets, and unsafe state changes produce a clarification or a scoped response; they do not execute a mutation.
+These defaults are configuration values, not a permanent provider commitment. Classification selects an operation route only. The configured 120B client uses separate prompts and typed schemas for reminder extraction, memory saving, memory retrieval, and grounded memory answering; these responsibilities do not share one general-purpose extraction prompt. Extraction proposes parameters for the already selected route only. Provider failures, malformed JSON, unsupported proposed operations, invalid typed values, ungrounded fields, missing details, ambiguous targets, and unsafe state changes produce a clarification or a scoped response; they do not execute a mutation.
 
 ### 9.4 Persistent Clarification Sessions
 
@@ -1197,7 +1198,9 @@ The current SQLAlchemy schema and Alembic migrations provide these implemented t
 - `notifications`: a due Telegram delivery linked to an occurrence and destination identity, with sequence, status, attempts, provider result, and lease fields.
 - `conversation_sessions`: typed pending clarification payloads, channel/session identity, status, optional active reminder reference, version, and update time.
 - `idempotency_records`: a unique `(source, idempotency_key)` record with request hash, durable response, business outcome, and confirmation-delivery state.
-- `memory_facts`: non-empty user-owned fact content with creation/update timestamps and an owner/date index.
+- `memory_facts`: authoritative non-empty user-owned fact content, nullable
+  `vector(1536)` semantic data, model/content-hash/versioning metadata, indexing
+  status and attempts, timestamps, and owner/date plus owner/index-status indexes.
 
 The implemented relationships are user-to-identities/reminders/sessions, reminder-to-occurrences/recurrence-exceptions, occurrence-to-notifications, and notification-to-a destination identity. Foreign keys cascade from user to owned rows and from reminder to occurrences/exceptions; notification destinations use `RESTRICT` to preserve delivery ownership. Application transactions persist a state change and its idempotency response together. Outbound Telegram calls occur only after the transaction commits. Rescheduling and cancellation lock the target reminder, relevant occurrences, and pending notifications; they fail safely if a notification is already `SENDING`.
 
@@ -1341,3 +1344,107 @@ after commit. Replayed Telegram updates return the stored response without
 inserting another fact. Memory request text is omitted from the classifier's
 durable recent-message history so secrets are not unnecessarily duplicated in
 idempotency payloads; logs contain only metadata such as content length.
+
+### 9.10 Retrieved memory facts (VS-14)
+
+VS-14 keeps memory reads on the same authenticated Telegram and shared-memory
+service boundary as saving. High-precision forms such as "What's my gate code?"
+extract their subject deterministically and query only facts owned by the
+canonical user. Reminder/date wording takes precedence over a question-shaped
+memory lookup: "What's my reminder for tomorrow?" and "What reminders do I
+have tomorrow?" are read-only reminder-list requests.
+
+If the deterministic router cannot reliably identify the requested subject, it
+may use the existing classifier to select `RETRIEVE_MEMORY`, then the existing
+typed extractor to propose only `RetrieveMemoryQuery.query`. The proposal is
+schema-checked, rejects answer/value and fact/user-ID fields, and must be
+grounded in the original request before an owner-scoped database search. The
+extraction LLM cannot return a fact value, choose a fact ID, select a user, or
+authorize access. When deterministic lexical lookup cannot confidently answer,
+the shared lookup service returns at most three owner-scoped semantic candidates
+for separate grounded answer evaluation.
+
+Candidate matching treats every owner-scoped fact that contains the requested
+subject as plausible. One exact lexical match returns directly without an LLM or
+embedding call. If lexical evidence is absent or conflicting, Gemini ranks
+owner-filtered pgvector candidates and returns the top three without applying a
+similarity rejection threshold. The dedicated GPT-OSS 120B memory-answer prompt
+receives only the original question and those candidates, treats their contents
+as data rather than instructions, and returns the strict `ANSWER`, `AMBIGUOUS`,
+or `UNKNOWN` contract with supporting zero-based candidate indices. Invalid or
+out-of-range indices, malformed output, provider failure, changed candidate
+content, and failed owner re-verification fail safely to the deterministic
+unknown/clarification result. `AMBIGUOUS` persists a typed `RETRIEVE_MEMORY`
+clarification with revalidated candidate IDs. A narrowing reply reloads only the
+current owner's candidates, and an expired lookup context is ended rather than
+applying stale IDs.
+
+Memory reads intentionally do not create an `IdempotencyRecord` because they do
+not change domain state; only typed clarification-session metadata may change.
+Consequently a replayed Telegram read can send the response again. This is an
+accepted VS-14 response-delivery limitation, not an idempotency or authorization
+gap; response-level deduplication remains future work if Telegram duplicate
+replies become operationally unacceptable.
+
+### 9.11 PostgreSQL semantic memory indexing
+
+Migration `0016_memory_embeddings` enables the PostgreSQL `vector` extension
+and adds a nullable `vector(1536)` column to the existing `memory_facts` table.
+It is additive: existing fact text and identifiers are unchanged and existing
+rows receive `embedding_status=PENDING`. `content` remains the authoritative
+fact and is the only value returned to a user. The current schema is compatible
+with either the configurable OpenAI-compatible adapter or Google's
+`gemini-embedding-001` adapter at 1,536 dimensions and cosine distance. Gemini
+uses `RETRIEVAL_DOCUMENT` for saved facts and `RETRIEVAL_QUERY` for questions;
+its 1,536-dimensional Matryoshka prefix is manually L2-normalized after
+truncation as required by Google's guidance. The provider boundary is a small
+`EmbeddingProvider` protocol; deterministic fakes are used in automated tests.
+
+Embedding work starts only inside the already authorized memory-save service,
+after intent, extraction, grounding, canonical-user resolution, pending-context
+validation, and replay checks. A successful vector is recorded as `INDEXED`
+with its model name and SHA-256 content hash. Provider failure does not roll
+back the fact: the original content commits as `FAILED`, with only a sanitized
+error category and attempt count, and can be retried. A disabled provider
+stores `PENDING`. The save confirmation says only that the information was
+saved and never claims semantic indexing succeeded. Replayed Telegram save
+events return their committed idempotent result without repeating embedding
+work.
+
+`memory-embedding-backfill` locks at most 100 eligible rows with `FOR UPDATE
+SKIP LOCKED`, regenerates vectors from current authoritative content, and
+commits one resumable batch. Content updates invalidate or regenerate their
+vector; matching model and content hashes make regeneration a no-op. Model
+changes are handled by deploying a compatible schema migration when dimensions
+change, updating the provider/model configuration, and repeatedly running the
+backfill. During that transition, retrieval only uses rows indexed by the active
+model/configuration; embeddings from incompatible models are never compared. A
+dimension change always requires a new Alembic migration; it must never
+reinterpret an existing vector column in place.
+
+Retrieval remains deterministic-first. It runs an owner-filtered, bounded lexical
+query and returns a single exact subject match without calling either an LLM or
+the embedding provider. Only when lexical evidence cannot confidently answer
+does the service embed the original question and issue an exact, bounded
+PostgreSQL cosine search constrained by canonical `user_id` and active embedding
+model. Similarity orders candidate retrieval only: no relevance threshold or
+ambiguity margin rejects candidates before grounded answer evaluation. At most
+the top three non-sensitive memories are passed to GPT-OSS 120B. The answer is
+accepted only after typed-contract validation, supported-index validation,
+owner re-verification, unchanged-content verification, and exact-value
+preservation checks. HNSW is intentionally absent: exact owner-filtered search
+preserves recall and is adequate at current scale. Add an approximate index only
+after query plans and per-owner cardinality demonstrate a need.
+
+Embedding privacy is deny-by-default for external providers. Passwords,
+passphrases, PINs, access/gate/door/security codes, API keys, tokens, private
+keys, recovery/seed phrases, and similar detected secrets are marked
+`SKIPPED_SENSITIVE` and remain lexically retrievable; their content is not sent
+externally unless `EMBEDDING_ALLOW_SENSITIVE_EXTERNAL=true` reflects an approved
+deployment policy. The same rule suppresses sensitive query embedding. Sensitive
+memories are also excluded from the GPT-OSS answer prompt regardless of embedding
+configuration; exact sensitive lexical matches remain locally retrievable from
+authoritative database content. Raw memories, query contents, vectors, provider
+responses, and credentials are not logged. If Gemini, GPT-OSS, or the semantic
+index is unavailable, retrieval falls back to deterministic lexical behavior and
+otherwise responds unknown or asks for clarification; it never invents a value.

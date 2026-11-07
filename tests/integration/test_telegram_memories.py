@@ -1,5 +1,6 @@
 from datetime import timedelta
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
@@ -11,7 +12,13 @@ from reminder_agent.intent import (
     ReminderIntentInterpreter,
 )
 from reminder_agent.main import create_app
-from reminder_agent.memories import MemoryIntentEvidence, SaveMemoryFact
+from reminder_agent.embeddings import EmbeddingProviderError
+from reminder_agent.memories import (
+    MemoryAnswerProposal,
+    MemoryIntentEvidence,
+    RetrieveMemoryQuery,
+    SaveMemoryFact,
+)
 
 from reminder_agent.db.models import (
     ConversationSession,
@@ -25,6 +32,90 @@ from reminder_agent.db.models import (
 
 
 HEADERS = {"X-Telegram-Bot-Api-Secret-Token": "test-secret"}
+
+
+def _semantic_vector(axis: int) -> list[float]:
+    vector = [0.0] * 1536
+    vector[axis] = 1.0
+    return vector
+
+
+class DeterministicFakeEmbeddings:
+    model = "fake-semantic-v1"
+    dimensions = 1536
+    is_external = False
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def embed(self, text: str) -> list[float]:
+        self.calls.append(text)
+        normalized = text.casefold()
+        if "food" in normalized or "biryani" in normalized:
+            return _semantic_vector(0)
+        if any(token in normalized for token in ("park", "b17", "leave", "car")):
+            return _semantic_vector(1)
+        if "office" in normalized or "lahore" in normalized or "located" in normalized:
+            return _semantic_vector(2)
+        return _semantic_vector(3)
+
+
+class FailingFakeEmbeddings(DeterministicFakeEmbeddings):
+    def embed(self, text: str) -> list[float]:
+        self.calls.append(text)
+        raise EmbeddingProviderError()
+
+
+class GroundedFakeAnswerer:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def answer(self, *, question: str, memories: tuple[str, ...]) -> MemoryAnswerProposal:
+        self.calls.append((question, memories))
+        lowered = question.casefold()
+        subject = (
+            "parking"
+            if any(token in lowered for token in ("park", "car"))
+            else "food"
+            if any(token in lowered for token in ("food", "eat", "dish"))
+            else "office"
+            if any(token in lowered for token in ("office", "work"))
+            else None
+        )
+        if subject is None:
+            return MemoryAnswerProposal(
+                decision="UNKNOWN",
+                candidate_indices=[],
+                answer=None,
+                clarification_question=None,
+            )
+        index = next(
+            (index for index, memory in enumerate(memories) if subject in memory.casefold()),
+            None,
+        )
+        if index is None:
+            return MemoryAnswerProposal(
+                decision="UNKNOWN",
+                candidate_indices=[],
+                answer=None,
+                clarification_question=None,
+            )
+        return MemoryAnswerProposal(
+            decision="ANSWER",
+            candidate_indices=[index],
+            answer=f'You told me: "{memories[index]}"',
+            clarification_question=None,
+        )
+
+
+class StaticFakeAnswerer:
+    def __init__(self, proposal) -> None:
+        self.proposal = proposal
+        self.calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def answer(self, *, question: str, memories: tuple[str, ...]):
+        self.calls.append((question, memories))
+        return self.proposal
 
 
 def post_update(client, update: dict):
@@ -134,6 +225,255 @@ def test_memory_facts_are_owned_separately_between_users(
     facts = db.scalars(select(MemoryFact).order_by(MemoryFact.content)).all()
     assert [fact.content for fact in facts] == ["first user's fact", "second user's fact"]
     assert facts[0].user_id != facts[1].user_id
+
+
+def test_memory_lookup_returns_exact_fact_without_mutating_memory_or_creating_idempotency(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=325)
+    assert post_update(
+        api_client,
+        update_factory(327, text="Remember my gate code is 4512"),
+    ).status_code == 200
+    fact = db.scalar(select(MemoryFact))
+    assert fact is not None
+    original_updated_at = fact.updated_at
+    fact_count = db.scalar(select(func.count()).select_from(MemoryFact))
+
+    assert post_update(
+        api_client,
+        update_factory(328, text="What's my gate code?"),
+    ).status_code == 200
+
+    assert telegram_client.messages[-1][1] == 'You told me: "my gate code is 4512"'
+    db.expire_all()
+    current = db.scalar(select(MemoryFact))
+    assert current is not None
+    assert current.content == "my gate code is 4512"
+    assert current.updated_at == original_updated_at
+    assert db.scalar(select(func.count()).select_from(MemoryFact)) == fact_count
+    assert db.scalar(
+        select(func.count()).select_from(IdempotencyRecord).where(
+            IdempotencyRecord.idempotency_key == "328"
+        )
+    ) == 0
+
+
+def test_memory_lookup_does_not_cross_user_boundary_or_hallucinate_unknown_fact(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=350)
+    onboard(api_client, update_factory, user_id=1002, chat_id=2002, start=360)
+    assert post_update(
+        api_client,
+        update_factory(352, user_id=1001, chat_id=2001, text="Remember my gate code is 4512"),
+    ).status_code == 200
+
+    assert post_update(
+        api_client,
+        update_factory(362, user_id=1002, chat_id=2002, text="What's my gate code?"),
+    ).status_code == 200
+    assert telegram_client.messages[-1][1] == "I don't know that yet."
+
+    assert post_update(
+        api_client,
+        update_factory(363, user_id=1001, chat_id=2001, text="What's my passport number?"),
+    ).status_code == 200
+    assert telegram_client.messages[-1][1] == "I don't know that yet."
+    assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
+
+
+def test_ambiguous_memory_lookup_clarifies_then_returns_one_owned_fact(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=380)
+    assert post_update(
+        api_client,
+        update_factory(382, text="Remember my gate code is 4512"),
+    ).status_code == 200
+    assert post_update(
+        api_client,
+        update_factory(383, text="Remember my backup gate code is 9921"),
+    ).status_code == 200
+
+    assert post_update(
+        api_client,
+        update_factory(384, text="What's my gate code?"),
+    ).status_code == 200
+    assert "more than one" in telegram_client.messages[-1][1].lower()
+    db.expire_all()
+    session = db.scalar(select(ConversationSession))
+    assert session is not None
+    assert session.pending_clarification["operation"] == "RETRIEVE_MEMORY"
+    assert "candidate_ids" in session.pending_clarification
+    assert "4512" not in str(session.pending_clarification)
+
+    assert post_update(
+        api_client,
+        update_factory(385, text="backup gate code"),
+    ).status_code == 200
+    assert telegram_client.messages[-1][1] == 'You told me: "my backup gate code is 9921"'
+    db.expire_all()
+    assert db.scalar(select(ConversationSession)).pending_clarification is None
+
+
+def test_pending_memory_lookup_can_be_canceled_without_mutation(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=400)
+    assert post_update(
+        api_client,
+        update_factory(402, text="Remember my gate code is 4512"),
+    ).status_code == 200
+    assert post_update(
+        api_client,
+        update_factory(403, text="Remember my backup gate code is 9921"),
+    ).status_code == 200
+    assert post_update(
+        api_client,
+        update_factory(404, text="What's my gate code?"),
+    ).status_code == 200
+    assert post_update(api_client, update_factory(405, text="Never mind")).status_code == 200
+
+    assert telegram_client.messages[-1][1] == "Okay, I won't look that up."
+    assert db.scalar(select(func.count()).select_from(MemoryFact)) == 2
+    db.expire_all()
+    assert db.scalar(select(ConversationSession)).pending_clarification is None
+
+
+def test_clear_memory_lookup_bypasses_classifier(
+    api_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=420)
+    assert post_update(
+        api_client,
+        update_factory(422, text="Remember my emergency contact is Sam"),
+    ).status_code == 200
+
+    class FailingRouter:
+        def classify(self, *args, **kwargs):
+            raise AssertionError("clear memory lookup must not invoke classification")
+
+    api_client.app.state.intent_router = FailingRouter()
+    assert post_update(
+        api_client,
+        update_factory(423, text="What is my emergency contact?"),
+    ).status_code == 200
+    assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
+
+
+def test_indirect_memory_lookup_uses_existing_typed_extractor_and_owner_scoped_fact(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=430)
+    assert post_update(
+        api_client,
+        update_factory(432, text="Remember my favorite color is blue"),
+    ).status_code == 200
+    calls: list[IntentRoute] = []
+
+    class LookupRouter:
+        def classify(self, *args, **kwargs):
+            return IntentRouteSuggestion(operation=IntentRoute.RETRIEVE_MEMORY)
+
+    class LookupExtractor:
+        def interpret(self, text, *, selected_route, **kwargs):
+            calls.append(selected_route)
+            assert text == "Which color do I like?"
+            return Interpretation(memory_query=RetrieveMemoryQuery(query="color"))
+
+    api_client.app.state.intent_router = LookupRouter()
+    api_client.app.state.reminder_interpreter = LookupExtractor()
+    assert post_update(
+        api_client,
+        update_factory(433, text="Which color do I like?"),
+    ).status_code == 200
+
+    assert calls == [IntentRoute.RETRIEVE_MEMORY]
+    assert telegram_client.messages[-1][1] == 'You told me: "my favorite color is blue"'
+    assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
+
+
+def test_ungrounded_model_memory_lookup_query_does_not_disclose_a_fact(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=440)
+    assert post_update(
+        api_client,
+        update_factory(442, text="Remember my gate code is 4512"),
+    ).status_code == 200
+
+    class LookupRouter:
+        def classify(self, *args, **kwargs):
+            return IntentRouteSuggestion(operation=IntentRoute.RETRIEVE_MEMORY)
+
+    class UngroundedLookupExtractor:
+        def interpret(self, *args, **kwargs):
+            return Interpretation(memory_query=RetrieveMemoryQuery(query="gate code"))
+
+    api_client.app.state.intent_router = LookupRouter()
+    api_client.app.state.reminder_interpreter = UngroundedLookupExtractor()
+    assert post_update(
+        api_client,
+        update_factory(443, text="Which color do I like?"),
+    ).status_code == 200
+
+    assert telegram_client.messages[-1][1] == "Which saved information should I look up?"
+    assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
+
+
+def test_reminder_lookup_collision_prefers_reminder_listing_over_memory_lookup(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=450)
+    assert post_update(
+        api_client,
+        update_factory(452, text="Remind me tomorrow at 9 AM to call the bank"),
+    ).status_code == 200
+    assert post_update(
+        api_client,
+        update_factory(453, text="Remember my reminder for tomorrow is a private note"),
+    ).status_code == 200
+
+    for update_id, text in (
+        (454, "What's my reminder for tomorrow?"),
+        (455, "What reminders do I have tomorrow?"),
+    ):
+        assert post_update(api_client, update_factory(update_id, text=text)).status_code == 200
+        assert "call the bank" in telegram_client.messages[-1][1]
+        assert "private note" not in telegram_client.messages[-1][1]
+
+
+def test_expired_memory_lookup_follow_up_does_not_reuse_stale_candidates(
+    api_client, telegram_client, db, update_factory, fixed_now
+) -> None:
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=460)
+    assert post_update(
+        api_client,
+        update_factory(462, text="Remember my gate code is 4512"),
+    ).status_code == 200
+    assert post_update(
+        api_client,
+        update_factory(463, text="Remember my backup gate code is 9921"),
+    ).status_code == 200
+    assert post_update(
+        api_client,
+        update_factory(464, text="What's my gate code?"),
+    ).status_code == 200
+    session = db.scalar(select(ConversationSession))
+    assert session is not None
+    session.updated_at = fixed_now - timedelta(seconds=901)
+    db.commit()
+
+    assert post_update(
+        api_client,
+        update_factory(465, text="backup gate code"),
+    ).status_code == 200
+    assert telegram_client.messages[-1][1] == (
+        "That memory lookup expired. Please ask what you want to look up again."
+    )
+    db.expire_all()
+    assert db.scalar(select(ConversationSession)).pending_clarification is None
 
 
 def test_incomplete_memory_save_asks_for_fact_without_mutation(
@@ -625,3 +965,408 @@ def test_expired_pending_memory_does_not_save_follow_up_as_a_new_fact(
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == 0
     db.expire_all()
     assert db.scalar(select(ConversationSession)).pending_clarification is None
+
+
+def test_required_lexical_and_semantic_memory_phrases(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    provider = DeterministicFakeEmbeddings()
+    api_client.app.state.embedding_provider = provider
+    api_client.app.state.memory_answerer = GroundedFakeAnswerer()
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=2000)
+
+    cases = (
+        (2002, "Remember my favorite food is biryani.", "What's my favorite food?", "biryani"),
+        (2004, None, "Which food do I like most?", "biryani"),
+        (
+            2005,
+            "Remember my parking slot is B17.",
+            "Where do I leave my car?",
+            "B17",
+        ),
+        (
+            2007,
+            "Remember my office location is Lahore.",
+            "Where is my office located?",
+            "Lahore",
+        ),
+    )
+    next_query_id = 2003
+    for save_id, save_text, query_text, expected in cases:
+        if save_text is not None:
+            assert post_update(
+                api_client, update_factory(save_id, text=save_text)
+            ).status_code == 200
+            next_query_id = save_id + 1
+        assert post_update(
+            api_client, update_factory(next_query_id, text=query_text)
+        ).status_code == 200
+        assert expected in telegram_client.messages[-1][1]
+        next_query_id += 1
+
+    assert db.scalar(select(func.count()).select_from(MemoryFact)) == 3
+    assert db.scalar(select(func.count()).select_from(Reminder)) == 0
+    assert db.scalar(select(func.count()).select_from(ReminderOccurrence)) == 0
+    assert db.scalar(select(func.count()).select_from(Notification)) == 0
+
+
+def test_semantic_lookup_emits_privacy_safe_diagnostics_and_uses_deterministic_route(
+    api_client, telegram_client, db, update_factory, monkeypatch
+) -> None:
+    events: list[tuple[str, dict]] = []
+
+    def capture_event(_logger, _level, event, **context):
+        events.append((event, context))
+
+    monkeypatch.setattr("reminder_agent.reminders.log_event", capture_event)
+    monkeypatch.setattr("reminder_agent.memories.log_event", capture_event)
+
+    provider = DeterministicFakeEmbeddings()
+    api_client.app.state.embedding_provider = provider
+    api_client.app.state.memory_answerer = GroundedFakeAnswerer()
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=2020)
+    assert post_update(
+        api_client,
+        update_factory(2022, text="Remember my parking slot is B17"),
+    ).status_code == 200
+    assert post_update(
+        api_client,
+        update_factory(2023, text="Where do I leave my car?"),
+    ).status_code == 200
+
+    assert telegram_client.messages[-1][1] == 'You told me: "my parking slot is B17"'
+    assert provider.calls == ["my parking slot is B17", "Where do I leave my car?"]
+
+    route_events = [context for event, context in events if event == "reminder_route_decision"]
+    assert any(
+        context["update_id"] == 2023
+        and context["route"] == ConversationRoute.RETRIEVE_MEMORY_REQUEST
+        and context["classifier_invoked"] is False
+        for context in route_events
+    )
+    extraction = [
+        context for event, context in events
+        if event == "memory_lookup_query_extracted" and context["update_id"] == 2023
+    ]
+    assert extraction == [
+        {
+            "update_id": 2023,
+            "extraction_source": "deterministic",
+            "query_present": True,
+            "query_length": len("leave my car"),
+            "classifier_invoked": False,
+        }
+    ]
+    assert not any(event == "reminder_route_classifier_requested" for event, _ in events)
+
+    sql_events = [
+        context
+        for event, context in events
+        if event == "memory_semantic_similarity_query_completed"
+    ]
+    assert sql_events
+    assert sql_events[-1]["owner_scoped"] is True
+    assert len(sql_events[-1]["candidate_ids"]) == 1
+    assert len(sql_events[-1]["similarity_scores"]) == 1
+    semantic_started = [
+        context
+        for event, context in events
+        if event == "memory_semantic_lookup_started"
+    ]
+    assert semantic_started[-1]["query_representation"] == "full_request"
+    assert semantic_started[-1]["semantic_query_length"] == len(
+        "Where do I leave my car?"
+    )
+    result_events = [
+        context
+        for event, context in events
+        if event == "memory_semantic_lookup_result"
+    ]
+    assert result_events[-1]["status"] == "CANDIDATES"
+    assert result_events[-1]["final_decision_deferred"] is True
+    assert all("content" not in context for _, context in events)
+
+
+def test_disabled_embedding_provider_falls_back_to_deterministic_lexical_lookup(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=2050)
+    api_client.app.state.embedding_provider = None
+    assert post_update(
+        api_client,
+        update_factory(2052, text="Remember my parking slot is B17"),
+    ).status_code == 200
+    assert post_update(
+        api_client,
+        update_factory(2053, text="What's my parking slot?"),
+    ).status_code == 200
+    assert telegram_client.messages[-1][1] == 'You told me: "my parking slot is B17"'
+    fact = db.scalar(select(MemoryFact))
+    assert fact is not None and fact.embedding is None
+
+
+def test_exact_lookup_does_not_call_embedding_or_llm(
+    api_client, telegram_client, update_factory
+) -> None:
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=2100)
+    assert post_update(
+        api_client,
+        update_factory(2102, text="Remember my favorite food is biryani"),
+    ).status_code == 200
+
+    class MustNotRun:
+        model = "fake-semantic-v1"
+        dimensions = 1536
+        is_external = False
+
+        def embed(self, text):
+            raise AssertionError("exact lexical lookup must not invoke embeddings")
+
+    class MustNotClassify:
+        def classify(self, *args, **kwargs):
+            raise AssertionError("exact memory lookup must not invoke classification")
+
+    class MustNotAnswer:
+        def answer(self, *args, **kwargs):
+            raise AssertionError("exact lexical lookup must not invoke the answer model")
+
+    api_client.app.state.embedding_provider = MustNotRun()
+    api_client.app.state.intent_router = MustNotClassify()
+    api_client.app.state.memory_answerer = MustNotAnswer()
+    assert post_update(
+        api_client,
+        update_factory(2103, text="What's my favorite food?"),
+    ).status_code == 200
+    assert "biryani" in telegram_client.messages[-1][1]
+
+
+def test_semantic_lookup_sends_only_top_three_owned_memories_to_answerer(
+    api_client, telegram_client, update_factory
+) -> None:
+    provider = DeterministicFakeEmbeddings()
+    answerer = StaticFakeAnswerer(
+        MemoryAnswerProposal(
+            decision="ANSWER",
+            candidate_indices=[0],
+            answer="You leave your car in parking slot B17.",
+            clarification_question=None,
+        )
+    )
+    api_client.app.state.embedding_provider = provider
+    api_client.app.state.memory_answerer = answerer
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=2120)
+    for update_id, text in enumerate(
+        (
+            "Remember my parking slot is B17",
+            "Remember my favorite food is biryani",
+            "Remember my office location is Lahore",
+            "Remember my dog's name is Milo",
+        ),
+        start=2122,
+    ):
+        assert post_update(api_client, update_factory(update_id, text=text)).status_code == 200
+
+    assert post_update(
+        api_client, update_factory(2130, text="Where do I leave my car?")
+    ).status_code == 200
+    assert telegram_client.messages[-1][1] == "You leave your car in parking slot B17."
+    assert len(answerer.calls) == 1
+    question, memories = answerer.calls[0]
+    assert question == "Where do I leave my car?"
+    assert len(memories) == 3
+    assert memories[0] == "my parking slot is B17"
+
+
+def test_multiple_complementary_memories_are_combined_with_exact_values(
+    api_client, telegram_client, update_factory
+) -> None:
+    provider = DeterministicFakeEmbeddings()
+    answerer = StaticFakeAnswerer(
+        MemoryAnswerProposal(
+            decision="ANSWER",
+            candidate_indices=[0, 1],
+            answer="Your main parking slot is B17, and your backup slot is C22.",
+            clarification_question=None,
+        )
+    )
+    api_client.app.state.embedding_provider = provider
+    api_client.app.state.memory_answerer = answerer
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=2130)
+    assert post_update(
+        api_client,
+        update_factory(2132, text="Remember my main parking slot is B17"),
+    ).status_code == 200
+    assert post_update(
+        api_client,
+        update_factory(2133, text="Remember my backup parking slot is C22"),
+    ).status_code == 200
+    assert post_update(
+        api_client,
+        update_factory(2134, text="Where do I park?"),
+    ).status_code == 200
+    assert telegram_client.messages[-1][1] == (
+        "Your main parking slot is B17, and your backup slot is C22."
+    )
+    assert len(answerer.calls) == 1
+    assert len(answerer.calls[0][1]) == 2
+
+
+def test_semantic_unknown_uses_answer_contract_without_hallucination(
+    api_client, telegram_client, update_factory
+) -> None:
+    provider = DeterministicFakeEmbeddings()
+    answerer = StaticFakeAnswerer(
+        MemoryAnswerProposal(
+            decision="UNKNOWN",
+            candidate_indices=[],
+            answer=None,
+            clarification_question=None,
+        )
+    )
+    api_client.app.state.embedding_provider = provider
+    api_client.app.state.memory_answerer = answerer
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=2140)
+    assert post_update(
+        api_client, update_factory(2142, text="Remember my favorite food is biryani")
+    ).status_code == 200
+    assert post_update(
+        api_client, update_factory(2143, text="What's my favorite movie?")
+    ).status_code == 200
+    assert telegram_client.messages[-1][1] == "I don't know that yet."
+    assert len(answerer.calls) == 1
+
+
+def test_semantic_conflicts_use_model_clarification_and_typed_pending_context(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    provider = DeterministicFakeEmbeddings()
+    answerer = StaticFakeAnswerer(
+        MemoryAnswerProposal(
+            decision="AMBIGUOUS",
+            candidate_indices=[0, 1],
+            answer=None,
+            clarification_question="Do you mean the Lahore or Karachi office location?",
+        )
+    )
+    api_client.app.state.embedding_provider = provider
+    api_client.app.state.memory_answerer = answerer
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=2160)
+    assert post_update(
+        api_client, update_factory(2162, text="Remember my office is in Lahore")
+    ).status_code == 200
+    assert post_update(
+        api_client, update_factory(2163, text="Remember my workplace is Karachi")
+    ).status_code == 200
+    assert post_update(
+        api_client, update_factory(2164, text="Where is my office located?")
+    ).status_code == 200
+    assert telegram_client.messages[-1][1] == (
+        "Do you mean the Lahore or Karachi office location?"
+    )
+    db.expire_all()
+    session = db.scalar(select(ConversationSession))
+    assert session is not None
+    assert session.pending_clarification["operation"] == "RETRIEVE_MEMORY"
+    assert len(session.pending_clarification["candidate_ids"]) == 2
+    assert db.scalar(
+        select(func.count()).select_from(IdempotencyRecord).where(
+            IdempotencyRecord.idempotency_key == "2164"
+        )
+    ) == 0
+
+
+@pytest.mark.parametrize(
+    "proposal",
+    [
+        {"decision": "ANSWER", "candidate_indices": [0], "answer": "invented"},
+        MemoryAnswerProposal(
+            decision="ANSWER",
+            candidate_indices=[3],
+            answer="invented",
+            clarification_question=None,
+        ),
+    ],
+)
+def test_invalid_or_unsupported_memory_answer_output_fails_safe(
+    api_client, telegram_client, update_factory, proposal
+) -> None:
+    api_client.app.state.embedding_provider = DeterministicFakeEmbeddings()
+    api_client.app.state.memory_answerer = StaticFakeAnswerer(proposal)
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=2180)
+    assert post_update(
+        api_client, update_factory(2182, text="Remember my parking slot is B17")
+    ).status_code == 200
+    assert post_update(
+        api_client, update_factory(2183, text="Where do I leave my car?")
+    ).status_code == 200
+    assert telegram_client.messages[-1][1] == "I don't know that yet."
+
+
+def test_semantic_candidates_and_answer_prompt_remain_cross_user_isolated(
+    api_client, telegram_client, update_factory
+) -> None:
+    provider = DeterministicFakeEmbeddings()
+    answerer = GroundedFakeAnswerer()
+    api_client.app.state.embedding_provider = provider
+    api_client.app.state.memory_answerer = answerer
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=2220)
+    onboard(api_client, update_factory, user_id=1002, chat_id=2002, start=2230)
+    assert post_update(
+        api_client,
+        update_factory(2222, user_id=1001, chat_id=2001, text="Remember my parking slot is B17"),
+    ).status_code == 200
+    assert post_update(
+        api_client,
+        update_factory(2232, user_id=1002, chat_id=2002, text="Remember my parking slot is A99"),
+    ).status_code == 200
+    assert post_update(
+        api_client,
+        update_factory(2223, user_id=1001, chat_id=2001, text="Where do I leave my car?"),
+    ).status_code == 200
+    assert "B17" in telegram_client.messages[-1][1]
+    assert "A99" not in str(answerer.calls)
+
+
+def test_sensitive_memory_never_reaches_memory_answerer(
+    api_client, telegram_client, update_factory
+) -> None:
+    class ExternalEmbeddings(DeterministicFakeEmbeddings):
+        is_external = True
+
+    class MustNotAnswer:
+        def answer(self, *args, **kwargs):
+            raise AssertionError("sensitive memory must not reach GPT-OSS")
+
+    provider = ExternalEmbeddings()
+    api_client.app.state.embedding_provider = provider
+    api_client.app.state.memory_answerer = MustNotAnswer()
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=2240)
+    assert post_update(
+        api_client, update_factory(2242, text="Remember my Wi-Fi password is Andorra2026")
+    ).status_code == 200
+    assert post_update(
+        api_client, update_factory(2243, text="What's my Wi-Fi password?")
+    ).status_code == 200
+    assert telegram_client.messages[-1][1] == (
+        'You told me: "my Wi-Fi password is Andorra2026"'
+    )
+    assert provider.calls == []
+
+
+def test_embedding_failure_saves_once_and_replay_does_not_repeat_work(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    provider = FailingFakeEmbeddings()
+    api_client.app.state.embedding_provider = provider
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=2200)
+    update = update_factory(2202, text="Remember my favorite food is biryani")
+    assert post_update(api_client, update).status_code == 200
+    assert telegram_client.messages[-1][1] == "I saved that information."
+    assert post_update(api_client, update).status_code == 200
+
+    fact = db.scalar(select(MemoryFact))
+    assert fact is not None and fact.content == "my favorite food is biryani"
+    assert fact.embedding_status == "FAILED"
+    assert fact.embedding is None
+    assert len(provider.calls) == 1
+    assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
