@@ -17,6 +17,7 @@ def test_production_configuration_accepts_postgresql_and_strong_secret() -> None
         telegram_bot_token="123456:production-token",
         telegram_webhook_secret="s" * 32,
         llm_api_key="production-llm-key",
+        stt_api_key="production-stt-key",
     )
 
     validate_runtime_settings(settings)
