@@ -53,7 +53,9 @@ class EmbeddingPrivacyPolicy:
 _SENSITIVE_MEMORY = re.compile(
     r"\b(?:password|passphrase|passcode|pin|secret|api[\s_-]*key|token|"
     r"access\s+code|gate\s+code|door\s+code|security\s+code|cvv|cvc|"
-    r"private\s+key|recovery\s+(?:code|phrase)|seed\s+phrase)\b",
+    r"private\s+key|recovery\s+(?:code|phrase)|seed\s+phrase|"
+    r"e-?mail(?:\s+address)?|phone\s+number|mobile\s+number|telephone\s+number|"
+    r"account\s+number)\b",
     re.IGNORECASE,
 )
 
