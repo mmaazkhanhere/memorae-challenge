@@ -90,6 +90,7 @@ def telegram_client() -> FakeTelegramClient:
 @pytest.fixture()
 def api_client(session_factory, telegram_client, fixed_now) -> Iterator[TestClient]:
     settings = Settings(
+        _env_file=None,
         database_url="sqlite://",
         telegram_bot_token="test-token",
         telegram_webhook_secret="test-secret",
