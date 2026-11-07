@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     notification_retry_base_delay_seconds: float = Field(default=30.0, gt=0, le=3600)
     llm_base_url: str = "https://api.openai.com/v1"
     llm_api_key: str | None = None
-    llm_extract_model: str = "gpt-5.4-mini-2026-03-17"
+    llm_extract_model: str = "openai/gpt-oss-120b"
     llm_intent_model: str = "openai/gpt-oss-20b"
     llm_timeout_seconds: float = Field(default=10.0, gt=0)
     embedding_provider: str = "disabled"
@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     embedding_timeout_seconds: float = Field(default=10.0, gt=0)
     embedding_allow_sensitive_external: bool = False
     memory_lexical_candidate_limit: int = Field(default=20, ge=2, le=50)
-    memory_semantic_candidate_limit: int = Field(default=5, ge=2, le=20)
+    memory_semantic_candidate_limit: int = Field(default=3, ge=2, le=20)
     memory_semantic_relevance_threshold: float = Field(default=0.68, ge=-1, le=1)
     memory_semantic_ambiguity_margin: float = Field(default=0.04, ge=0, le=1)
     conversation_session_ttl_seconds: int = Field(default=900, ge=60, le=86400)

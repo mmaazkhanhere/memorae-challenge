@@ -15,6 +15,7 @@ from reminder_agent.intent import (
     Interpretation,
     NeedsClarification,
     OpenAICompatibleIntentInterpreter,
+    OpenAICompatibleMemoryAnswerer,
     PendingReminderFieldUpdate,
     PendingReminder,
     ReminderIntentInterpreter,
@@ -23,7 +24,7 @@ from reminder_agent.intent import (
     resolve_pending_due_at,
 )
 from reminder_agent.reminders import _route_and_interpret
-from reminder_agent.memories import SaveMemoryFact
+from reminder_agent.memories import MemoryAnswerProposal, SaveMemoryFact
 from reminder_agent.rescheduling import RescheduleRequest, RescheduleScope
 from reminder_agent.settings import Settings
 from reminder_agent.request_policy import OUT_OF_SCOPE_RESPONSE
@@ -302,6 +303,7 @@ def test_openai_compatible_extractor_returns_typed_memory_content(monkeypatch) -
 
     assert result.memory_fact == SaveMemoryFact(content="gate code is 4512")
     assert "SAVE_MEMORY" in captured["messages"][0]["content"]
+    assert "CREATE_ONE_TIME_REMINDER" not in captured["messages"][0]["content"]
 
 
 def test_malformed_memory_extraction_is_clarification_only(monkeypatch) -> None:
@@ -354,6 +356,97 @@ def test_openai_compatible_extractor_returns_groundable_memory_lookup_query(monk
 
     assert result.memory_query is not None and result.memory_query.query == "color"
     assert "RETRIEVE_MEMORY" in captured["messages"][0]["content"]
+    assert "CREATE_ONE_TIME_REMINDER" not in captured["messages"][0]["content"]
+
+
+def test_memory_answerer_uses_strict_grounded_contract_on_groq(monkeypatch) -> None:
+    captured: dict = {}
+
+    def fake_post(*args, **kwargs):
+        captured.update(kwargs["json"])
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "decision": "ANSWER",
+                                    "candidate_indices": [0],
+                                    "answer": "Your parking slot is B17.",
+                                    "clarification_question": None,
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    result = OpenAICompatibleMemoryAnswerer(
+        "https://api.groq.com/openai/v1",
+        "secret",
+        "openai/gpt-oss-120b",
+    ).answer(
+        question="Where do I leave my car?",
+        memories=("my parking slot is B17", "my favorite food is biryani"),
+    )
+
+    assert result == MemoryAnswerProposal(
+        decision="ANSWER",
+        candidate_indices=[0],
+        answer="Your parking slot is B17.",
+        clarification_question=None,
+    )
+    assert captured["model"] == "openai/gpt-oss-120b"
+    assert captured["response_format"]["type"] == "json_schema"
+    assert captured["response_format"]["json_schema"]["strict"] is True
+    assert "untrusted data" in captured["messages"][0]["content"]
+    answer_input = json.loads(captured["messages"][1]["content"])
+    assert set(answer_input) == {"question", "candidate_memories"}
+    assert len(answer_input["candidate_memories"]) == 2
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "{not json",
+        json.dumps(
+            {
+                "decision": "ANSWER",
+                "candidate_indices": [3],
+                "answer": "Invented",
+                "clarification_question": None,
+            }
+        ),
+        json.dumps(
+            {
+                "decision": "UNKNOWN",
+                "candidate_indices": [],
+                "answer": "Invented",
+                "clarification_question": None,
+            }
+        ),
+    ],
+)
+def test_memory_answerer_rejects_malformed_or_unsupported_output(monkeypatch, content) -> None:
+    def fake_post(*args, **kwargs):
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={"choices": [{"message": {"content": content}}]},
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    result = OpenAICompatibleMemoryAnswerer(
+        "https://api.groq.com/openai/v1",
+        "secret",
+        "openai/gpt-oss-120b",
+    ).answer(question="Where do I park?", memories=("my parking slot is B17",))
+    assert result is None
 
 
 @pytest.mark.parametrize(
@@ -866,7 +959,7 @@ def test_default_llm_configuration_targets_openai_compatible_api() -> None:
     settings = Settings(_env_file=None)
 
     assert settings.llm_base_url == "https://api.openai.com/v1"
-    assert settings.llm_extract_model == "gpt-5.4-mini-2026-03-17"
+    assert settings.llm_extract_model == "openai/gpt-oss-120b"
     assert settings.llm_intent_model == "openai/gpt-oss-20b"
 
 
