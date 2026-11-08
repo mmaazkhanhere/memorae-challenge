@@ -109,10 +109,10 @@ ONBOARDING_MESSAGES: dict[str, list[str]] = {
         "I couldn't recognize that one. Mind trying a time zone like Asia/Karachi?",
     ],
     "onboarding_complete": [
-        "Perfect, {name}! 🎉 I've got your time zone as {timezone_name}. Now, what's the first thing you'd like me to remember?",
-        "We're all set, {name}! I'll use {timezone_name} for your reminders. Want to try one? Say 'Remind me to stretch in 5 minutes.'",
-        "And that's it, {name}! You're ready to go. I'll keep your reminders on {timezone_name} time. What's on your mind?",
-        "Lovely, {name}! Your time zone is set to {timezone_name}. You can start telling me what you'd like to remember.",
+        "Perfect, {name}! 🎉 I've got your time zone as {timezone_name}. Now, what's the first thing you'd like me to remember? You can also share your phone number below to enable calls.",
+        "We're all set, {name}! I'll use {timezone_name} for your reminders. Want to try one? Say 'Remind me to stretch in 5 minutes.' You can also share your phone number below for phone calls.",
+        "And that's it, {name}! You're ready to go. I'll keep your reminders on {timezone_name} time. What's on your mind? If you'd like calls too, share your phone number below.",
+        "Lovely, {name}! Your time zone is set to {timezone_name}. You can start telling me what you'd like to remember, and share your phone number below if you'd like phone calls.",
     ],
 }
 
