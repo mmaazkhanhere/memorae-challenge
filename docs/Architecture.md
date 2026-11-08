@@ -1026,7 +1026,24 @@ This section records the architecture implemented for VS-01 through VS-14. It is
 
 The running system consists of a Telegram webhook adapter, shared reminder and memory application services, PostgreSQL persistence, and a separate worker process. The implemented Telegram path supports onboarding and verified phone linking, one-time and recurring reminders, memory saving, clarification, unsupported-request responses, listing, rescheduling, cancellation, and completion of delivered occurrences.
 
-`api.telegram.telegram_webhook` verifies Telegram's webhook secret, validates the incoming `TelegramUpdate`, and calls `onboarding.handle_update`. Once onboarding is active, that function delegates text requests to `reminders.handle_reminder_text`. The handler resolves the trusted Telegram identity, checks idempotency, applies request policy, and then invokes the appropriate service. It does not accept user-supplied identifiers as authority.
+Source ownership is feature-oriented: `features/reminders`, `features/memory`,
+`features/intent`, and `features/onboarding` contain business rules;
+`application` contains channel-neutral contracts and orchestration;
+`channels/telegram` contains provider payloads, callback signatures, and
+Telegram response adaptation; `infrastructure` contains SQL, settings,
+observability, workers, and external providers; and `shared` contains neutral
+cross-feature contracts such as deterministic creation routing and memory
+command DTOs. Feature packages do not import Telegram adapters or legacy
+compatibility paths. Architecture tests enforce these rules and the canonical
+package graph remains cycle-free.
+
+`channels.telegram.webhook` verifies Telegram's webhook secret and validates the
+incoming `TelegramUpdate`. The Telegram adapter normalizes transport fields and
+delegates to application workflows; it does not interpret intent or execute
+reminder, memory, onboarding, or clarification rules. The application boundary
+resolves the trusted identity, checks idempotency, applies request policy, and
+invokes the appropriate shared service. It does not accept user-supplied
+identifiers as authority.
 
 **Current system architecture.** This view shows the deployed containers and external dependencies, not the internal request sequence.
 
@@ -1055,8 +1072,14 @@ The FastAPI application contains deterministic interpretation with optional LLM 
 
 Implemented service boundaries are deliberately small and operation-specific:
 
-- `onboarding.py` creates Telegram identities, collects time zones, and verifies self-shared phone contacts.
-- `reminders.py` is the Telegram orchestration boundary for creation, clarification, listing, rescheduling, and cancellation.
+- `features/onboarding/workflow.py` owns onboarding orchestration and uses
+  reusable onboarding validation and identity operations.
+- `application/conversation_workflow.py` owns reminder conversation routing,
+  deterministic-first interpretation, clarification coordination, and dispatch
+  to shared reminder and memory services.
+- `channels/telegram/inbound.py`, `identity.py`, `outbound.py`, and
+  `presentation/` own only Telegram payloads, identity-field extraction,
+  delivery, keyboards, and Telegram-facing rendering.
 - `completion.py` resolves and completes only an owned, already-delivered occurrence.
 - `reminder_listing.py`, `rescheduling.py`, and `cancellation.py` implement owned-reminder lookup, candidate selection, grounding, and transactional change rules.
 - `recurrence_service.py` materializes upcoming recurring instances.
@@ -1071,15 +1094,18 @@ Natural-language processing is a deterministic-first hybrid, not a generic comma
 
 The primary execution order for a Telegram text request is:
 
-1. The webhook authenticates and validates the update; `handle_update` resolves the Telegram identity.
-2. `handle_reminder_text` verifies the active user, linked Telegram identity, idempotency key, onboarding state, and saved IANA time zone.
+1. The webhook authenticates and validates the update; the Telegram inbound
+   adapter extracts transport fields and the application workflow resolves the
+   Telegram identity.
+2. The application workflow verifies the active user, linked channel identity,
+   idempotency key, onboarding state, and saved IANA time zone.
 3. `conversation_router.route_message` makes a deterministic routing decision from the text and any pending creation context.
    It recognizes only high-precision creation forms: `remember to <action>` and
    `save a reminder to <action>` select reminder creation, while `remember
    that/my <fact>` selects memory saving. Mixed cues such as `remember to keep
    <fact> in mind`, and otherwise ambiguous wording, select `MODEL_FALLBACK`
    rather than guessing.
-4. Only a `MODEL_FALLBACK` route calls `OpenAICompatibleIntentRouter.classify`, when a router is configured. The classifier may select `SAVE_MEMORY` for a clearly intentional indirect save request, but not for an ordinary statement. For memory fallback, it also returns typed `MemoryIntentEvidence`: a clear `EXPLICIT_SAVE_REQUEST` plus an exact source span. `reminders.py` accepts that evidence only when its kind, confidence, and source grounding validate; English phrase matching is not used as authorization.
+4. Only a `MODEL_FALLBACK` route calls `OpenAICompatibleIntentRouter.classify`, when a router is configured. The classifier may select `SAVE_MEMORY` for a clearly intentional indirect save request, but not for an ordinary statement. For memory fallback, it also returns typed `MemoryIntentEvidence`: a clear `EXPLICIT_SAVE_REQUEST` plus an exact source span. The application workflow accepts that evidence only when its kind, confidence, and source grounding validate; English phrase matching is not used as authorization.
 5. The selected route reaches the applicable deterministic parser: `RuleBasedIntentInterpreter`, listing parsing, `parse_reschedule_request`, or `parse_cancellation_request`.
    A `COMPLETE_REQUEST` route bypasses extraction and resolves the delivered occurrence from trusted Telegram context.
 6. If that parser permits fallback, `ReminderIntentInterpreter` can ask its configured extraction adapter for a structured proposal. `SAVE_MEMORY` extraction returns typed `SaveMemoryFact` content, which is deterministically schema-validated and grounded in the source text before the shared memory service is called. The classifier evidence and extracted content are both required; extraction content never supplies intent authority. Rescheduling and cancellation first parse and find owned candidates deterministically; their contextual model proposals remain non-authoritative.
@@ -1212,7 +1238,7 @@ For cancellation, an unqualified recurring target defaults to `SERIES`; a one-ti
 
 #### Confirmation delivery
 
-Every durable Telegram result is stored in an `IdempotencyRecord` with its response before the request is returned. The webhook then claims the stored response with `onboarding.claim_delivery` and attempts immediate Telegram delivery. `api.telegram._send_reply_with_retry` retries only a 429 response synchronously; other delivery failure results are recorded by `record_delivery_outcome` after the transaction.
+Every durable channel result is stored in an `IdempotencyRecord` with its response before the request is returned. The channel adapter claims the stored response through the provider-neutral `application.delivery.SqlAlchemyResponseDelivery` ledger and then attempts immediate provider delivery. `api.telegram._send_reply_with_retry` retries only a 429 response synchronously; other delivery failure results are recorded through the same ledger after the transaction.
 
 `ConfirmationWorker` later leases `UNKNOWN` confirmations that have become due, retries eligible records, and finalizes `SENT`, `FAILED`, or `UNKNOWN` based on the delivery outcome. Expired confirmation leases are recovered as `UNKNOWN`. This preserves a quick synchronous response path while keeping a durable retry path for failed confirmations.
 
@@ -1471,3 +1497,41 @@ results create no reminder or memory mutation. Durable mutation results and
 clarification responses retain the existing Telegram idempotency and
 post-commit-delivery behavior. Transcripts, audio bytes, provider credentials,
 and personal content are excluded from logs and durable response metadata.
+
+## 10. Canonical package organization (ADR 0039)
+
+The implementation is organized by feature and boundary rather than by the
+historical extraction order:
+
+```text
+src/reminder_agent/
+├── application/                 # channel-neutral contracts and workflows
+├── channels/telegram/           # payload normalization and Telegram delivery
+├── features/
+│   ├── intent/                  # deterministic-first route/extract pipeline
+│   ├── memory/                  # owner-scoped memory save and lookup
+│   ├── onboarding/              # reusable onboarding validation
+│   └── reminders/               # reminder lifecycle and recurrence
+├── infrastructure/              # SQLAlchemy, providers, settings, worker
+└── shared/                      # cross-feature idempotency contract
+```
+
+Telegram adapters authenticate provider requests, resolve the canonical user,
+load pending state, and delegate to application contracts. They may format and
+deliver Telegram responses, but they do not replace shared authorization,
+ownership, idempotency, or feature rules. Application and feature modules do
+not import Telegram payloads or legacy compatibility paths. The bootstrap
+module is the explicit composition-root exception, and the worker retains its
+existing Telegram delivery dependency until a later provider-neutral delivery
+milestone.
+
+All supported channels continue to use the deterministic-first route and
+extraction pipeline: deterministic interpretation is authoritative when it is
+unambiguous; classifier or structured extraction fallback is used only when
+needed; unsupported or uncertain routes never reach extraction or mutation;
+all proposals are validated and grounded before a shared execution service is
+called; confirmations come only from committed idempotent results.
+
+The complete old-path → new-path migration map and remaining compatibility-subpackage inventory are
+maintained in [`docs/STRUCTURAL_MIGRATION_MAP.md`](STRUCTURAL_MIGRATION_MAP.md)
+and [ADR 0039](adr/0039-feature-oriented-package-reorganization.md).
