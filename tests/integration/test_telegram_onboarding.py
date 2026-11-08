@@ -1,8 +1,8 @@
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from reminder_agent.db.models import ChannelIdentity, IdempotencyRecord, User
-
+from reminder_agent.features.onboarding.message_templates import ONBOARDING_MESSAGES
+from reminder_agent.infrastructure.db.models import ChannelIdentity, IdempotencyRecord, User
 
 HEADERS = {"X-Telegram-Bot-Api-Secret-Token": "test-secret"}
 
@@ -19,7 +19,9 @@ def test_first_start_creates_pending_account_and_requests_timezone(
     assert response.status_code == 200
     assert response.json() == {"ok": True}
     assert len(telegram_client.messages) == 1
-    assert "Asia/Karachi" in telegram_client.messages[0][1]
+    assert telegram_client.messages[0][1] in {
+        template.format(name="Ada") for template in ONBOARDING_MESSAGES["welcome"]
+    }
 
     user = db.scalar(select(User))
     identity = db.scalar(select(ChannelIdentity))
@@ -53,7 +55,7 @@ def test_invalid_timezone_keeps_user_pending_and_does_not_confirm_success(
     response = post_update(api_client, update_factory(21, text="Mars/Olympus"))
 
     assert response.status_code == 200
-    assert "don't recognize" in telegram_client.messages[-1][1]
+    assert telegram_client.messages[-1][1] in set(ONBOARDING_MESSAGES["invalid_timezone"])
     user = db.scalar(select(User))
     assert user is not None
     assert user.onboarding_status == "PENDING"
@@ -67,7 +69,10 @@ def test_valid_timezone_activates_user(
     response = post_update(api_client, update_factory(31, text="Asia/Karachi"))
 
     assert response.status_code == 200
-    assert "all set" in telegram_client.messages[-1][1]
+    assert telegram_client.messages[-1][1] in {
+        template.format(name="Ada", timezone_name="Asia/Karachi")
+        for template in ONBOARDING_MESSAGES["onboarding_complete"]
+    }
     user = db.scalar(select(User))
     assert user is not None
     assert user.onboarding_status == "ACTIVE"
@@ -76,7 +81,10 @@ def test_valid_timezone_activates_user(
     assert [identity.channel_type for identity in identities] == ["TELEGRAM"]
 
     assert post_update(api_client, update_factory(32)).status_code == 200
-    assert "already onboarded" in telegram_client.messages[-1][1]
+    assert telegram_client.messages[-1][1] in {
+        template.format(name="Ada")
+        for template in ONBOARDING_MESSAGES["already_onboarded_without_phone"]
+    }
 
 
 def test_unknown_sender_cannot_see_existing_account(
@@ -99,7 +107,7 @@ def test_unknown_sender_cannot_see_existing_account(
 
     assert response.status_code == 200
     assert response.json() == {"ok": True}
-    assert telegram_client.messages[-1][1] == "Please send /start to begin onboarding."
+    assert telegram_client.messages[-1][1] in set(ONBOARDING_MESSAGES["unknown_sender"])
     assert db.scalar(select(func.count()).select_from(User)) == 1
 
 
@@ -147,16 +155,19 @@ def test_reusing_update_id_with_different_payload_is_rejected(
 def test_database_failure_does_not_send_false_success(
     session_factory, telegram_client, update_factory
 ) -> None:
-    from sqlalchemy.orm import Session as SQLAlchemySession
     from fastapi.testclient import TestClient
-    from reminder_agent.main import create_app
-    from reminder_agent.settings import Settings
+    from sqlalchemy.orm import Session as SQLAlchemySession
+
+    from reminder_agent.application.bootstrap import create_app
+    from reminder_agent.infrastructure.settings import Settings
 
     class FailingSession(SQLAlchemySession):
         def flush(self, *args, **kwargs) -> None:
             raise RuntimeError("database write failed")
 
-    failing_factory = lambda: FailingSession(bind=session_factory.kw["bind"])
+    def failing_factory() -> FailingSession:
+        return FailingSession(bind=session_factory.kw["bind"])
+
     app = create_app(
         Settings(
             database_url="sqlite://",
@@ -167,9 +178,7 @@ def test_database_failure_does_not_send_false_success(
         session_factory=failing_factory,
     )
     with TestClient(app, raise_server_exceptions=False) as client:
-        response = client.post(
-            "/webhook/telegram", json=update_factory(80), headers=HEADERS
-        )
+        response = client.post("/webhook/telegram", json=update_factory(80), headers=HEADERS)
 
     assert response.status_code == 500
     assert telegram_client.messages == []
@@ -179,9 +188,10 @@ def test_telegram_502_is_acknowledged_without_duplicate_retry(
     session_factory, update_factory
 ) -> None:
     from fastapi.testclient import TestClient
-    from reminder_agent.main import create_app
-    from reminder_agent.settings import Settings
-    from reminder_agent.telegram import TelegramAPIError
+
+    from reminder_agent.application.bootstrap import create_app
+    from reminder_agent.channels.telegram.provider import TelegramAPIError
+    from reminder_agent.infrastructure.settings import Settings
 
     class FailingTelegramClient:
         attempts = 0

@@ -1,33 +1,40 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import pytest
 from sqlalchemy import func, select
 
-from reminder_agent import reminders
-from reminder_agent.db.models import (
+from reminder_agent.application import conversation_workflow as reminders
+from reminder_agent.application.conversation_workflow import handle_reminder_text
+from reminder_agent.channels.telegram.provider import (
+    TelegramAPIError,
+    TelegramDeliveryResult,
+    TelegramUpdate,
+)
+from reminder_agent.features.intent import CreateOneTimeReminderIntent, Interpretation
+from reminder_agent.features.onboarding.message_templates import ONBOARDING_MESSAGES
+from reminder_agent.features.onboarding.workflow import handle_update
+from reminder_agent.features.reminders.cancellation import CancellationScope, apply_cancellation
+from reminder_agent.features.reminders.recurrence_service import materialize_recurring_reminder
+from reminder_agent.features.reminders.rescheduling import (
+    RescheduleCandidate,
+    RescheduleScope,
+    apply_reschedule,
+    decide_reschedule,
+    find_candidates,
+    format_candidates,
+)
+from reminder_agent.infrastructure.db.models import (
     ChannelIdentity,
+    IdempotencyRecord,
     Notification,
     Reminder,
     ReminderOccurrence,
     User,
 )
-from reminder_agent.intent import CreateOneTimeReminderIntent, Interpretation
-from reminder_agent.onboarding import handle_update
-from reminder_agent.recurrence_service import materialize_recurring_reminder
-from reminder_agent.reminders import handle_reminder_text
-from reminder_agent.rescheduling import (
-    RescheduleCandidate,
-    RescheduleScope,
-    apply_reschedule,
-    decide_reschedule,
-    format_candidates,
-    find_candidates,
-)
-from reminder_agent.telegram import TelegramAPIError, TelegramDeliveryResult, TelegramUpdate
-from reminder_agent.worker import NotificationWorker
+from reminder_agent.infrastructure.worker import NotificationWorker
 
 
 class OneTimeInterpreter:
@@ -58,8 +65,8 @@ class RecordingTelegramClient:
 
 def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def test_reschedule_candidates_are_displayed_in_user_timezone() -> None:
@@ -69,7 +76,7 @@ def test_reschedule_candidates_are_displayed_in_user_timezone() -> None:
                 reminder_id=UUID(int=0),
                 occurrence_id=UUID(int=0),
                 task="call the bank",
-                due_at=datetime(2026, 11, 3, 4, 0, tzinfo=timezone.utc),
+                due_at=datetime(2026, 11, 3, 4, 0, tzinfo=UTC),
                 schedule_type="ONE_TIME",
             )
         ],
@@ -138,9 +145,7 @@ def test_reminder_creation_service_persists_a_single_graph_and_replays_idempoten
     session_factory, fixed_now, update_factory
 ) -> None:
     with session_factory.begin() as db:
-        user, identity = _active_user_and_telegram_identity(
-            db, telegram_user_id=1001, chat_id=2001
-        )
+        user, identity = _active_user_and_telegram_identity(db, telegram_user_id=1001, chat_id=2001)
 
     update = TelegramUpdate.model_validate(
         update_factory(700, text="Remind me in five minutes to call the bank")
@@ -189,9 +194,7 @@ def test_reminder_creation_service_rolls_back_the_full_graph_on_failure(
     session_factory, fixed_now, update_factory, monkeypatch
 ) -> None:
     with session_factory.begin() as db:
-        user, identity = _active_user_and_telegram_identity(
-            db, telegram_user_id=1001, chat_id=2001
-        )
+        user, identity = _active_user_and_telegram_identity(db, telegram_user_id=1001, chat_id=2001)
 
     def fail_after_scheduling(*args, **kwargs):
         raise RuntimeError("simulated response persistence failure")
@@ -211,6 +214,7 @@ def test_reminder_creation_service_rolls_back_the_full_graph_on_failure(
         )
 
     with session_factory() as db:
+        assert db.scalar(select(func.count()).select_from(IdempotencyRecord)) == 0
         assert db.scalar(select(func.count()).select_from(Reminder)) == 0
         assert db.scalar(select(func.count()).select_from(ReminderOccurrence)) == 0
         assert db.scalar(select(func.count()).select_from(Notification)) == 0
@@ -288,6 +292,44 @@ def test_reschedule_services_select_owned_candidates_and_replace_notification(
         ]
 
 
+def test_caller_rollback_discards_staged_cancellation_graph_mutation(
+    session_factory, fixed_now
+) -> None:
+    with session_factory.begin() as db:
+        user, destination = _active_user_and_telegram_identity(
+            db, telegram_user_id=1001, chat_id=2001
+        )
+        reminder, occurrence, notification = _seed_one_time_reminder(
+            db,
+            user=user,
+            destination=destination,
+            task="call the bank",
+            due_at=fixed_now + timedelta(hours=1),
+        )
+
+    with session_factory() as db:
+        apply_cancellation(
+            db,
+            user_id=user.id,
+            reminder_id=reminder.id,
+            occurrence_id=occurrence.id,
+            scope=CancellationScope.OCCURRENCE,
+            now=fixed_now,
+        )
+        db.rollback()
+
+    with session_factory() as db:
+        persisted_reminder = db.get(Reminder, reminder.id)
+        persisted_occurrence = db.get(ReminderOccurrence, occurrence.id)
+        persisted_notification = db.get(Notification, notification.id)
+        assert persisted_reminder is not None
+        assert persisted_occurrence is not None
+        assert persisted_notification is not None
+        assert persisted_reminder.status == "ACTIVE"
+        assert persisted_occurrence.status == "PENDING"
+        assert persisted_notification.status == "PENDING"
+
+
 def test_recurrence_materialization_service_is_idempotent_and_creates_deliveries(
     session_factory, fixed_now
 ) -> None:
@@ -306,9 +348,7 @@ def test_recurrence_materialization_service_is_idempotent_and_creates_deliveries
         )
         db.add(reminder)
         db.flush()
-        first_created = materialize_recurring_reminder(
-            db, reminder, now=fixed_now, horizon_days=14
-        )
+        first_created = materialize_recurring_reminder(db, reminder, now=fixed_now, horizon_days=14)
         second_created = materialize_recurring_reminder(
             db, reminder, now=fixed_now, horizon_days=14
         )
@@ -409,14 +449,15 @@ def test_onboarding_service_transitions_and_preserves_phone_ownership(
 ) -> None:
     def apply(update: dict):
         with session_factory() as db:
-            return handle_update(
-                db, TelegramUpdate.model_validate(update), now=fixed_now
-            )
+            return handle_update(db, TelegramUpdate.model_validate(update), now=fixed_now)
 
     def onboard(telegram_user_id: int, chat_id: int, update_id: int) -> None:
-        assert apply(
-            update_factory(update_id, user_id=telegram_user_id, chat_id=chat_id, text="/start")
-        ) is not None
+        assert (
+            apply(
+                update_factory(update_id, user_id=telegram_user_id, chat_id=chat_id, text="/start")
+            )
+            is not None
+        )
         completed = apply(
             update_factory(
                 update_id + 1,
@@ -425,7 +466,11 @@ def test_onboarding_service_transitions_and_preserves_phone_ownership(
                 text="UTC",
             )
         )
-        assert completed is not None and "all set" in completed.text.lower()
+        assert completed is not None
+        assert completed.text in {
+            template.format(name="Ada", timezone_name="UTC")
+            for template in ONBOARDING_MESSAGES["onboarding_complete"]
+        }
 
     onboard(1001, 2001, 800)
     first_contact = update_factory(
@@ -436,7 +481,8 @@ def test_onboarding_service_transitions_and_preserves_phone_ownership(
         contact={"phone_number": "+442083661177", "user_id": 1001},
     )
     first_reply = apply(first_contact)
-    assert first_reply is not None and "now linked" in first_reply.text.lower()
+    assert first_reply is not None
+    assert first_reply.text in set(ONBOARDING_MESSAGES["phone_linked"])
 
     onboard(2002, 3002, 810)
     second_reply = apply(
@@ -450,7 +496,7 @@ def test_onboarding_service_transitions_and_preserves_phone_ownership(
     )
 
     assert second_reply is not None
-    assert "already linked to another account" in second_reply.text.lower()
+    assert second_reply.text in set(ONBOARDING_MESSAGES["phone_conflict"])
     with session_factory() as db:
         users = db.scalars(select(User).order_by(User.name)).all()
         phones = db.scalars(
