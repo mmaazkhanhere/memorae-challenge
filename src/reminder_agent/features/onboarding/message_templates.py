@@ -48,14 +48,14 @@ ONBOARDING_MESSAGES: dict[str, list[str]] = {
         "Prefer talking sometimes? 📞 Link your number and we can pick up on a phone call with the same reminders and memories. Totally optional!",
     ],
     "phone_link_skipped": [
-        "Of course! We can stick to Telegram for now. You can connect your phone whenever you feel like it.",
-        "Sounds good! No phone needed. I'm right here whenever you've got something to remember.",
-        "No worries! Telegram is ready to go. We can always connect your phone later.",
+        "Of course! We can stick to Telegram for now. You can connect your phone whenever you feel like it. Try saying 'Remind me to stretch in 5 minutes.'",
+        "Sounds good! No phone needed. I'm right here whenever you've got something to remember. Try saying 'Remind me to stretch in 5 minutes.'",
+        "No worries! Telegram is ready to go. We can always connect your phone later. Try saying 'Remind me to stretch in 5 minutes.'",
     ],
     "phone_remains_linked": [
-        "Nothing's changed  your phone is still connected.",
-        "You're still connected! Your phone number remains linked.",
-        "All good! Your phone connection is exactly as you left it.",
+        "Nothing's changed  your phone is still connected. Try saying 'Remind me to stretch in 5 minutes.'",
+        "You're still connected! Your phone number remains linked. Try saying 'Remind me to stretch in 5 minutes.'",
+        "All good! Your phone connection is exactly as you left it. Try saying 'Remind me to stretch in 5 minutes.'",
     ],
     "phone_region_missing": [
         "Just need your country code first! Try /phone_region PK for Pakistan.",
@@ -99,9 +99,9 @@ ONBOARDING_MESSAGES: dict[str, list[str]] = {
         "Looks like that phone number is already in use on another account. Could you try a different number?",
     ],
     "phone_linked": [
-        "And we're connected! 📞 You can now reach me by calling from this number.",
-        "Nice! Your phone's linked. Whether you're messaging here or calling, I'll know it's you.",
-        "All set! 🎉 Your phone is connected. You're ready to talk whenever you need me.",
+        "And we're connected! 📞 You can now reach me by calling from this number. Try saying 'Remind me to stretch in 5 minutes.'",
+        "Nice! Your phone's linked. Whether you're messaging here or calling, I'll know it's you. Try saying 'Remind me to stretch in 5 minutes.'",
+        "All set! 🎉 Your phone is connected. You're ready to talk whenever you need me. Try saying 'Remind me to stretch in 5 minutes.'",
     ],
     "invalid_timezone": [
         "Hmm, I'm not finding that time zone. Could you try something like Asia/Karachi?",
@@ -110,7 +110,7 @@ ONBOARDING_MESSAGES: dict[str, list[str]] = {
     ],
     "onboarding_complete": [
         "Perfect, {name}! 🎉 I've got your time zone as {timezone_name}. Now, what's the first thing you'd like me to remember? You can also share your phone number below to enable calls.",
-        "We're all set, {name}! I'll use {timezone_name} for your reminders. Want to try one? Say 'Remind me to stretch in 5 minutes.' You can also share your phone number below for phone calls.",
+        "We're all set, {name}! I'll use {timezone_name} for your reminders. You can also share your phone number below for phone calls.",
         "And that's it, {name}! You're ready to go. I'll keep your reminders on {timezone_name} time. What's on your mind? If you'd like calls too, share your phone number below.",
         "Lovely, {name}! Your time zone is set to {timezone_name}. You can start telling me what you'd like to remember, and share your phone number below if you'd like phone calls.",
     ],
