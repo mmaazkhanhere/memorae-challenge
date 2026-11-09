@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from reminder_agent.channels.telegram.callbacks import callback_data
 from reminder_agent.channels.telegram.provider import TelegramUpdate
 from reminder_agent.features.intent import IntentRoute, IntentRouteSuggestion
+from reminder_agent.features.reminders.complete.messages import REMINDER_COMPLETION_MESSAGES
 from reminder_agent.infrastructure.db.models import (
     ChannelIdentity,
     ConversationSession,
@@ -21,6 +22,12 @@ from reminder_agent.infrastructure.db.models import (
 )
 
 HEADERS = {"X-Telegram-Bot-Api-Secret-Token": "test-secret"}
+
+
+def _completion_messages(key: str, **values: object) -> set[str]:
+    return {
+        message.format(**values) for message in REMINDER_COMPLETION_MESSAGES[key]
+    }
 requires_postgres = pytest.mark.skipif(
     not os.getenv("TEST_DATABASE_URL", "").startswith("postgresql"),
     reason="requires the dedicated PostgreSQL integration database",
@@ -129,14 +136,23 @@ def test_reply_done_thanks_completes_and_confirms_the_delivered_occurrence(
     }
     response = _post(api_client, payload)
     assert response.status_code == 200
-    assert "Marked as done" in telegram_client.messages[-1][1]
+    assert telegram_client.messages[-1][1] in _completion_messages(
+        "reminder_completed", task="call the bank"
+    )
+    assert telegram_client.edited_keyboards[-1] == (
+        2001,
+        777,
+        {"inline_keyboard": []},
+    )
     db.refresh(occurrence)
     db.refresh(reminder)
     assert occurrence.status == "COMPLETED"
     assert reminder.status == "COMPLETED"
 
 
-def test_inline_done_callback_completes_only_owned_occurrence(api_client, db, update_factory):
+def test_inline_done_callback_completes_only_owned_occurrence(
+    telegram_client, api_client, db, update_factory
+):
     _post(api_client, update_factory(200))
     _post(api_client, update_factory(201, text="UTC"))
     identity = db.scalar(select(ChannelIdentity).where(ChannelIdentity.external_id == "1001"))
@@ -186,6 +202,11 @@ def test_inline_done_callback_completes_only_owned_occurrence(api_client, db, up
     }
     response = _post(api_client, payload)
     assert response.status_code == 200
+    assert telegram_client.edited_keyboards[-1] == (
+        2001,
+        778,
+        {"inline_keyboard": []},
+    )
     db.refresh(occurrence)
     assert occurrence.status == "COMPLETED"
 
@@ -279,6 +300,22 @@ def test_bare_done_requires_one_unambiguous_delivered_occurrence(
     assert second.status == "NOTIFIED"
 
 
+def test_standalone_done_removes_keyboard_from_unambiguous_latest_delivery(
+    telegram_client, api_client, db, update_factory
+):
+    identity = _onboard(api_client, db, update_factory, 503)
+    _, occurrence = _seed_delivered(db, identity, provider="7830")
+
+    assert _post(api_client, update_factory(50400, text="Done")).status_code == 200
+    assert telegram_client.edited_keyboards[-1] == (
+        2001,
+        7830,
+        {"inline_keyboard": []},
+    )
+    db.refresh(occurrence)
+    assert occurrence.status == "COMPLETED"
+
+
 def test_ambiguous_done_follow_up_matches_delivered_task_and_completes_only_that_occurrence(
     telegram_client, api_client, db, update_factory
 ):
@@ -293,7 +330,9 @@ def test_ambiguous_done_follow_up_matches_delivered_task_and_completes_only_that
     assert pending.pending_clarification["operation"] == "COMPLETE_REMINDER"
 
     assert _post(api_client, update_factory(508, text="Calling James")).status_code == 200
-    assert telegram_client.messages[-1][1].startswith("Marked as done")
+    assert telegram_client.messages[-1][1] in _completion_messages(
+        "reminder_completed", task="call James"
+    )
     db.refresh(first)
     db.refresh(second)
     assert first.status == "NOTIFIED"
@@ -335,7 +374,9 @@ def test_llm_completion_route_uses_runtime_router_and_existing_completion_servic
 
     assert _post(api_client, payload).status_code == 200
     assert router.calls == ["I've taken care of it"]
-    assert telegram_client.messages[-1][1].startswith("Marked as done")
+    assert telegram_client.messages[-1][1] in _completion_messages(
+        "reminder_completed", task="call the bank"
+    )
     db.refresh(occurrence)
     assert occurrence.status == "COMPLETED"
 
@@ -392,7 +433,9 @@ def test_deterministic_done_still_bypasses_llm_router(
     }
 
     assert _post(api_client, payload).status_code == 200
-    assert telegram_client.messages[-1][1].startswith("Marked as done")
+    assert telegram_client.messages[-1][1] in _completion_messages(
+        "reminder_completed", task="call the bank"
+    )
     db.refresh(occurrence)
     assert occurrence.status == "COMPLETED"
 
@@ -445,7 +488,9 @@ def test_replayed_done_update_does_not_send_or_complete_twice(
     repeated = update_factory(703, text="Done")
     repeated["message"]["reply_to_message"] = payload["message"]["reply_to_message"]
     assert _post(api_client, repeated).status_code == 200
-    assert "already marked as done" in telegram_client.messages[-1][1]
+    assert telegram_client.messages[-1][1] in _completion_messages(
+        "reminder_already_completed"
+    )
 
 
 @requires_postgres
@@ -459,7 +504,9 @@ def test_postgres_pending_completion_commits_mutation_session_and_response(
     assert _post(api_client, update_factory(802, text="Done")).status_code == 200
     follow_up = update_factory(803, text="Calling James")
     assert _post(api_client, follow_up).status_code == 200
-    assert telegram_client.messages[-1][1] == "Marked as done: call James."
+    assert telegram_client.messages[-1][1] in _completion_messages(
+        "reminder_completed", task="call James"
+    )
 
     db.expire_all()
     db.refresh(first)
@@ -597,8 +644,8 @@ def test_postgres_concurrent_pending_completion_attempts_mutate_once(
     errors: list[BaseException] = []
 
     def complete_from_separate_session(update_id: int) -> None:
+        from reminder_agent.application.conversation_coordinator import handle_reminder_text
         from reminder_agent.channels.telegram.provider import TelegramUpdate
-        from reminder_agent.application.conversation_workflow import handle_reminder_text
         from reminder_agent.features.intent import RuleBasedIntentInterpreter
 
         session = session_factory()
@@ -632,10 +679,12 @@ def test_postgres_concurrent_pending_completion_attempts_mutate_once(
     db.refresh(first)
     db.refresh(second)
     session = db.scalar(select(ConversationSession))
-    assert sorted(outcomes) == [
-        "Marked as done: call James.",
-        "Please tell me the reminder task and a future time.",
-    ]
+    assert len(outcomes) == 2
+    assert "Please tell me the reminder task and a future time." in outcomes
+    assert sum(
+        outcome in _completion_messages("reminder_completed", task="call James")
+        for outcome in outcomes
+    ) == 1
     assert first.status == "NOTIFIED"
     assert second.status == "COMPLETED"
     assert session is not None and session.pending_clarification is None
@@ -684,7 +733,9 @@ def test_postgres_pending_completion_commit_failure_rolls_back_and_retry_replays
 
     retried = _post(api_client, follow_up)
     assert retried.status_code == 200
-    assert telegram_client.messages[-1][1] == "Marked as done: call James."
+    assert telegram_client.messages[-1][1] in _completion_messages(
+        "reminder_completed", task="call James"
+    )
     db.expire_all()
     db.refresh(second)
     assert second.status == "COMPLETED"
