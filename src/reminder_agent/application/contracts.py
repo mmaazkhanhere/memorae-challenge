@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, time
 from enum import StrEnum
 from uuid import UUID
 
@@ -88,6 +88,10 @@ class ListRemindersCommand:
     end_date: date | None
     task_query: str | None
     timezone_name: str
+    time_after: time | None = None
+    time_before: time | None = None
+    weekdays: tuple[int, ...] | None = None
+    limit: int | None = None
 
 
 @dataclass(frozen=True)

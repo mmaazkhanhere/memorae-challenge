@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from enum import StrEnum
 from typing import Any, Literal, Protocol
 from zoneinfo import ZoneInfo
@@ -163,7 +163,7 @@ class CreateRecurringReminderIntent(BaseModel):
 
 
 class ListRemindersIntent(BaseModel):
-    """A read-only request with optional date and task/subject filters."""
+    """A read-only request with typed date, time, weekday, and task filters."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -171,6 +171,10 @@ class ListRemindersIntent(BaseModel):
     start_date: date | None = None
     end_date: date | None = None
     task_query: str | None = Field(default=None, min_length=1, max_length=200)
+    time_after: time | None = None
+    time_before: time | None = None
+    weekdays: tuple[int, ...] | None = None
+    limit: int | None = Field(default=None, ge=1, le=100)
     timezone_name: str = Field(min_length=1, max_length=150)
 
     @field_validator("timezone_name")
@@ -192,10 +196,35 @@ class ListRemindersIntent(BaseModel):
             raise ValueError("task_query must not be blank")
         return normalized
 
+    @field_validator("weekdays", mode="before")
+    @classmethod
+    def normalize_weekdays(cls, value: object) -> object:
+        if value is None:
+            return None
+        if isinstance(value, int) and not isinstance(value, bool):
+            values = [value]
+        elif isinstance(value, (list, tuple)):
+            values = list(value)
+        else:
+            raise ValueError("weekdays must be a sequence of weekday numbers")
+        if any(
+            isinstance(item, bool) or not isinstance(item, int) or not 0 <= item <= 6
+            for item in values
+        ):
+            raise ValueError("weekdays must contain only integers from 0 through 6")
+        normalized = tuple(sorted(set(values)))
+        return normalized or None
+
     @model_validator(mode="after")
     def date_range_must_be_ordered(self) -> ListRemindersIntent:
         if (self.start_date is None) != (self.end_date is None):
             raise ValueError("start_date and end_date must be supplied together")
+        if (
+            self.time_after is not None
+            and self.time_before is not None
+            and self.time_after > self.time_before
+        ):
+            raise ValueError("time_after must not be later than time_before")
         if self.start_date is None:
             return self
         assert self.end_date is not None
