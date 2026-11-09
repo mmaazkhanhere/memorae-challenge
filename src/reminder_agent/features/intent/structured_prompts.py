@@ -96,7 +96,10 @@ def build_prompt(
 
                 LIST_REQUEST:
                 - LIST_REMINDERS: optional start_date, end_date (inclusive ISO dates),
-                task_query (only if explicitly mentioned). Omit dates to list all.
+                task_query (only if explicitly mentioned), time_after, time_before,
+                weekdays (Monday=0 through Sunday=6), and limit (1-100). Use local
+                wall-clock times as HH:MM strings. Omit filters that were not requested.
+                Omit dates to list all.
                 Return query filters, never reminder records.
 
                 SUMMARY_REQUEST:
