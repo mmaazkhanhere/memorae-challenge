@@ -99,7 +99,7 @@ from reminder_agent.features.reminders.create.service import (
 from reminder_agent.features.reminders.listing.filters import (
     list_owned_reminders,  # noqa: F401 - adapter compatibility export
 )
-from reminder_agent.features.reminders.listing.telegram_adapter import (
+from reminder_agent.channels.telegram.reminder_listing import (
     handle_list_reminder_request,
 )
 from reminder_agent.features.reminders.reschedule.decisions import (

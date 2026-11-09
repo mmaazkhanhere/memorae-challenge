@@ -1,9 +1,10 @@
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from uuid import UUID
 
 import pytest
 
 from reminder_agent.features.reminders.listing.filters import (
+    REMINDER_LIST_MESSAGES,
     ListedReminder,
     format_reminder_list,
     format_reminder_summary,
@@ -202,26 +203,72 @@ def test_listing_task_filter_combines_with_date_and_owner_scope(session_factory)
     assert [item.task for item in doctors] == ["doctor appointment"]
     assert [item.task for item in gym] == ["gym workout"]
     assert missing == []
-    assert (
-        format_reminder_list(
-            missing, start_date=None, end_date=None, task_query="dentist", timezone_name="UTC"
-        )
-        == 'You have no upcoming active reminders matching "dentist".'
+    rendered = format_reminder_list(
+        missing, start_date=None, end_date=None, task_query="dentist", timezone_name="UTC"
     )
+    assert rendered in {
+        message.format(query="dentist") for message in REMINDER_LIST_MESSAGES["empty_task_search"]
+    }
+
+
+def test_listing_filters_by_local_time_weekday_and_limit(session_factory):
+    with session_factory.begin() as db:
+        user = User(name="Filters", timezone="UTC", onboarding_status="ACTIVE")
+        db.add(user)
+        db.flush()
+        rows = [
+            ("weekday evening", datetime(2026, 11, 9, 18, 30, tzinfo=UTC)),
+            ("weekday morning", datetime(2026, 11, 10, 8, tzinfo=UTC)),
+            ("saturday evening", datetime(2026, 11, 14, 20, tzinfo=UTC)),
+            ("sunday evening", datetime(2026, 11, 15, 19, tzinfo=UTC)),
+        ]
+        for task, due_at in rows:
+            reminder = Reminder(
+                user_id=user.id,
+                task=task,
+                schedule_type="ONE_TIME",
+                start_local=due_at.isoformat(),
+                timezone="UTC",
+                status="ACTIVE",
+            )
+            db.add(reminder)
+            db.flush()
+            db.add(
+                ReminderOccurrence(
+                    reminder_id=reminder.id,
+                    scheduled_at=due_at,
+                    next_due_at=due_at,
+                    status="PENDING",
+                )
+            )
+
+    with session_factory() as db:
+        result = list_reminders_in_range(
+            db,
+            user_id=user.id,
+            start_date=None,
+            end_date=None,
+            timezone_name="UTC",
+            time_after=time(18),
+            weekdays=(5, 6),
+            limit=1,
+            now=datetime(2026, 11, 8, tzinfo=UTC),
+        )
+
+    assert [item.task for item in result] == ["saturday evening"]
 
 
 def test_empty_listing_is_explicit_and_formatting_is_local():
-    assert (
-        format_reminder_list([], start_date=None, end_date=None, timezone_name="UTC")
-        == "You have no upcoming active reminders."
-    )
-    assert (
-        format_reminder_list(
-            [], start_date=date(2026, 11, 1), end_date=date(2026, 11, 1), timezone_name="UTC"
-        )
-        == "You have no active reminders on 2026-11-01."
-    )
-    assert "2026-11-01 09:00 UTC" in format_reminder_list(
+    assert format_reminder_list([], start_date=None, end_date=None, timezone_name="UTC") in {
+        message for message in REMINDER_LIST_MESSAGES["empty_upcoming"]
+    }
+    assert format_reminder_list(
+        [], start_date=date(2026, 11, 1), end_date=date(2026, 11, 1), timezone_name="UTC"
+    ) in {
+        message.format(date="2026-11-01")
+        for message in REMINDER_LIST_MESSAGES["empty_specific_date"]
+    }
+    assert "2026-11-01 at 09:00 UTC" in format_reminder_list(
         [
             ListedReminder(
                 reminder_id=UUID(int=0),
@@ -353,11 +400,14 @@ def test_all_reminders_formatting_lists_nonempty_results():
     )
 
     lines = rendered.splitlines()
-    assert lines[0] == "All upcoming active reminders (UTC):"
-    assert "2026-11-01 09:00 UTC" in lines[1]
-    assert lines[1].endswith("call the bank")
-    assert "2026-11-02 10:30 UTC" in lines[2]
-    assert lines[2].endswith("pay rent")
+    assert lines[0] in {
+        message.format(count=2, reminder_word="reminders")
+        for message in REMINDER_LIST_MESSAGES["upcoming"]
+    }
+    assert lines[1] == "2026-11-01:"
+    assert lines[2] == "- 09:00 UTC - call the bank"
+    assert lines[3] == "2026-11-02:"
+    assert lines[4] == "- 10:30 UTC - pay rent"
 
 
 def test_multi_day_range_formatting_includes_dates_and_each_reminder():
@@ -380,11 +430,38 @@ def test_multi_day_range_formatting_includes_dates_and_each_reminder():
     )
 
     lines = rendered.splitlines()
-    assert lines[0] == "Reminders from 2026-11-01 to 2026-11-03 (UTC):"
-    assert "2026-11-01 09:00 UTC" in lines[1]
-    assert lines[1].endswith("call the bank")
-    assert "2026-11-03 17:00 UTC" in lines[2]
-    assert lines[2].endswith("send the report")
+    assert lines[0] in {
+        message.format(
+            count=2,
+            reminder_word="reminders",
+            start_date="2026-11-01",
+            end_date="2026-11-03",
+        )
+        for message in REMINDER_LIST_MESSAGES["date_range"]
+    }
+    assert lines[1] == "2026-11-01:"
+    assert lines[2] == "- 09:00 UTC - call the bank"
+    assert lines[3] == "2026-11-03:"
+    assert lines[4] == "- 17:00 UTC - send the report"
+
+
+def test_listing_uses_user_timezone_for_relative_dates_and_singular_grammar():
+    rendered = format_reminder_list(
+        [
+            ListedReminder(
+                reminder_id=UUID(int=1),
+                due_at=datetime(2026, 11, 10, 10, tzinfo=UTC),
+                task="call the bank",
+            )
+        ],
+        start_date=None,
+        end_date=None,
+        timezone_name="Asia/Karachi",
+        now=datetime(2026, 11, 9, 23, 30, tzinfo=UTC),
+    )
+
+    assert "1 reminders" not in rendered
+    assert "today at 15:00 PKT" in rendered
 
 
 def test_existing_recurring_occurrence_suppresses_matching_projected_instance(session_factory):

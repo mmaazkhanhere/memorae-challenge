@@ -1,16 +1,16 @@
-from datetime import datetime, timezone
 import json
+from datetime import UTC, datetime
 
 import pytest
 
-from reminder_agent.intent import (
+from reminder_agent.features.intent import (
     IntentRoute,
     Interpretation,
     ListRemindersIntent,
     OpenAICompatibleIntentInterpreter,
     PendingReminder,
-    ReminderSummaryIntent,
     ReminderIntentInterpreter,
+    ReminderSummaryIntent,
     RuleBasedIntentInterpreter,
 )
 
@@ -19,7 +19,7 @@ def test_rule_interpreter_parses_tomorrow_in_user_timezone():
     result = RuleBasedIntentInterpreter().interpret(
         "What do I have tomorrow?",
         timezone_name="Asia/Karachi",
-        now=datetime(2026, 10, 30, 12, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 30, 12, tzinfo=UTC),
     )
 
     assert isinstance(result.intent, ListRemindersIntent)
@@ -32,7 +32,7 @@ def test_rule_interpreter_parses_date_range_and_all_reminders():
     result = interpreter.interpret(
         "List my reminders from 2026-11-02 to 2026-11-05",
         timezone_name="UTC",
-        now=datetime(2026, 10, 30, 12, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 30, 12, tzinfo=UTC),
     )
     assert isinstance(result.intent, ListRemindersIntent)
     assert result.intent.start_date.isoformat() == "2026-11-02"
@@ -40,7 +40,7 @@ def test_rule_interpreter_parses_date_range_and_all_reminders():
     all_reminders = interpreter.interpret(
         "Show me all reminders",
         timezone_name="UTC",
-        now=datetime(2026, 10, 30, 12, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 30, 12, tzinfo=UTC),
     )
     assert isinstance(all_reminders.intent, ListRemindersIntent)
     assert all_reminders.intent.start_date is None
@@ -62,7 +62,7 @@ def test_rule_interpreter_parses_progress_questions(text, metric):
         text,
         selected_route=IntentRoute.SUMMARY_REQUEST,
         timezone_name="Asia/Karachi",
-        now=datetime(2026, 10, 30, 12, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 30, 12, tzinfo=UTC),
     )
 
     assert isinstance(result.intent, ReminderSummaryIntent)
@@ -83,7 +83,7 @@ def test_rule_interpreter_extracts_explicit_listing_task_without_model(text, tas
         text,
         selected_route=IntentRoute.LIST_REQUEST,
         timezone_name="UTC",
-        now=datetime(2026, 10, 30, 12, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 30, 12, tzinfo=UTC),
     )
 
     assert isinstance(result.intent, ListRemindersIntent)
@@ -96,12 +96,43 @@ def test_rule_interpreter_combines_listing_task_and_tomorrow():
         "When are my doctor's appointments tomorrow?",
         selected_route=IntentRoute.LIST_REQUEST,
         timezone_name="UTC",
-        now=datetime(2026, 10, 30, 12, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 30, 12, tzinfo=UTC),
     )
 
     assert isinstance(result.intent, ListRemindersIntent)
     assert result.intent.task_query == "doctor's appointments"
     assert result.intent.start_date.isoformat() == "2026-10-31"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Any reminders for Friday?", {"start_date": "2026-10-30", "end_date": "2026-10-30"}),
+        ("What's my next reminder to do?", {"limit": 1}),
+        ("Do I have any payment reminders?", {"task_query": "payment"}),
+        ("Show reminders after 6 PM.", {"time_after": "18:00:00"}),
+        (
+            "What do I have scheduled for next month?",
+            {"start_date": "2026-11-01", "end_date": "2026-11-30"},
+        ),
+        ("Do I have any reminders on weekends?", {"weekdays": (5, 6)}),
+    ],
+)
+def test_rule_interpreter_extracts_rich_listing_filters(text, expected):
+    result = RuleBasedIntentInterpreter().interpret(
+        text,
+        selected_route=IntentRoute.LIST_REQUEST,
+        timezone_name="UTC",
+        now=datetime(2026, 10, 30, 12, tzinfo=UTC),
+    )
+
+    assert isinstance(result.intent, ListRemindersIntent)
+    for field, expected_value in expected.items():
+        actual = getattr(result.intent, field)
+        if field in {"time_after", "start_date", "end_date"}:
+            assert actual.isoformat() == expected_value
+        else:
+            assert actual == expected_value
 
 
 def test_task_listing_deterministic_path_does_not_call_model():
@@ -117,7 +148,7 @@ def test_task_listing_deterministic_path_does_not_call_model():
         "Show my gym reminders.",
         selected_route=IntentRoute.LIST_REQUEST,
         timezone_name="UTC",
-        now=datetime(2026, 10, 30, 12, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 30, 12, tzinfo=UTC),
     )
 
     assert isinstance(result.intent, ListRemindersIntent)
@@ -130,7 +161,7 @@ def test_unrecognized_natural_language_range_falls_back_to_extractor():
         "show reminders between November 10 and November 15",
         selected_route=IntentRoute.LIST_REQUEST,
         timezone_name="UTC",
-        now=datetime(2026, 10, 30, 12, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 30, 12, tzinfo=UTC),
     )
 
     assert result.intent is None
@@ -142,7 +173,7 @@ def test_new_request_does_not_consume_an_existing_pending_draft():
         "8 PM",
         selected_route=IntentRoute.NEW_REQUEST,
         timezone_name="UTC",
-        now=datetime(2026, 10, 30, 12, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 30, 12, tzinfo=UTC),
         context=PendingReminder(task="call the bank", timezone_name="UTC"),
     )
 
@@ -155,7 +186,7 @@ def test_list_request_ignores_existing_pending_draft():
         "What do I have tomorrow?",
         selected_route=IntentRoute.LIST_REQUEST,
         timezone_name="UTC",
-        now=datetime(2026, 10, 30, 12, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 30, 12, tzinfo=UTC),
         context=PendingReminder(task="call the bank", timezone_name="UTC"),
     )
 
@@ -175,11 +206,12 @@ def test_uncertain_route_does_not_call_the_extraction_provider():
         "anything",
         selected_route=IntentRoute.UNCERTAIN,
         timezone_name="UTC",
-        now=datetime(2026, 10, 30, 12, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 30, 12, tzinfo=UTC),
     )
 
     assert provider.called is False
     assert result.response_text == "I’m not sure what you want to do. Please clarify."
+
 
 def test_model_interpreter_validates_read_only_date_range(monkeypatch):
     class Response:
@@ -203,13 +235,13 @@ def test_model_interpreter_validates_read_only_date_range(monkeypatch):
                 ]
             }
 
-    monkeypatch.setattr("reminder_agent.intent.httpx.post", lambda *args, **kwargs: Response())
-    result = OpenAICompatibleIntentInterpreter(
-        "https://example.test", "key", "model"
-    ).interpret(
+    monkeypatch.setattr(
+        "reminder_agent.features.intent.httpx.post", lambda *args, **kwargs: Response()
+    )
+    result = OpenAICompatibleIntentInterpreter("https://example.test", "key", "model").interpret(
         "show my reminders early next week",
         timezone_name="UTC",
-        now=datetime(2026, 10, 30, 12, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 30, 12, tzinfo=UTC),
     )
 
     assert isinstance(result.intent, ListRemindersIntent)
@@ -225,14 +257,14 @@ def test_model_interpreter_accepts_all_reminders_without_a_date_range(monkeypatc
         def json(self):
             return {"choices": [{"message": {"content": '{"operation":"LIST_REMINDERS"}'}}]}
 
-    monkeypatch.setattr("reminder_agent.intent.httpx.post", lambda *args, **kwargs: Response())
-    result = OpenAICompatibleIntentInterpreter(
-        "https://example.test", "key", "model"
-    ).interpret(
+    monkeypatch.setattr(
+        "reminder_agent.features.intent.httpx.post", lambda *args, **kwargs: Response()
+    )
+    result = OpenAICompatibleIntentInterpreter("https://example.test", "key", "model").interpret(
         "show me everything I need to remember",
         selected_route=IntentRoute.LIST_REQUEST,
         timezone_name="UTC",
-        now=datetime(2026, 10, 30, 12, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 30, 12, tzinfo=UTC),
     )
 
     assert isinstance(result.intent, ListRemindersIntent)
@@ -247,7 +279,9 @@ def test_model_interpreter_accepts_all_reminders_without_a_date_range(monkeypatc
         {"operation": "LIST_REMINDERS", "task_query": ["call John"]},
     ],
 )
-def test_model_interpreter_rejects_missing_or_malformed_explicit_task_filter(monkeypatch, model_payload):
+def test_model_interpreter_rejects_missing_or_malformed_explicit_task_filter(
+    monkeypatch, model_payload
+):
     class Response:
         def raise_for_status(self):
             return None
@@ -255,14 +289,14 @@ def test_model_interpreter_rejects_missing_or_malformed_explicit_task_filter(mon
         def json(self):
             return {"choices": [{"message": {"content": json.dumps(model_payload)}}]}
 
-    monkeypatch.setattr("reminder_agent.intent.httpx.post", lambda *args, **kwargs: Response())
-    result = OpenAICompatibleIntentInterpreter(
-        "https://example.test", "key", "model"
-    ).interpret(
+    monkeypatch.setattr(
+        "reminder_agent.features.intent.httpx.post", lambda *args, **kwargs: Response()
+    )
+    result = OpenAICompatibleIntentInterpreter("https://example.test", "key", "model").interpret(
         "When do I have to call John?",
         selected_route=IntentRoute.LIST_REQUEST,
         timezone_name="UTC",
-        now=datetime(2026, 10, 30, 12, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 30, 12, tzinfo=UTC),
     )
 
     assert result.intent is None
@@ -295,14 +329,14 @@ def test_model_interpreter_normalizes_single_date_and_ignores_model_reminders(mo
                 ]
             }
 
-    monkeypatch.setattr("reminder_agent.intent.httpx.post", lambda *args, **kwargs: Response())
-    result = OpenAICompatibleIntentInterpreter(
-        "https://example.test", "key", "model"
-    ).interpret(
+    monkeypatch.setattr(
+        "reminder_agent.features.intent.httpx.post", lambda *args, **kwargs: Response()
+    )
+    result = OpenAICompatibleIntentInterpreter("https://example.test", "key", "model").interpret(
         "what reminders do i have tomorrow?",
         selected_route=IntentRoute.LIST_REQUEST,
         timezone_name="Asia/Karachi",
-        now=datetime(2026, 11, 2, 16, 59, tzinfo=timezone.utc),
+        now=datetime(2026, 11, 2, 16, 59, tzinfo=UTC),
     )
 
     assert isinstance(result.intent, ListRemindersIntent)
@@ -330,14 +364,14 @@ def test_model_interpreter_normalizes_nested_date_range(monkeypatch):
                 ]
             }
 
-    monkeypatch.setattr("reminder_agent.intent.httpx.post", lambda *args, **kwargs: Response())
-    result = OpenAICompatibleIntentInterpreter(
-        "https://example.test", "key", "model"
-    ).interpret(
+    monkeypatch.setattr(
+        "reminder_agent.features.intent.httpx.post", lambda *args, **kwargs: Response()
+    )
+    result = OpenAICompatibleIntentInterpreter("https://example.test", "key", "model").interpret(
         "show reminders between November 10 and November 15",
         selected_route=IntentRoute.LIST_REQUEST,
         timezone_name="UTC",
-        now=datetime(2026, 10, 30, 12, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 30, 12, tzinfo=UTC),
     )
 
     assert isinstance(result.intent, ListRemindersIntent)
