@@ -6,7 +6,7 @@ import json
 import logging
 import re
 from collections.abc import Callable, Sequence
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo
 
@@ -113,6 +113,28 @@ def _normalise_time_fields(data: dict[str, Any]) -> tuple[int, int]:
     if hour < 0 or hour > 23 or minute < 0 or minute > 59:
         raise ValueError("recurring time was outside the valid range")
     return hour, minute
+
+
+def _normalise_listing_time(value: Any, field_name: str) -> time | None:
+    """Normalize an optional listing time filter to a local wall-clock time."""
+
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} was not a time string")
+    match = _TIME_PATTERN.fullmatch(value.strip().upper())
+    if match is None:
+        raise ValueError(f"{field_name} was not recognized")
+    hour = int(match.group("hour"))
+    minute = int(match.group("minute") or 0)
+    meridiem = match.group("meridiem")
+    if meridiem is not None:
+        if hour < 1 or hour > 12:
+            raise ValueError(f"{field_name} was outside the 12-hour range")
+        hour = hour % 12 + (12 if meridiem == "PM" else 0)
+    if hour > 23 or minute > 59:
+        raise ValueError(f"{field_name} was outside the valid range")
+    return time(hour, minute)
 
 
 def decode_response(content: str | dict[str, Any]) -> tuple[dict[str, Any], str | None]:
@@ -613,13 +635,19 @@ def interpret_response(
             )
         )
     if operation == "LIST_REMINDERS":
-        start_date_value = data.get("start_date")
-        end_date_value = data.get("end_date")
-        date_range = data.get("date_range")
+        nested_filters = data.get("filters")
+        if nested_filters is not None and not isinstance(nested_filters, dict):
+            raise ValueError("list intent filters were not an object")
+        filter_data = dict(nested_filters or {})
+        filter_data.update({key: value for key, value in data.items() if key != "filters"})
+
+        start_date_value = filter_data.get("start_date")
+        end_date_value = filter_data.get("end_date")
+        date_range = filter_data.get("date_range")
         if isinstance(date_range, dict):
             start_date_value = start_date_value or date_range.get("start")
             end_date_value = end_date_value or date_range.get("end")
-        single_date_value = data.get("date")
+        single_date_value = filter_data.get("date")
         if single_date_value is not None:
             if start_date_value is not None or end_date_value is not None:
                 raise ValueError("list intent has conflicting date filters")
@@ -631,7 +659,7 @@ def interpret_response(
             not isinstance(start_date_value, str) or not isinstance(end_date_value, str)
         ):
             raise ValueError("list intent has invalid date range")
-        raw_task_query = data.get("task_query")
+        raw_task_query = filter_data.get("task_query")
         explicit_task_query = listing_task_query(text)
         if raw_task_query is not None and not isinstance(raw_task_query, str):
             raise ValueError("list intent has invalid task query")
@@ -640,11 +668,26 @@ def interpret_response(
                 raise ValueError("list intent discarded an explicit task query")
             if normalize_task_query(raw_task_query).lower() != explicit_task_query.lower():
                 raise ValueError("list intent changed an explicit task query")
+        time_after = _normalise_listing_time(filter_data.get("time_after"), "time_after")
+        time_before = _normalise_listing_time(filter_data.get("time_before"), "time_before")
+        weekdays = _normalise_weekdays(
+            filter_data.get("weekdays", filter_data.get("weekday"))
+        )
+        raw_limit = filter_data.get("limit")
+        if raw_limit is not None:
+            if isinstance(raw_limit, bool) or not isinstance(raw_limit, int):
+                raise ValueError("list intent limit was not an integer")
+            if raw_limit < 1 or raw_limit > 100:
+                raise ValueError("list intent limit was outside 1..100")
         return Interpretation(
             intent=ListRemindersIntent(
                 start_date=date.fromisoformat(start_date_value) if start_date_value else None,
                 end_date=date.fromisoformat(end_date_value) if end_date_value else None,
                 task_query=raw_task_query,
+                time_after=time_after,
+                time_before=time_before,
+                weekdays=tuple(weekdays) if weekdays else None,
+                limit=raw_limit,
                 timezone_name=timezone_name,
             )
         )
