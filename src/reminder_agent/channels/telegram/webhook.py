@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from reminder_agent.application.contracts import OutboundResponse, RequestSource
 from reminder_agent.application.delivery import SqlAlchemyResponseDelivery
+from reminder_agent.channels.telegram.completion_callbacks import parse_completion_callback
 from reminder_agent.channels.telegram.identity import resolve_identity
 from reminder_agent.channels.telegram.inbound import message_input, to_application_request
 from reminder_agent.channels.telegram.onboarding import to_onboarding_request
@@ -18,6 +19,7 @@ from reminder_agent.channels.telegram.outbound import (
     TELEGRAM_MAX_MESSAGE_LENGTH,
     acknowledge_callback,
     is_retryable,
+    remove_inline_keyboard,
     send_text,
     split_text,
 )
@@ -97,6 +99,50 @@ def _telegram_chat_id(update: TelegramUpdate) -> int:
     return message.chat.id
 
 
+def _remove_completion_keyboard(
+    client: Any,
+    update: TelegramUpdate,
+    *,
+    reply: OutboundResponse,
+) -> None:
+    """Remove the Done button from the notification just completed."""
+
+    if reply.response_kind != "completion" and update.callback_query is None:
+        return
+    if update.callback_query is not None:
+        message = update.callback_query.message
+    elif update.message is not None:
+        message = update.message.reply_to_message
+    else:
+        message = None
+    cleanup_message_id = getattr(reply, "cleanup_provider_message_id", None)
+    if message is None and cleanup_message_id is None:
+        return
+    if not hasattr(client, "edit_message_reply_markup") and message is None:
+        return
+    try:
+        remove_inline_keyboard(
+            client,
+            chat_id=message.chat.id if message is not None else reply.chat_id,
+            message_id=(
+                message.message_id
+                if message is not None
+                else int(cleanup_message_id)
+            ),
+            text=message.text if message is not None else "Reminder",
+        )
+    except TelegramAPIError as exc:
+        # Completion has already committed; keyboard cleanup is best effort.
+        log_event(
+            logger,
+            logging.WARNING,
+            "telegram_completion_keyboard_cleanup_failed",
+            update_id=update.update_id,
+            failure_kind=exc.failure_kind,
+            provider_status_code=exc.status_code,
+        )
+
+
 def _telegram_reply_markup(db: Session, update: TelegramUpdate, reply: OutboundResponse) -> dict | None:
     presentation_hint = getattr(reply, "presentation_hint", None)
     if presentation_hint == "PHONE_CONTACT_REQUEST":
@@ -155,6 +201,14 @@ def telegram_webhook(
                 request.app.state.settings.telegram_api_timeout_seconds,
             )
         onboarding_request = to_onboarding_request(update)
+        completion_callback = (
+            parse_completion_callback(
+                update,
+                callback_secret=request.app.state.settings.telegram_webhook_secret,
+            )
+            if update.callback_query is not None
+            else None
+        )
         reply = (
             handle_onboarding_request(
                 db,
@@ -202,6 +256,7 @@ def telegram_webhook(
                 ),
                 log_voice_transcript=request.app.state.settings.telegram_voice_log_transcript,
                 application_request=application_request,
+                completion_callback=completion_callback,
             )
         delivery = SqlAlchemyResponseDelivery(db, source=RequestSource.TELEGRAM)
         reply_markup = (
@@ -244,6 +299,13 @@ def telegram_webhook(
                         failure_kind=exc.failure_kind,
                         provider_status_code=exc.status_code,
                     )
+        if reply is not None and reply.response_kind == "completion":
+            if client is None:
+                client = HttpTelegramClient(
+                    request.app.state.settings.telegram_bot_token,
+                    request.app.state.settings.telegram_api_timeout_seconds,
+                )
+            _remove_completion_keyboard(client, update, reply=reply)
         if reply is not None and reply.should_send:
             if reply.idempotency_key is not None and not delivery.claim(reply.idempotency_key):
                 log_event(
