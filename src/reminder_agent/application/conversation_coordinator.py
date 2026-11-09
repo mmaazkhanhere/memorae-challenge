@@ -45,6 +45,9 @@ from reminder_agent.application.response_staging import (
     _reply_from_record,
     _store_response,
 )
+from reminder_agent.channels.telegram.reminder_listing import (
+    handle_list_reminder_request,
+)
 from reminder_agent.features.intent.contracts import (
     IntentInterpreter,
     Interpretation,
@@ -66,6 +69,7 @@ from reminder_agent.features.intent.routing import (
     is_completion_command,
     is_list_request_command,
     is_new_reminder_command,
+    is_reminder_status_question,
     is_summary_request_command,
 )
 from reminder_agent.features.memory.adapters import (
@@ -99,8 +103,8 @@ from reminder_agent.features.reminders.create.service import (
 from reminder_agent.features.reminders.listing.filters import (
     list_owned_reminders,  # noqa: F401 - adapter compatibility export
 )
-from reminder_agent.channels.telegram.reminder_listing import (
-    handle_list_reminder_request,
+from reminder_agent.features.reminders.listing.status import (
+    answer_status_question_for_delivery,
 )
 from reminder_agent.features.reminders.reschedule.decisions import (
     is_reschedule_command,
@@ -120,11 +124,7 @@ from reminder_agent.features.reminders.snooze.service import (
 from reminder_agent.features.reminders.summary.telegram_adapter import (
     handle_reminder_summary_request,
 )
-from reminder_agent.infrastructure.db.models import (
-    ChannelIdentity,
-    IdempotencyRecord,
-    User,
-)
+from reminder_agent.infrastructure.db.models import ChannelIdentity, IdempotencyRecord, User
 from reminder_agent.infrastructure.embeddings import (
     EmbeddingPrivacyPolicy,
     EmbeddingProvider,
@@ -141,6 +141,7 @@ TELEGRAM = "TELEGRAM"
 LINKED = "LINKED"
 ACTIVE = "ACTIVE"
 logger = get_logger()
+
 
 # Compatibility wrapper; routing implementation lives in features.intent.
 def _route_and_interpret(*args: Any, **kwargs: Any):
@@ -464,6 +465,32 @@ def handle_reminder_text(
     # Completion is a deterministic acknowledgement of a delivered occurrence;
     # never send it through the natural-language extractor.
     text = (update.message.text or "").strip()
+    reply_to = update.message.reply_to_message
+    if reply_to is not None and is_reminder_status_question(text):
+        status_response = answer_status_question_for_delivery(
+            db,
+            user_id=user.id,
+            identity_id=identity.id,
+            provider_message_id=str(reply_to.message_id),
+        )
+        if status_response is not None:
+            reply = _store_response(
+                db,
+                update=update,
+                user_id=user.id,
+                text=status_response,
+                response_kind="reminder_status",
+                operation="REMINDER_STATUS",
+            )
+            db.commit()
+            log_event(
+                logger,
+                logging.INFO,
+                "reminder_status_question_answered",
+                update_id=update.update_id,
+                provider_message_id=str(reply_to.message_id),
+            )
+            return reply
     if is_completion_command(text):
         pending_session = load_session(
             db,
