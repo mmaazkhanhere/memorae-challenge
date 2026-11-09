@@ -91,7 +91,7 @@ def format_when(value: datetime, *, reference: datetime) -> str:
     if value.date() == reference.date():
         prefix = "today"
     elif (value.date() - reference.date()).days == 1:
-        prefix = f"{value.strftime('%B')} {value.day},"
+        prefix = f"tomorrow, {value.strftime('%B')} {value.day},"
     else:
         prefix = f"on {value.strftime('%A, %B')} {value.day},"
     return f"{prefix} at {_human_time(value)} {value.tzname()}"
