@@ -17,7 +17,6 @@ from sqlalchemy.orm import Session
 
 from reminder_agent.application.contracts import (
     ApplicationRequest,
-    ApplicationResult,
     AuthenticatedRequestContext,
     DurableResponse,
     RequestSource,
@@ -157,15 +156,6 @@ def _application_request_from_telegram_update(
         message_text=update.message.text or "",
         idempotency_key=str(update.update_id),
     )
-
-
-def _telegram_durable_cancellation_response(result: ApplicationResult) -> DurableResponse:
-    """Render legacy Telegram cancellation wording outside shared services."""
-
-    content = result.content
-    if result.response_kind in {"CANCELLATION_SERIES", "CANCELLATION_REMINDER"}:
-        content = f"{content.removesuffix('.')} via Telegram."
-    return DurableResponse(content=content, response_kind=result.response_kind)
 
 
 def _store_response(

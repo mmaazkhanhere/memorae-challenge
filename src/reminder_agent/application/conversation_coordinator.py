@@ -45,6 +45,7 @@ from reminder_agent.application.response_staging import (
     _reply_from_record,
     _store_response,
 )
+from reminder_agent.channels.telegram.cancellation import handle_cancellation_text
 from reminder_agent.channels.telegram.reminder_listing import (
     handle_list_reminder_request,
 )
@@ -86,7 +87,6 @@ from reminder_agent.features.reminders.cancel.decisions import (
     is_cancel_command,
 )
 from reminder_agent.features.reminders.cancel.service import (
-    _handle_cancellation_text,
     dispatch_cancellation,
 )
 from reminder_agent.features.reminders.complete.operations import (
@@ -989,13 +989,12 @@ def handle_reminder_text(
         is_new_reminder=is_new_reminder_command(text),
         is_reschedule=is_reschedule_command(text),
         is_cancel_command=is_cancel_command(text),
-        handle=lambda pending_value: _handle_cancellation_text(
+        handle=lambda pending_value: handle_cancellation_text(
             db,
             update,
             user_id=cast(User, user).id,
-            identity_id=cast(ChannelIdentity, identity).id,
-            telegram_user_id=telegram_user_id,
             user=cast(User, user),
+            identity=cast(ChannelIdentity, identity),
             pending=pending_value,
             now=now,
             session_ttl_seconds=session_ttl_seconds,
@@ -1121,13 +1120,12 @@ def handle_reminder_text(
             if reschedule_reply is not None:
                 return reschedule_reply
         elif route is ConversationRoute.CANCEL_REQUEST:
-            cancellation_reply = _handle_cancellation_text(
+            cancellation_reply = handle_cancellation_text(
                 db,
                 update,
                 user_id=user.id,
-                identity_id=identity.id,
-                telegram_user_id=telegram_user_id,
                 user=user,
+                identity=identity,
                 pending=pending_cancellation,
                 now=now,
                 session_ttl_seconds=session_ttl_seconds,
