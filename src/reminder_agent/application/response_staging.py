@@ -47,6 +47,8 @@ class ReminderReply:
     should_send: bool = True
     is_duplicate: bool = False
     reply_markup: dict | None = None
+    response_kind: str = "clarification"
+    cleanup_provider_message_id: str | None = None
 
 
 def _existing_record(db: Session, update: Any) -> IdempotencyRecord | None:
@@ -74,6 +76,10 @@ def _reply_from_record(record: IdempotencyRecord) -> ReminderReply:
         should_send=False,
         is_duplicate=True,
         reply_markup=record.response.get("reply_markup"),
+        response_kind=(
+            "completion" if record.operation == "COMPLETE_REMINDER" else "REPLAY"
+        ),
+        cleanup_provider_message_id=record.response.get("cleanup_provider_message_id"),
     )
 
 
@@ -172,10 +178,14 @@ def _store_response(
     response_kind: str = "clarification",
     operation: str = "CREATE_REMINDER",
     include_request_text: bool = True,
+    cleanup_provider_message_id: str | None = None,
 ) -> ReminderReply:
     """Stage an idempotent Telegram response in the caller's transaction."""
 
-    assert update.message is not None
+    source_message = update.message or (
+        update.callback_query.message if update.callback_query else None
+    )
+    assert source_message is not None
     if text is None:
         if durable_response is None:
             raise ValueError("a response text or durable response is required")
@@ -183,9 +193,11 @@ def _store_response(
     elif durable_response is not None:
         raise ValueError("provide either response text or a durable response")
     reply = ReminderReply(
-        chat_id=update.message.chat.id,
+        chat_id=source_message.chat.id,
         text=text,
         idempotency_key=str(update.update_id),
+        response_kind=response_kind,
+        cleanup_provider_message_id=cleanup_provider_message_id,
     )
     now = datetime.now(UTC)
     response = {
@@ -193,8 +205,10 @@ def _store_response(
         "text": reply.text,
         "reply_markup": None,
     }
-    if include_request_text and update.message.voice is None:
+    if include_request_text and update.message is not None and update.message.voice is None:
         response["request_text"] = update.message.text or ""
+    if cleanup_provider_message_id is not None:
+        response["cleanup_provider_message_id"] = cleanup_provider_message_id
     db.add(
         IdempotencyRecord(
             source=TELEGRAM,
