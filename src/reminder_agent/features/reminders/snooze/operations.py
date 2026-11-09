@@ -2,19 +2,24 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 import logging
 import re
-from typing import Literal
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from reminder_agent.db.models import ChannelIdentity, Notification, Reminder, ReminderOccurrence
-from reminder_agent.observability import get_logger, log_event
+from reminder_agent.features.reminders.snooze.messages import snooze_message
+from reminder_agent.infrastructure.db.models import (
+    ChannelIdentity,
+    Notification,
+    Reminder,
+    ReminderOccurrence,
+)
+from reminder_agent.infrastructure.observability import get_logger, log_event
 
 logger = get_logger()
 
@@ -24,16 +29,6 @@ ACTIVE = "ACTIVE"
 NOTIFIED = "NOTIFIED"
 PENDING = "PENDING"
 SENT = "SENT"
-
-
-class PendingSnooze(BaseModel):
-    """Durable, non-authoritative context for an unfinished snooze request."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    operation: Literal["SNOOZE_OCCURRENCE"] = "SNOOZE_OCCURRENCE"
-    candidate_occurrence_ids: tuple[UUID, ...] = Field(min_length=1, max_length=2)
-    duration_seconds: int | None = Field(default=None, gt=0)
 
 
 class SnoozeDuration(BaseModel):
@@ -74,17 +69,19 @@ def parse_snooze_duration(text: str) -> SnoozeDuration | None:
     prefix = raw[: match.start()]
     if (
         _SNOOZE_PREFIX.fullmatch(prefix) is None
-        and re.match(r"^\s*(?:please\s+)?snooz(?:e|ed|ing)\b", prefix, re.IGNORECASE)
-        is None
+        and re.match(r"^\s*(?:please\s+)?snooz(?:e|ed|ing)\b", prefix, re.IGNORECASE) is None
     ):
         return None
     value = int(match.group("value"))
     unit = match.group("unit").casefold()
     multiplier = (
-        1 if unit.startswith(("second", "sec")) else
-        60 if unit.startswith(("minute", "min")) else
-        3600 if unit.startswith("hour") else
-        86400
+        1
+        if unit.startswith(("second", "sec"))
+        else 60
+        if unit.startswith(("minute", "min"))
+        else 3600
+        if unit.startswith("hour")
+        else 86400
     )
     try:
         return SnoozeDuration(duration_seconds=value * multiplier)
@@ -132,21 +129,24 @@ class SnoozeResult:
 def snooze_occurrence(
     db: Session,
     *,
-    user_id,
-    identity_id,
-    chat_id: int,
+    user_id: UUID,
+    identity_id: UUID,
+    chat_id: int | None = None,
     occurrence_id: UUID,
     duration_seconds: int,
     provider_message_id: str | None = None,
+    channel_type: str = TELEGRAM,
+    external_destination_id: str | None = None,
+    delivery_label: str | None = "Telegram",
     now: datetime | None = None,
 ) -> SnoozeResult:
     """Stage a new notification for one delivered occurrence; do not commit."""
 
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     if now.tzinfo is None or now.utcoffset() is None:
-        now = now.replace(tzinfo=timezone.utc)
+        now = now.replace(tzinfo=UTC)
     else:
-        now = now.astimezone(timezone.utc)
+        now = now.astimezone(UTC)
     log_event(
         logger,
         logging.INFO,
@@ -160,18 +160,22 @@ def snooze_occurrence(
     )
     if duration_seconds <= 0:
         log_event(logger, logging.INFO, "snooze_mutation_rejected", outcome="INVALID_DURATION")
-        return SnoozeResult("INVALID_DURATION", "Please provide a positive snooze duration.")
+        return SnoozeResult("INVALID_DURATION", snooze_message("invalid_duration"))
     due_at = now + timedelta(seconds=duration_seconds)
 
-    identity = db.scalar(
-        select(ChannelIdentity).where(
-            ChannelIdentity.id == identity_id,
-            ChannelIdentity.user_id == user_id,
-            ChannelIdentity.channel_type == TELEGRAM,
-            ChannelIdentity.status == LINKED,
-            ChannelIdentity.telegram_chat_id == chat_id,
-        )
+    identity_query = select(ChannelIdentity).where(
+        ChannelIdentity.id == identity_id,
+        ChannelIdentity.user_id == user_id,
+        ChannelIdentity.channel_type == channel_type,
+        ChannelIdentity.status == LINKED,
     )
+    if channel_type == TELEGRAM:
+        identity_query = identity_query.where(ChannelIdentity.telegram_chat_id == chat_id)
+    elif external_destination_id is not None:
+        identity_query = identity_query.where(
+            ChannelIdentity.external_id == external_destination_id
+        )
+    identity = db.scalar(identity_query)
     occurrence = db.scalar(
         select(ReminderOccurrence)
         .join(Reminder, Reminder.id == ReminderOccurrence.reminder_id)
@@ -186,7 +190,7 @@ def snooze_occurrence(
             outcome="NOT_FOUND",
             occurrence_id=str(occurrence_id),
         )
-        return SnoozeResult("NOT_FOUND", "I couldn't find that delivered reminder to snooze.")
+        return SnoozeResult("NOT_FOUND", snooze_message("reminder_not_found"))
 
     reminder = db.get(Reminder, occurrence.reminder_id)
     if reminder is None or reminder.status != ACTIVE or occurrence.status != NOTIFIED:
@@ -198,7 +202,7 @@ def snooze_occurrence(
             occurrence_id=str(occurrence_id),
             occurrence_status=occurrence.status,
         )
-        return SnoozeResult("NOT_ELIGIBLE", "That reminder is no longer available to snooze.")
+        return SnoozeResult("NOT_ELIGIBLE", snooze_message("reminder_unavailable"))
 
     delivery_filters = [
         Notification.occurrence_id == occurrence.id,
@@ -207,9 +211,7 @@ def snooze_occurrence(
     ]
     if provider_message_id is not None:
         delivery_filters.append(Notification.provider_message_id == provider_message_id)
-    delivered = db.scalar(
-        select(Notification).where(*delivery_filters).with_for_update()
-    )
+    delivered = db.scalar(select(Notification).where(*delivery_filters).with_for_update())
     if delivered is None:
         log_event(
             logger,
@@ -218,14 +220,17 @@ def snooze_occurrence(
             outcome="NOT_DELIVERED",
             occurrence_id=str(occurrence_id),
         )
-        return SnoozeResult(
-            "NOT_DELIVERED", "That reminder was not delivered to this Telegram chat."
-        )
+        return SnoozeResult("NOT_DELIVERED", snooze_message("wrong_telegram_chat"))
 
     # The occurrence lock serializes snoozes and makes sequence allocation safe.
-    max_sequence = db.scalar(
-        select(func.max(Notification.sequence)).where(Notification.occurrence_id == occurrence.id)
-    ) or 0
+    max_sequence = (
+        db.scalar(
+            select(func.max(Notification.sequence)).where(
+                Notification.occurrence_id == occurrence.id
+            )
+        )
+        or 0
+    )
     occurrence.status = PENDING
     occurrence.next_due_at = due_at
     occurrence.updated_at = now
@@ -248,9 +253,15 @@ def snooze_occurrence(
         notification_sequence=int(max_sequence) + 1,
         due_at=due_at.isoformat(),
     )
+    new_datetime = f"{due_at.isoformat(timespec='minutes')} UTC"
     return SnoozeResult(
         "SNOOZED",
-        f"Snoozed '{reminder.task}' until {due_at.isoformat(timespec='minutes')} UTC on Telegram.",
+        snooze_message(
+            "snooze_success",
+            task=reminder.task,
+            when=f"at {new_datetime}",
+            new_datetime=new_datetime,
+        ),
         occurrence.id,
         due_at,
     )
