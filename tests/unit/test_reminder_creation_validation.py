@@ -4,7 +4,7 @@ from reminder_agent.features.intent import (
     CreateOneTimeReminderIntent,
     CreateRecurringReminderIntent,
 )
-from reminder_agent.features.reminders.reminder_creation_validation import (
+from reminder_agent.features.reminders.create.validation import (
     validate_creation_schedules,
 )
 

@@ -27,11 +27,12 @@ from reminder_agent.application import (
     process_authenticated_conversation,
     save_memory_for_request,
 )
-from reminder_agent.application import conversation_workflow as reminders
+from reminder_agent.application import conversation_coordinator as reminders
 from reminder_agent.channels.telegram.provider import TelegramUpdate
 from reminder_agent.features.intent import ReminderIntentInterpreter
 from reminder_agent.features.intent.routing import ConversationRoute
-from reminder_agent.features.reminders.cancellation import CancellationScope
+from reminder_agent.features.memory import adapters as memory_adapters
+from reminder_agent.features.reminders.cancel.decisions import CancellationScope
 from reminder_agent.infrastructure.db.models import (
     ChannelIdentity,
     IdempotencyRecord,
@@ -407,7 +408,7 @@ def test_telegram_memory_save_uses_the_authenticated_application_contract(
             resource_id=uuid4(),
         )
 
-    monkeypatch.setattr(reminders, "save_memory_for_request", boundary_spy)
+    monkeypatch.setattr(memory_adapters, "save_memory_for_request", boundary_spy)
     update = TelegramUpdate.model_validate(
         update_factory(706, text="Remember my gate code is 4512")
     )

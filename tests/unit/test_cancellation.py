@@ -1,9 +1,9 @@
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 
-from reminder_agent.cancellation import (
+from reminder_agent.features.reminders.cancel.decisions import (
     CancellationDecision,
-    CancellationResolution,
     CancellationRequest,
+    CancellationResolution,
     CancellationScope,
     _candidate_match,
     classify_cancellation_resolution,
@@ -12,8 +12,7 @@ from reminder_agent.cancellation import (
     parse_cancellation_request,
 )
 
-
-NOW = datetime(2026, 10, 30, 12, tzinfo=timezone.utc)
+NOW = datetime(2026, 10, 30, 12, tzinfo=UTC)
 
 
 def test_cancel_command_requires_a_target():
@@ -58,9 +57,7 @@ def test_explicit_iso_date_selects_future_occurrence():
 def test_model_named_date_is_grounded_as_explicit_occurrence_date():
     request = ground_model_cancellation_request(
         "Skip my finance review on January 15, 2027",
-        CancellationRequest(
-            "finance review", CancellationScope.OCCURRENCE, date(2027, 1, 15)
-        ),
+        CancellationRequest("finance review", CancellationScope.OCCURRENCE, date(2027, 1, 15)),
         timezone_name="UTC",
         now=NOW,
     )
@@ -74,12 +71,8 @@ def test_target_matching_accepts_simple_singular_plural_difference():
 
 
 def test_series_and_next_occurrence_scopes_are_explicit():
-    series = parse_cancellation_request(
-        "Delete all future standups", timezone_name="UTC", now=NOW
-    )
-    occurrence = parse_cancellation_request(
-        "Remove the next standup", timezone_name="UTC", now=NOW
-    )
+    series = parse_cancellation_request("Delete all future standups", timezone_name="UTC", now=NOW)
+    occurrence = parse_cancellation_request("Remove the next standup", timezone_name="UTC", now=NOW)
 
     assert not isinstance(series, str)
     assert series.scope is CancellationScope.SERIES
@@ -104,26 +97,36 @@ def test_indirect_cancellation_language_has_a_safe_target_fallback():
 
 
 def test_cancellation_resolution_keeps_uncertainty_distinct_from_no_match():
-    assert classify_cancellation_resolution(
-        CancellationDecision("MUTATE", ""), CancellationRequest("bank reminder")
-    ) is CancellationResolution.CONFIDENT_MATCH
-    assert classify_cancellation_resolution(
-        CancellationDecision("CLARIFY", ""), CancellationRequest("bank reminder")
-    ) is CancellationResolution.AMBIGUOUS
-    assert classify_cancellation_resolution(
-        CancellationDecision("RESPONSE", ""), CancellationRequest("those exercise reminders")
-    ) is CancellationResolution.UNCERTAIN_EXTRACTION
-    assert classify_cancellation_resolution(
-        CancellationDecision("RESPONSE", ""), CancellationRequest("bank reminder")
-    ) is CancellationResolution.NO_MATCH
+    assert (
+        classify_cancellation_resolution(
+            CancellationDecision("MUTATE", ""), CancellationRequest("bank reminder")
+        )
+        is CancellationResolution.CONFIDENT_MATCH
+    )
+    assert (
+        classify_cancellation_resolution(
+            CancellationDecision("CLARIFY", ""), CancellationRequest("bank reminder")
+        )
+        is CancellationResolution.AMBIGUOUS
+    )
+    assert (
+        classify_cancellation_resolution(
+            CancellationDecision("RESPONSE", ""), CancellationRequest("those exercise reminders")
+        )
+        is CancellationResolution.UNCERTAIN_EXTRACTION
+    )
+    assert (
+        classify_cancellation_resolution(
+            CancellationDecision("RESPONSE", ""), CancellationRequest("bank reminder")
+        )
+        is CancellationResolution.NO_MATCH
+    )
 
 
 def test_model_cannot_replace_an_explicit_occurrence_date():
     request = ground_model_cancellation_request(
         "Cancel only Monday's standup",
-        CancellationRequest(
-            "standup", CancellationScope.OCCURRENCE, date(2026, 11, 9)
-        ),
+        CancellationRequest("standup", CancellationScope.OCCURRENCE, date(2026, 11, 9)),
         timezone_name="UTC",
         now=NOW,
     )
@@ -135,9 +138,7 @@ def test_model_cannot_replace_an_explicit_occurrence_date():
 def test_model_occurrence_date_must_match_a_relative_date_in_the_request():
     request = ground_model_cancellation_request(
         "Cancel standup tomorrow",
-        CancellationRequest(
-            "standup", CancellationScope.SERIES, date(2026, 11, 9)
-        ),
+        CancellationRequest("standup", CancellationScope.SERIES, date(2026, 11, 9)),
         timezone_name="UTC",
         now=NOW,
     )
@@ -149,9 +150,7 @@ def test_model_occurrence_date_must_match_a_relative_date_in_the_request():
 def test_contextual_next_occurrence_discards_a_model_invented_date():
     request = ground_model_cancellation_request(
         "Skip the next one",
-        CancellationRequest(
-            "standup", CancellationScope.OCCURRENCE, date(2026, 11, 9)
-        ),
+        CancellationRequest("standup", CancellationScope.OCCURRENCE, date(2026, 11, 9)),
         timezone_name="UTC",
         now=NOW,
         recent_messages=("user: Remind me every Monday at 8 AM to standup",),
@@ -164,9 +163,7 @@ def test_contextual_next_occurrence_discards_a_model_invented_date():
 def test_multiple_explicit_dates_discard_the_model_date_for_ambiguous_occurrences():
     request = ground_model_cancellation_request(
         "Cancel standup Monday or Tuesday",
-        CancellationRequest(
-            "standup", CancellationScope.OCCURRENCE, date(2026, 11, 9)
-        ),
+        CancellationRequest("standup", CancellationScope.OCCURRENCE, date(2026, 11, 9)),
         timezone_name="UTC",
         now=NOW,
     )

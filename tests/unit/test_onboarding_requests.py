@@ -93,7 +93,8 @@ def test_onboarding_application_service_accepts_a_nontelegram_request(
         response = handle_onboarding_request(db, start, now=fixed_now)
 
     assert response is not None
-    assert "Welcome, Ada" in response.content
+    assert "Ada" in response.content
+    assert "time zone" in response.content.lower()
 
     timezone_request = OnboardingRequest(
         source=RequestSource.VAPI,

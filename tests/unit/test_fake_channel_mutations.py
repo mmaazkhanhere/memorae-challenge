@@ -18,7 +18,7 @@ from reminder_agent.application import (
     snooze_reminder_for_request,
 )
 from reminder_agent.features.onboarding.identity_operations import link_phone_identity
-from reminder_agent.features.reminders.cancellation import CancellationScope
+from reminder_agent.features.reminders.cancel.decisions import CancellationScope
 from reminder_agent.features.reminders.rescheduling import RescheduleScope
 from reminder_agent.infrastructure.db.models import (
     ChannelIdentity,

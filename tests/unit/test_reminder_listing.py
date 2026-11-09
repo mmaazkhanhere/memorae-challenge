@@ -1,20 +1,20 @@
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from uuid import UUID
 
 import pytest
 
-from reminder_agent.db.models import (
-    Reminder,
-    ReminderOccurrence,
-    ReminderRecurrenceException,
-    User,
-)
-from reminder_agent.reminder_listing import (
+from reminder_agent.features.reminders.listing.filters import (
     ListedReminder,
     format_reminder_list,
     format_reminder_summary,
     list_reminders_in_range,
     summarize_reminders,
+)
+from reminder_agent.infrastructure.db.models import (
+    Reminder,
+    ReminderOccurrence,
+    ReminderRecurrenceException,
+    User,
 )
 
 
@@ -64,8 +64,8 @@ def test_listing_projects_unmaterialized_recurring_instance_and_excludes_termina
         db.add(
             ReminderOccurrence(
                 reminder_id=one_time.id,
-                scheduled_at=datetime(2026, 11, 3, 9, tzinfo=timezone.utc),
-                next_due_at=datetime(2026, 11, 3, 9, tzinfo=timezone.utc),
+                scheduled_at=datetime(2026, 11, 3, 9, tzinfo=UTC),
+                next_due_at=datetime(2026, 11, 3, 9, tzinfo=UTC),
                 status="COMPLETED",
             )
         )
@@ -73,8 +73,8 @@ def test_listing_projects_unmaterialized_recurring_instance_and_excludes_termina
         db.add(
             ReminderOccurrence(
                 reminder_id=canceled.id,
-                scheduled_at=datetime(2026, 11, 3, 10, tzinfo=timezone.utc),
-                next_due_at=datetime(2026, 11, 3, 10, tzinfo=timezone.utc),
+                scheduled_at=datetime(2026, 11, 3, 10, tzinfo=UTC),
+                next_due_at=datetime(2026, 11, 3, 10, tzinfo=UTC),
                 status="PENDING",
             )
         )
@@ -82,8 +82,8 @@ def test_listing_projects_unmaterialized_recurring_instance_and_excludes_termina
         db.add(
             ReminderOccurrence(
                 reminder_id=hidden.id,
-                scheduled_at=datetime(2026, 11, 3, 11, tzinfo=timezone.utc),
-                next_due_at=datetime(2026, 11, 3, 11, tzinfo=timezone.utc),
+                scheduled_at=datetime(2026, 11, 3, 11, tzinfo=UTC),
+                next_due_at=datetime(2026, 11, 3, 11, tzinfo=UTC),
                 status="PENDING",
             )
         )
@@ -98,7 +98,7 @@ def test_listing_projects_unmaterialized_recurring_instance_and_excludes_termina
         )
 
     assert [(item.task, item.due_at) for item in result] == [
-        ("weekly review", datetime(2026, 11, 2, 9, tzinfo=timezone.utc))
+        ("weekly review", datetime(2026, 11, 2, 9, tzinfo=UTC))
     ]
 
 
@@ -120,8 +120,8 @@ def test_listing_uses_local_midnight_boundaries_across_dst(session_factory):
         db.add(
             ReminderOccurrence(
                 reminder_id=reminder.id,
-                scheduled_at=datetime(2027, 3, 14, 13, tzinfo=timezone.utc),
-                next_due_at=datetime(2027, 3, 14, 13, tzinfo=timezone.utc),
+                scheduled_at=datetime(2027, 3, 14, 13, tzinfo=UTC),
+                next_due_at=datetime(2027, 3, 14, 13, tzinfo=UTC),
                 status="PENDING",
             )
         )
@@ -136,7 +136,7 @@ def test_listing_uses_local_midnight_boundaries_across_dst(session_factory):
         )
 
     assert len(result) == 1
-    assert result[0].due_at == datetime(2027, 3, 14, 13, tzinfo=timezone.utc)
+    assert result[0].due_at == datetime(2027, 3, 14, 13, tzinfo=UTC)
 
 
 def test_listing_task_filter_combines_with_date_and_owner_scope(session_factory):
@@ -146,56 +146,86 @@ def test_listing_task_filter_combines_with_date_and_owner_scope(session_factory)
         db.add_all([ada, bob])
         db.flush()
         rows = [
-            (ada, "doctor appointment", datetime(2026, 11, 1, 9, tzinfo=timezone.utc)),
-            (ada, "call John", datetime(2026, 11, 1, 10, tzinfo=timezone.utc)),
-            (ada, "gym workout", datetime(2026, 11, 2, 9, tzinfo=timezone.utc)),
-            (bob, "doctor appointment", datetime(2026, 11, 1, 8, tzinfo=timezone.utc)),
+            (ada, "doctor appointment", datetime(2026, 11, 1, 9, tzinfo=UTC)),
+            (ada, "call John", datetime(2026, 11, 1, 10, tzinfo=UTC)),
+            (ada, "gym workout", datetime(2026, 11, 2, 9, tzinfo=UTC)),
+            (bob, "doctor appointment", datetime(2026, 11, 1, 8, tzinfo=UTC)),
         ]
         for owner, task, due_at in rows:
             reminder = Reminder(
-                user_id=owner.id, task=task, schedule_type="ONE_TIME",
-                start_local=due_at.isoformat(), timezone="UTC", status="ACTIVE",
+                user_id=owner.id,
+                task=task,
+                schedule_type="ONE_TIME",
+                start_local=due_at.isoformat(),
+                timezone="UTC",
+                status="ACTIVE",
             )
             db.add(reminder)
             db.flush()
-            db.add(ReminderOccurrence(
-                reminder_id=reminder.id, scheduled_at=due_at, next_due_at=due_at, status="PENDING"
-            ))
+            db.add(
+                ReminderOccurrence(
+                    reminder_id=reminder.id,
+                    scheduled_at=due_at,
+                    next_due_at=due_at,
+                    status="PENDING",
+                )
+            )
 
     with session_factory() as db:
         doctors = list_reminders_in_range(
-            db, user_id=ada.id, start_date=date(2026, 11, 1), end_date=date(2026, 11, 1),
-            task_query="doctor's appointments", timezone_name="UTC",
+            db,
+            user_id=ada.id,
+            start_date=date(2026, 11, 1),
+            end_date=date(2026, 11, 1),
+            task_query="doctor's appointments",
+            timezone_name="UTC",
         )
         gym = list_reminders_in_range(
-            db, user_id=ada.id, start_date=None, end_date=None, task_query="gym", timezone_name="UTC",
-            now=datetime(2026, 10, 30, tzinfo=timezone.utc),
+            db,
+            user_id=ada.id,
+            start_date=None,
+            end_date=None,
+            task_query="gym",
+            timezone_name="UTC",
+            now=datetime(2026, 10, 30, tzinfo=UTC),
         )
         missing = list_reminders_in_range(
-            db, user_id=ada.id, start_date=None, end_date=None, task_query="dentist", timezone_name="UTC",
-            now=datetime(2026, 10, 30, tzinfo=timezone.utc),
+            db,
+            user_id=ada.id,
+            start_date=None,
+            end_date=None,
+            task_query="dentist",
+            timezone_name="UTC",
+            now=datetime(2026, 10, 30, tzinfo=UTC),
         )
 
     assert [item.task for item in doctors] == ["doctor appointment"]
     assert [item.task for item in gym] == ["gym workout"]
     assert missing == []
-    assert format_reminder_list(
-        missing, start_date=None, end_date=None, task_query="dentist", timezone_name="UTC"
-    ) == 'You have no upcoming active reminders matching "dentist".'
+    assert (
+        format_reminder_list(
+            missing, start_date=None, end_date=None, task_query="dentist", timezone_name="UTC"
+        )
+        == 'You have no upcoming active reminders matching "dentist".'
+    )
 
 
 def test_empty_listing_is_explicit_and_formatting_is_local():
-    assert format_reminder_list(
-        [], start_date=None, end_date=None, timezone_name="UTC"
-    ) == "You have no upcoming active reminders."
-    assert format_reminder_list(
-        [], start_date=date(2026, 11, 1), end_date=date(2026, 11, 1), timezone_name="UTC"
-    ) == "You have no active reminders on 2026-11-01."
+    assert (
+        format_reminder_list([], start_date=None, end_date=None, timezone_name="UTC")
+        == "You have no upcoming active reminders."
+    )
+    assert (
+        format_reminder_list(
+            [], start_date=date(2026, 11, 1), end_date=date(2026, 11, 1), timezone_name="UTC"
+        )
+        == "You have no active reminders on 2026-11-01."
+    )
     assert "2026-11-01 09:00 UTC" in format_reminder_list(
         [
             ListedReminder(
                 reminder_id=UUID(int=0),
-                due_at=datetime(2026, 11, 1, 9, tzinfo=timezone.utc),
+                due_at=datetime(2026, 11, 1, 9, tzinfo=UTC),
                 task="call the bank",
             )
         ],
@@ -208,17 +238,17 @@ def test_empty_listing_is_explicit_and_formatting_is_local():
 def test_summary_counts_are_owner_scoped_and_today_keeps_delivered_work(
     session_factory,
 ):
-    now = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)
+    now = datetime(2026, 11, 1, 12, tzinfo=UTC)
     with session_factory.begin() as db:
         ada = User(name="Ada", timezone="UTC", onboarding_status="ACTIVE")
         bob = User(name="Bob", timezone="UTC", onboarding_status="ACTIVE")
         db.add_all([ada, bob])
         db.flush()
         rows = [
-            (ada, "pending task", datetime(2026, 11, 1, 9, tzinfo=timezone.utc), "PENDING"),
-            (ada, "delivered task", datetime(2026, 11, 1, 10, tzinfo=timezone.utc), "NOTIFIED"),
-            (ada, "completed task", datetime(2026, 10, 31, 10, tzinfo=timezone.utc), "COMPLETED"),
-            (bob, "private task", datetime(2026, 11, 1, 11, tzinfo=timezone.utc), "PENDING"),
+            (ada, "pending task", datetime(2026, 11, 1, 9, tzinfo=UTC), "PENDING"),
+            (ada, "delivered task", datetime(2026, 11, 1, 10, tzinfo=UTC), "NOTIFIED"),
+            (ada, "completed task", datetime(2026, 10, 31, 10, tzinfo=UTC), "COMPLETED"),
+            (bob, "private task", datetime(2026, 11, 1, 11, tzinfo=UTC), "PENDING"),
         ]
         for owner, task, due_at, status in rows:
             reminder = Reminder(
@@ -238,9 +268,7 @@ def test_summary_counts_are_owner_scoped_and_today_keeps_delivered_work(
                     next_due_at=due_at,
                     status=status,
                     updated_at=(
-                        datetime(2026, 11, 1, 11, tzinfo=timezone.utc)
-                        if status == "COMPLETED"
-                        else due_at
+                        datetime(2026, 11, 1, 11, tzinfo=UTC) if status == "COMPLETED" else due_at
                     ),
                 )
             )
@@ -278,8 +306,9 @@ def test_summary_counts_are_owner_scoped_and_today_keeps_delivered_work(
 
 
 def test_listing_rejects_a_start_date_without_an_end_date(session_factory):
-    with session_factory() as db, pytest.raises(
-        ValueError, match="start_date and end_date must be supplied together"
+    with (
+        session_factory() as db,
+        pytest.raises(ValueError, match="start_date and end_date must be supplied together"),
     ):
         list_reminders_in_range(
             db,
@@ -291,8 +320,9 @@ def test_listing_rejects_a_start_date_without_an_end_date(session_factory):
 
 
 def test_listing_rejects_an_end_date_before_its_start_date(session_factory):
-    with session_factory() as db, pytest.raises(
-        ValueError, match="end_date must not precede start_date"
+    with (
+        session_factory() as db,
+        pytest.raises(ValueError, match="end_date must not precede start_date"),
     ):
         list_reminders_in_range(
             db,
@@ -308,12 +338,12 @@ def test_all_reminders_formatting_lists_nonempty_results():
         [
             ListedReminder(
                 reminder_id=UUID(int=1),
-                due_at=datetime(2026, 11, 1, 9, tzinfo=timezone.utc),
+                due_at=datetime(2026, 11, 1, 9, tzinfo=UTC),
                 task="call the bank",
             ),
             ListedReminder(
                 reminder_id=UUID(int=2),
-                due_at=datetime(2026, 11, 2, 10, 30, tzinfo=timezone.utc),
+                due_at=datetime(2026, 11, 2, 10, 30, tzinfo=UTC),
                 task="pay rent",
             ),
         ],
@@ -335,12 +365,12 @@ def test_multi_day_range_formatting_includes_dates_and_each_reminder():
         [
             ListedReminder(
                 reminder_id=UUID(int=1),
-                due_at=datetime(2026, 11, 1, 9, tzinfo=timezone.utc),
+                due_at=datetime(2026, 11, 1, 9, tzinfo=UTC),
                 task="call the bank",
             ),
             ListedReminder(
                 reminder_id=UUID(int=2),
-                due_at=datetime(2026, 11, 3, 17, tzinfo=timezone.utc),
+                due_at=datetime(2026, 11, 3, 17, tzinfo=UTC),
                 task="send the report",
             ),
         ],
@@ -376,8 +406,8 @@ def test_existing_recurring_occurrence_suppresses_matching_projected_instance(se
         db.add(
             ReminderOccurrence(
                 reminder_id=reminder.id,
-                scheduled_at=datetime(2026, 11, 2, 9, tzinfo=timezone.utc),
-                next_due_at=datetime(2026, 11, 2, 9, tzinfo=timezone.utc),
+                scheduled_at=datetime(2026, 11, 2, 9, tzinfo=UTC),
+                next_due_at=datetime(2026, 11, 2, 9, tzinfo=UTC),
                 recurrence_instance_key="2026-11-02T09:00",
                 status="PENDING",
             )
@@ -393,7 +423,7 @@ def test_existing_recurring_occurrence_suppresses_matching_projected_instance(se
         )
 
     assert [(item.task, item.due_at) for item in result] == [
-        ("weekly review", datetime(2026, 11, 2, 9, tzinfo=timezone.utc))
+        ("weekly review", datetime(2026, 11, 2, 9, tzinfo=UTC))
     ]
 
 
@@ -441,9 +471,9 @@ def test_listing_includes_only_occurrences_at_the_requested_local_midnight_bound
         db.flush()
         reminders = []
         for task, due_at in (
-            ("before range", datetime(2026, 10, 31, 18, 59, tzinfo=timezone.utc)),
-            ("at local midnight", datetime(2026, 10, 31, 19, 0, tzinfo=timezone.utc)),
-            ("next local midnight", datetime(2026, 11, 1, 19, 0, tzinfo=timezone.utc)),
+            ("before range", datetime(2026, 10, 31, 18, 59, tzinfo=UTC)),
+            ("at local midnight", datetime(2026, 10, 31, 19, 0, tzinfo=UTC)),
+            ("next local midnight", datetime(2026, 11, 1, 19, 0, tzinfo=UTC)),
         ):
             reminder = Reminder(
                 user_id=user.id,
@@ -475,5 +505,5 @@ def test_listing_includes_only_occurrences_at_the_requested_local_midnight_bound
         )
 
     assert [(item.task, item.due_at) for item in result] == [
-        ("at local midnight", datetime(2026, 10, 31, 19, tzinfo=timezone.utc))
+        ("at local midnight", datetime(2026, 10, 31, 19, tzinfo=UTC))
     ]

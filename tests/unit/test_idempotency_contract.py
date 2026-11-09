@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from reminder_agent.application import conversation_workflow as reminders
+from reminder_agent.application import conversation_coordinator as reminders
 from reminder_agent.channels.telegram.provider import TelegramUpdate
 from reminder_agent.features.onboarding.workflow import (
     IdempotencyConflict as PublicIdempotencyConflict,

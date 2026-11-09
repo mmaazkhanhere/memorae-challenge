@@ -5,7 +5,7 @@ from reminder_agent.features.intent import (
     CreateOneTimeReminderIntent,
     CreateRecurringReminderIntent,
 )
-from reminder_agent.features.reminders.reminder_creation import resolve_creation_due_at
+from reminder_agent.features.reminders.create.validation import resolve_creation_due_at
 
 
 def test_one_time_creation_due_at_is_normalized_to_utc() -> None:

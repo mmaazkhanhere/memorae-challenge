@@ -6,8 +6,8 @@ from uuid import UUID
 import pytest
 from sqlalchemy import func, select
 
-from reminder_agent.application import conversation_workflow as reminders
-from reminder_agent.application.conversation_workflow import handle_reminder_text
+from reminder_agent.application import conversation_coordinator as reminders
+from reminder_agent.application.conversation_coordinator import handle_reminder_text
 from reminder_agent.channels.telegram.provider import (
     TelegramAPIError,
     TelegramDeliveryResult,
@@ -16,7 +16,7 @@ from reminder_agent.channels.telegram.provider import (
 from reminder_agent.features.intent import CreateOneTimeReminderIntent, Interpretation
 from reminder_agent.features.onboarding.message_templates import ONBOARDING_MESSAGES
 from reminder_agent.features.onboarding.workflow import handle_update
-from reminder_agent.features.reminders.cancellation import CancellationScope, apply_cancellation
+from reminder_agent.features.reminders.cancel.decisions import CancellationScope, apply_cancellation
 from reminder_agent.features.reminders.recurrence_service import materialize_recurring_reminder
 from reminder_agent.features.reminders.rescheduling import (
     RescheduleCandidate,
@@ -162,7 +162,8 @@ def test_reminder_creation_service_persists_a_single_graph_and_replays_idempoten
             now=fixed_now,
         )
 
-    assert "I'll remind you" in reply.text
+    assert "call the bank" in reply.text
+    assert "Telegram" in reply.text
     assert reply.is_duplicate is False
     with session_factory() as db:
         reminder = db.scalar(select(Reminder))
