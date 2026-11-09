@@ -45,7 +45,8 @@ def test_user_can_list_and_reschedule_a_reminder_without_creating_another_one(
     assert _post_update(
         api_client, update_factory(6, text="Move the bank reminder to tomorrow at 11 AM")
     ).json() == {"ok": True}
-    assert "Moved 'call the bank'" in telegram_client.messages[-1][1]
+    assert "call the bank" in telegram_client.messages[-1][1]
+    assert "Telegram" in telegram_client.messages[-1][1]
     assert "11:00" in telegram_client.messages[-1][1]
 
     db.expire_all()
