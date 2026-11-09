@@ -23,7 +23,7 @@ from reminder_agent.features.reminders.create.validation import (
     CreationValidationFailure,
     validate_creation_schedules,
 )
-from reminder_agent.features.reminders.reminder_creation_persistence import (
+from reminder_agent.features.reminders.create.reminder_creation_persistence import (
     CreationPersistenceResult,
     ExistingReminder,
     persist_creation_graphs,
