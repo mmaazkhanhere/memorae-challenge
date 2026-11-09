@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from uuid import UUID
@@ -91,6 +92,76 @@ class ReminderSummary:
     metric: str
     count: int
     reminders: tuple[ListedReminder, ...] = ()
+
+
+REMINDER_SUMMARY_MESSAGES: dict[str, list[str]] = {
+    "pending": [
+        "You've got {count} {reminder_word} coming up.",
+        "Just a heads up, {count} {reminder_word} are still pending.",
+        "You've got {count} {reminder_word} on your upcoming list.",
+        "There are {count} {reminder_word} waiting on your reminder list.",
+    ],
+    "overdue": [
+        "Looks like {count} {reminder_word} are past due.",
+        "You've got {count} overdue {reminder_word}. Want to take a look?",
+        "Just a heads-up, {count} {reminder_word} are overdue.",
+        "There are {count} {reminder_word} that have passed their scheduled time.",
+    ],
+    "completed_total": [
+        "Nice work! You've completed {count} {reminder_word} so far.",
+        "You've checked off {count} {reminder_word} in total!",
+        "That's {count} {reminder_word} taken care of so far.",
+        "You've marked {count} {reminder_word} as done. Nice going!",
+    ],
+    "completed_today": [
+        "You've checked off {count} {reminder_word} today. Nice going!",
+        "Look at that! {count} {reminder_word} completed today.",
+        "You've already taken care of {count} {reminder_word} today!",
+        "That's {count} {reminder_word} off your list today. Well done!",
+    ],
+    "remaining_today_none": [
+        "You're all clear on reminders for today!",
+        "Nothing else on your reminder list for today.",
+        "Looks like you have no reminders left for today.",
+        "Your reminder list is clear for the rest of today!",
+    ],
+    "pending_zero": [
+        "You're all caught up! No pending reminders right now.",
+        "Nothing coming up on your reminder list at the moment.",
+        "No pending reminders for now. You're all set!",
+    ],
+    "pending_one": [
+        "You've got one reminder coming up.",
+        "Just one reminder on your upcoming list.",
+        "There's one reminder waiting on your list.",
+    ],
+    "overdue_zero": [
+        "Good news! No overdue reminders.",
+        "Nothing overdue on your reminder list.",
+        "You're all clear—no overdue reminders.",
+    ],
+    "overdue_one": [
+        "Looks like one reminder is past due.",
+        "You've got one overdue reminder. Want to take a look?",
+        "Just a heads-up, one reminder is overdue.",
+    ],
+    "completed_total_zero": [
+        "You haven't marked any reminders as done yet.",
+        "No completed reminders just yet.",
+    ],
+    "completed_today_zero": [
+        "No reminders marked as done today yet.",
+        "You haven't checked off any reminders today.",
+    ],
+    "completed_total_one": [
+        "You've completed your first reminder!",
+        "That's one reminder checked off so far.",
+    ],
+    "completed_today_one": [
+        "You've checked off one reminder today!",
+        "One reminder taken care of today.",
+    ],
+}
 
 
 def list_owned_reminders(
@@ -362,16 +433,36 @@ def format_reminder_summary(summary: ReminderSummary, *, timezone_name: str) -> 
     """Format a concise response for a progress query."""
 
     count = summary.count
+    reminder_word = "reminder" if count == 1 else "reminders"
+
+    def choose(key: str) -> str:
+        return random.choice(REMINDER_SUMMARY_MESSAGES[key]).format(
+            count=count,
+            reminder_word=reminder_word,
+        )
+
     if summary.metric == "PENDING_COUNT":
-        return f"You have {count} pending reminder{'s' if count != 1 else ''}."
+        return choose("pending_zero" if count == 0 else "pending_one" if count == 1 else "pending")
     if summary.metric == "OVERDUE_COUNT":
-        return f"You have {count} overdue reminder{'s' if count != 1 else ''}."
+        return choose("overdue_zero" if count == 0 else "overdue_one" if count == 1 else "overdue")
     if summary.metric == "COMPLETED_COUNT":
-        return f"You have completed {count} task{'s' if count != 1 else ''}."
+        return choose(
+            "completed_total_zero"
+            if count == 0
+            else "completed_total_one"
+            if count == 1
+            else "completed_total"
+        )
     if summary.metric == "TODAY_COMPLETED":
-        return f"You have completed {count} task{'s' if count != 1 else ''} today."
+        return choose(
+            "completed_today_zero"
+            if count == 0
+            else "completed_today_one"
+            if count == 1
+            else "completed_today"
+        )
     if not summary.reminders:
-        return "You have nothing left to do today."
+        return random.choice(REMINDER_SUMMARY_MESSAGES["remaining_today_none"])
     zone = ZoneInfo(timezone_name)
     header = f"You still have {count} task{'s' if count != 1 else ''} to do today:"
     lines = [
@@ -491,7 +582,11 @@ def format_reminder_list(
     local_items = [(item.due_at.astimezone(zone), item.task) for item in reminders]
     if len(local_items) == 1:
         due_at, task = local_items[0]
-        return "\n".join([heading, f"- {date_label(due_at.date())} at {due_at:%H:%M %Z} - {task}"])
+        if start_date is not None and start_date == end_date and due_at.date() == start_date:
+            item_text = f"- {due_at:%H:%M %Z} - {task}"
+        else:
+            item_text = f"- {date_label(due_at.date())} at {due_at:%H:%M %Z} - {task}"
+        return "\n".join([heading, item_text])
 
     grouped: dict[date, list[tuple[datetime, str]]] = {}
     for due_at, task in local_items:
