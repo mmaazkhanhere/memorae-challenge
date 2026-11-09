@@ -6,6 +6,7 @@ from reminder_agent.features.intent import (
     Interpretation,
     ListRemindersIntent,
 )
+from reminder_agent.features.reminders.listing.filters import REMINDER_SUMMARY_MESSAGES
 from reminder_agent.infrastructure.db.models import (
     ConversationSession,
     IdempotencyRecord,
@@ -102,7 +103,10 @@ def test_telegram_progress_questions_are_read_only_and_owner_scoped(
 
     response = post_update(api_client, update_factory(519, text="How many reminders are pending?"))
     assert response.status_code == 200
-    assert telegram_client.messages[-1][1] == "You have 2 pending reminders."
+    assert telegram_client.messages[-1][1] in {
+        message.format(count=2, reminder_word="reminders")
+        for message in REMINDER_SUMMARY_MESSAGES["pending"]
+    }
 
     response = post_update(
         api_client, update_factory(523, text="What do I still have to do today?")
