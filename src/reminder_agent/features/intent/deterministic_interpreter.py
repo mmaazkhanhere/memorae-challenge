@@ -159,7 +159,9 @@ class RuleBasedIntentInterpreter(
         now: datetime,
         context: PendingReminder | None = None,
     ) -> Interpretation:
-        raw = text.strip()
+        # Telegram users sometimes send copied questions with surrounding
+        # quotation marks. They are presentation noise, not intent content.
+        raw = text.strip().strip('"“”')
         route = selected_route or (
             IntentRoute.UPDATE_PENDING if context is not None else IntentRoute.NEW_REQUEST
         )

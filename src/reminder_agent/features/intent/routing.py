@@ -162,7 +162,8 @@ def is_list_request_command(text: str) -> bool:
 
 def is_summary_request_command(text: str) -> bool:
     """Return whether text asks for reminder progress/count information."""
-    return _SUMMARY_REQUEST.fullmatch(text.strip()) is not None
+    normalized = text.strip().strip('"“”')
+    return _SUMMARY_REQUEST.fullmatch(normalized) is not None
 
 
 def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecision:
