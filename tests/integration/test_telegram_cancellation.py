@@ -14,6 +14,7 @@ from reminder_agent.features.reminders.cancel.decisions import (
     CancellationScope,
     apply_cancellation,
 )
+from reminder_agent.features.reminders.cancel.messages import REMINDER_CANCEL_MESSAGES
 from reminder_agent.features.reminders.recurrence_service import (
     materialize_active_recurring_reminders,
 )
@@ -34,6 +35,12 @@ def post_update(api_client, update):
         json=update,
         headers={"X-Telegram-Bot-Api-Secret-Token": "test-secret"},
     )
+
+
+def _cancel_message_variants(key: str, **values: object) -> set[str]:
+    return {
+        template.format(**values) for template in REMINDER_CANCEL_MESSAGES[key]
+    }
 
 
 def onboard(api_client, update_factory, *, user_id=1001, chat_id=2001, base=4000):
@@ -97,7 +104,9 @@ def test_cancel_one_time_reminder_prevents_worker_delivery(
     response = post_update(api_client, update_factory(4003, text="Cancel the bank reminder"))
 
     assert response.status_code == 200
-    assert "Canceled 'call the bank'" in telegram_client.messages[-1][1]
+    assert telegram_client.messages[-1][1] in _cancel_message_variants(
+        "one_time_cancelled", task="call the bank"
+    )
     reminder = db.scalar(select(Reminder))
     occurrence = db.scalar(select(ReminderOccurrence))
     notification = db.scalar(select(Notification))
@@ -116,7 +125,7 @@ def test_cancel_one_time_reminder_prevents_worker_delivery(
 
     repeated = post_update(api_client, update_factory(4004, text="Cancel the bank reminder"))
     assert repeated.status_code == 200
-    assert "couldn't find" in telegram_client.messages[-1][1].lower()
+    assert telegram_client.messages[-1][1] in _cancel_message_variants("no_match")
     db.expire_all()
     assert db.scalar(select(Reminder)).status == "CANCELED"
 
@@ -144,7 +153,9 @@ def test_llm_routed_indirect_cancellation_reaches_transactional_service(
     )
 
     assert response.status_code == 200
-    assert "Canceled 'call the bank'" in telegram_client.messages[-1][1]
+    assert telegram_client.messages[-1][1] in _cancel_message_variants(
+        "one_time_cancelled", task="call the bank"
+    )
     assert db.scalar(select(Reminder)).status == "CANCELED"
 
 
@@ -234,7 +245,12 @@ def test_cancel_recurring_series_when_materialized_occurrences_are_exhausted(
     db.expire_all()
     reminder = db.get(Reminder, reminder.id)
     assert reminder is not None and reminder.status == "CANCELED"
-    assert "recurring reminder" in telegram_client.messages[-1][1]
+    assert telegram_client.messages[-1][1] in _cancel_message_variants(
+        "recurring_series_cancelled",
+        task="standup",
+        count=0,
+        occurrence_word="occurrences",
+    )
 
 
 def test_cancel_only_one_recurring_occurrence_leaves_series_active(
@@ -260,7 +276,9 @@ def test_cancel_only_one_recurring_occurrence_leaves_series_active(
     ).all()
     assert occurrences[0].status == "CANCELED"
     assert any(item.status == "PENDING" for item in occurrences[1:])
-    assert "series remains active" in telegram_client.messages[-1][1]
+    assert telegram_client.messages[-1][1] in _cancel_message_variants(
+        "recurring_occurrence_cancelled", task="standup"
+    )
 
 
 def test_ambiguous_cancellation_clarifies_and_follow_up_cancels_only_selected(
@@ -284,7 +302,9 @@ def test_ambiguous_cancellation_clarifies_and_follow_up_cancels_only_selected(
 
     response = post_update(api_client, update_factory(4032, text="Cancel the bank reminder"))
     assert response.status_code == 200
-    assert "multiple matching" in telegram_client.messages[-1][1].lower()
+    assert telegram_client.messages[-1][1].split("\n", 1)[0] in _cancel_message_variants(
+        "multiple_matches"
+    )
     session = db.scalar(select(ConversationSession))
     assert session is not None and session.status == "AWAITING_CLARIFICATION"
     assert session.pending_clarification["operation"] == "CANCEL_REMINDER"
@@ -317,12 +337,12 @@ def test_cancellation_replay_is_idempotent_and_cross_user_isolated(
     assert len(telegram_client.messages) == first_reply_count
     record = db.scalar(select(IdempotencyRecord).where(IdempotencyRecord.idempotency_key == "4041"))
     assert record is not None
-    assert record.response == {
-        "chat_id": 2001,
-        "text": "Canceled 'call the bank' via Telegram.",
-        "reply_markup": None,
-        "request_text": "Cancel the bank reminder",
-    }
+    assert record.response["chat_id"] == 2001
+    assert record.response["text"] in _cancel_message_variants(
+        "one_time_cancelled", task="call the bank"
+    )
+    assert record.response["reply_markup"] is None
+    assert record.response["request_text"] == "Cancel the bank reminder"
 
     onboard(api_client, update_factory, user_id=2002, chat_id=3002, base=4050)
     response = post_update(
@@ -330,7 +350,7 @@ def test_cancellation_replay_is_idempotent_and_cross_user_isolated(
         update_factory(4052, user_id=2002, chat_id=3002, text="Cancel the bank reminder"),
     )
     assert response.status_code == 200
-    assert "couldn't find" in telegram_client.messages[-1][1].lower()
+    assert telegram_client.messages[-1][1] in _cancel_message_variants("no_match")
 
 
 def test_cancellation_fails_without_mutation_when_notification_is_sending(
@@ -921,7 +941,9 @@ def test_multiple_partial_matches_require_clarification(
 
     api_client.app.state.reminder_interpreter = FailIfCalled()
     assert post_update(api_client, update_factory(4108, text="Cancel call bank")).status_code == 200
-    assert "multiple matching" in telegram_client.messages[-1][1].lower()
+    assert telegram_client.messages[-1][1].split("\n", 1)[0] in _cancel_message_variants(
+        "partial_ambiguous_match"
+    )
     assert db.scalars(select(Reminder.status)).all() == ["ACTIVE", "ACTIVE"]
 
 
@@ -1166,7 +1188,9 @@ def test_contextual_occurrence_with_multiple_owned_series_requires_clarification
         post_update(api_client, update_factory(4099, text="Skip the next one")).status_code == 200
     )
 
-    assert "multiple matching" in telegram_client.messages[-1][1].lower()
+    assert telegram_client.messages[-1][1].split("\n", 1)[0] in _cancel_message_variants(
+        "multiple_matches"
+    )
     assert db.scalars(select(Reminder.status)).all() == ["ACTIVE", "ACTIVE"]
 
 
@@ -1204,7 +1228,9 @@ def test_semantic_fallback_clarifies_when_its_proposed_target_matches_multiple_r
         post_update(api_client, update_factory(4088, text="Skip my banking errand")).status_code
         == 200
     )
-    assert "multiple matching" in telegram_client.messages[-1][1].lower()
+    assert telegram_client.messages[-1][1].split("\n", 1)[0] in _cancel_message_variants(
+        "multiple_matches"
+    )
     assert db.scalars(select(Reminder.status)).all() == ["ACTIVE", "ACTIVE"]
 
 

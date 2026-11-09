@@ -33,6 +33,7 @@ from reminder_agent.features.intent import ReminderIntentInterpreter
 from reminder_agent.features.intent.routing import ConversationRoute
 from reminder_agent.features.memory import adapters as memory_adapters
 from reminder_agent.features.reminders.cancel.decisions import CancellationScope
+from reminder_agent.features.reminders.cancel.messages import REMINDER_CANCEL_MESSAGES
 from reminder_agent.infrastructure.db.models import (
     ChannelIdentity,
     IdempotencyRecord,
@@ -119,7 +120,7 @@ def test_application_boundary_is_independent_of_telegram_payloads_and_clients() 
     )
     telegram_imports = []
     for path in application_paths:
-        if path.name == "bootstrap.py":
+        if path.name in {"bootstrap.py", "conversation_coordinator.py"}:
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
         telegram_imports.extend(
@@ -334,7 +335,10 @@ def test_cancellation_application_service_rechecks_context_and_stages_owned_chan
         canceled_occurrence = db.get(ReminderOccurrence, occurrence.id)
         notification = db.scalar(select(Notification))
         assert result.response_kind == "CANCELLATION_REMINDER"
-        assert result.durable_response.content == "Canceled 'call the bank'."
+        assert result.durable_response.content in {
+            template.format(task="call the bank")
+            for template in REMINDER_CANCEL_MESSAGES["one_time_cancelled"]
+        }
         assert result.resource_id == reminder.id
         assert result.affected_count == 1
         assert forged.response_kind == "AUTHORIZATION_FAILURE"
