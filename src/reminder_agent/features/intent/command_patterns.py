@@ -136,7 +136,10 @@ LIST_REQUEST = re.compile(
     r"^\s*(?:can\s+you\s+)?(?:what\s+(?:do\s+i\s+have|are\s+my\s+reminders?|"
     r"reminders?\s+do\s+i\s+have)|"
     r"what(?:'s|\s+is)\s+(?:my\s+)?reminders?(?:\s+(?:for|on|tomorrow|today))?|"
+    r"(?:any|do\s+i\s+have|are\s+there)\s+(?:any\s+)?reminders?(?:\s+(?:for|on)\s+\S+)?|"
     r"(?:list|show)(?:\s+(?:my|me))?\s+(?:all\s+(?:the\s+)?)?(?:recurring\s+)?reminders?|"
+    r"(?:do\s+i\s+have|are\s+there)\s+(?:any\s+)?\S.+\s+reminders?|"
+    r"what(?:'s|\s+is)\s+(?:my\s+)?(?:next|upcoming)\s+reminders?(?:\s+to\s+do)?|"
     r"what(?:'s|\s+is)\s+(?:(?:on|in)\s+)?(?:my\s+)?schedule|"
     r"what\s+is\s+scheduled|anything\s+coming\s+up)\b",
     re.IGNORECASE,

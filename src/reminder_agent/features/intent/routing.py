@@ -41,6 +41,7 @@ class RouteDecision:
 _LIST_REMINDERS = re.compile(
     r"^\s*(?:can\s+you\s+)?(?:what\s+(?:do\s+i\s+have|are\s+my\s+reminders?|"
     r"reminders?\s+do\s+i\s+have)|"
+    r"(?:any|do\s+i\s+have|are\s+there)\s+(?:any\s+)?reminders?(?:\s+(?:for|on)\s+\S+)?|"
     r"what(?:['Ã¢â‚¬â„¢]s|\s+is)\s+(?:my\s+)?reminders?(?:\s+(?:for|on|tomorrow|today))?|"
     r"(?:list|show)(?:\s+(?:my|me))?\s+(?:all\s+(?:the\s+)?)?(?:recurring\s+)?reminders?)\b",
     re.IGNORECASE,
@@ -52,7 +53,12 @@ _SCHEDULE_LIST_REQUEST = re.compile(
 )
 _TASK_LIST_REQUEST = re.compile(
     r"^\s*(?:when\s+(?:are|is)\s+(?:my\s+)?\S+|when\s+do\s+i\s+have\s+to\s+\S+|"
-    r"(?:show|list)\s+(?:my\s+)?\S.+\s+reminders?)\b",
+    r"(?:show|list)\s+(?:my\s+)?\S.+\s+reminders?|"
+    r"(?:do\s+i\s+have|are\s+there)\s+(?:any\s+)?\S.+\s+reminders?)\b",
+    re.IGNORECASE,
+)
+_NEXT_REMINDER_REQUEST = re.compile(
+    r"^\s*what(?:'s|\s+is)\s+(?:my\s+)?(?:next|upcoming)\s+reminders?(?:\s+to\s+do)?\s*[?!.]*\s*$",
     re.IGNORECASE,
 )
 _SUMMARY_REQUEST = re.compile(
@@ -129,7 +135,9 @@ def is_memory_save_command(text: str) -> bool:
 
 def is_memory_lookup_command(text: str) -> bool:
     """Return whether text is a high-precision saved-fact lookup question."""
-    return extract_memory_lookup_query(text) is not None
+    # Reminder-shaped questions can match the broad "what's my ..." memory
+    # pattern. Keep the semantic boundary explicit for direct callers too.
+    return not is_list_request_command(text) and extract_memory_lookup_query(text) is not None
 
 
 def is_list_request_command(text: str) -> bool:
@@ -139,6 +147,7 @@ def is_list_request_command(text: str) -> bool:
         _LIST_REMINDERS.match(raw) is not None
         or _SCHEDULE_LIST_REQUEST.match(raw) is not None
         or _TASK_LIST_REQUEST.match(raw) is not None
+        or _NEXT_REMINDER_REQUEST.match(raw) is not None
     )
 
 
