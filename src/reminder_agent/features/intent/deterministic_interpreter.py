@@ -99,6 +99,7 @@ from reminder_agent.features.intent.text_normalization import (
     valid_clock as _valid_clock,
 )
 from reminder_agent.infrastructure.observability import get_logger, log_event
+from reminder_agent.features.memory.create.messages import memory_message
 from reminder_agent.shared.creation_routing import (
     REMINDER_COMMAND_PREFIX,
     is_disambiguated_reminder_command,
@@ -188,6 +189,7 @@ class RuleBasedIntentInterpreter(
             # the extractor must never select an occurrence or invent an ID.
             return Interpretation(fallback_allowed=False)
         if route is IntentRoute.SNOOZE_REQUEST:
+            from reminder_agent.features.reminders.snooze.messages import snooze_message
             from reminder_agent.features.reminders.snooze.operations import parse_snooze_duration
 
             duration = parse_snooze_duration(raw)
@@ -197,14 +199,14 @@ class RuleBasedIntentInterpreter(
                     fallback_allowed=False,
                 )
             return Interpretation(
-                response_text="How long should I snooze that reminder?",
+                response_text=snooze_message("missing_duration"),
                 fallback_allowed=True,
             )
         if route is IntentRoute.SAVE_MEMORY:
             content = extract_memory_content(raw)
             if content is None:
                 return Interpretation(
-                    response_text="What information should I remember?",
+                    response_text=memory_message("memory_clarification"),
                     fallback_allowed=True,
                 )
             return Interpretation(

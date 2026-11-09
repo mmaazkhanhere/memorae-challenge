@@ -114,6 +114,7 @@ from reminder_agent.features.reminders.reschedule.service import (
     _handle_reschedule_text,
     dispatch_reschedule,
 )
+from reminder_agent.features.reminders.snooze.messages import snooze_message
 from reminder_agent.features.reminders.snooze.operations import (
     is_snooze_command,
 )
@@ -940,7 +941,7 @@ def handle_reminder_text(
             user=user,
             now=now,
             session_ttl_seconds=session_ttl_seconds,
-            response_text="Okay, I won't snooze that reminder.",
+            response_text=snooze_message("snooze_cancelled"),
         )
         assert canceled_reply is not None
         return canceled_reply
