@@ -190,6 +190,38 @@ def _recent_messages(db: Session, *, user_id: UUID) -> list[str]:
     return messages[-34:]
 
 
+def _recent_selection_context(
+    db: Session, *, user_id: UUID
+) -> tuple[dict[str, str], ...]:
+    """Return the most recent structured reminder list for ordinal references."""
+
+    records = db.scalars(
+        select(IdempotencyRecord)
+        .where(
+            IdempotencyRecord.source == TELEGRAM,
+            IdempotencyRecord.user_id == user_id,
+        )
+        .order_by(IdempotencyRecord.created_at.desc())
+        .limit(1)
+    ).all()
+    for record in records:
+        if not isinstance(record.response, dict):
+            continue
+        raw_context = record.response.get("selection_context")
+        if not isinstance(raw_context, list):
+            continue
+        context = tuple(
+            item
+            for item in raw_context
+            if isinstance(item, dict)
+            and isinstance(item.get("reminder_id"), str)
+            and isinstance(item.get("task"), str)
+        )
+        if context:
+            return context
+    return ()
+
+
 def _recent_delivered_reminders(
     db: Session, *, user_id: UUID, identity_id: UUID, chat_id: int
 ) -> list[dict[str, str]]:
@@ -574,6 +606,7 @@ def handle_reminder_text(
     )
     text = update.message.text or ""
     recent_messages = _recent_messages(db, user_id=user.id)
+    selection_context = _recent_selection_context(db, user_id=user.id)
     recent_delivered_reminders = _recent_delivered_reminders(
         db, user_id=user.id, identity_id=identity.id, chat_id=update.message.chat.id
     )
@@ -626,7 +659,24 @@ def handle_reminder_text(
     )
     if conversation_entry.response is not None:
         db.rollback()
-        return ReminderReply(update.message.chat.id, conversation_entry.response.content)
+        with db.begin():
+            existing = _existing_record(db, update)
+            if existing is not None:
+                return _reply_from_record(existing)
+            result = conversation_entry.response
+            return _store_response(
+                db,
+                update=update,
+                user_id=user.id,
+                text=result.content,
+                response_kind=result.response_kind,
+                operation="LIST_REMINDERS",
+                response_metadata=(
+                    {"selection_context": list(result.selection_context)}
+                    if result.selection_context
+                    else None
+                ),
+            )
     assert conversation_entry.route is not None
     deterministic_route = conversation_entry.route
     log_event(
@@ -982,8 +1032,10 @@ def handle_reminder_text(
             pending=pending_value,
             now=now,
             session_ttl_seconds=session_ttl_seconds,
+            defer_to_classifier=intent_router is not None,
             reschedule_interpreter=cast(ReminderIntentInterpreter, interpreter),
             recent_messages=recent_messages,
+            selection_context=selection_context,
             pending_session_version=session_version,
         ),
     )
@@ -1046,6 +1098,7 @@ def handle_reminder_text(
             intent_router=intent_router,
             recent_messages=recent_messages,
             recent_delivered_reminders=recent_delivered_reminders,
+            selection_context=list(selection_context),
             deterministic_route=deterministic_route,
         )
         if route is ConversationRoute.RESCHEDULE_REQUEST:
@@ -1062,6 +1115,7 @@ def handle_reminder_text(
                 force=True,
                 reschedule_interpreter=cast(ReminderIntentInterpreter, interpreter),
                 recent_messages=recent_messages,
+                selection_context=selection_context,
                 pending_session_version=observed_session_version,
             )
             if reschedule_reply is not None:

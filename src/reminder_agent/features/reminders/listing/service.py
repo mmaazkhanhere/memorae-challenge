@@ -77,6 +77,14 @@ def list_reminders_for_request(
             now=now,
         ),
         response_kind="REMINDER_LIST",
+        selection_context=tuple(
+            {
+                "reminder_id": str(item.reminder_id),
+                "task": item.task,
+                "due_at": item.due_at.isoformat(),
+            }
+            for item in reminders
+        ),
     )
 
 
