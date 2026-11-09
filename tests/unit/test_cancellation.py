@@ -96,6 +96,18 @@ def test_indirect_cancellation_language_has_a_safe_target_fallback():
     assert request.target_text == "bank reminder"
 
 
+def test_stop_reminding_language_normalizes_task_and_recurring_frequency():
+    request = parse_cancellation_request(
+        "Stop reminding me to take vitamins every morning",
+        timezone_name="Asia/Karachi",
+        now=NOW,
+    )
+
+    assert not isinstance(request, str)
+    assert request.target_text == "take vitamins"
+    assert request.scope is None
+
+
 def test_cancellation_resolution_keeps_uncertainty_distinct_from_no_match():
     assert (
         classify_cancellation_resolution(
