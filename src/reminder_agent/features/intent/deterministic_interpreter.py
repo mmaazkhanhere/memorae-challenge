@@ -306,6 +306,13 @@ class RuleBasedIntentInterpreter(
                     timezone_name=timezone_name,
                     now=_normalise_now(now),
                 )
+            partial_weekly = self._interpret_partial_weekly(
+                raw,
+                timezone_name=timezone_name,
+                now=_normalise_now(now),
+            )
+            if partial_weekly is not None:
+                return partial_weekly
             # Keep bare clock answers and social acknowledgements deterministic,
             # but allow the provider to interpret complex natural language even
             # when it does not contain the literal word "remind".
@@ -335,6 +342,13 @@ class RuleBasedIntentInterpreter(
                 timezone_name=timezone_name,
                 now=reference,
             )
+        partial_weekly = self._interpret_partial_weekly(
+            without_prefix,
+            timezone_name=timezone_name,
+            now=reference,
+        )
+        if partial_weekly is not None:
+            return partial_weekly
 
         # Relative phrases and conversational qualifiers have
         # too much meaning for a small regex parser.  Do not extract a partial

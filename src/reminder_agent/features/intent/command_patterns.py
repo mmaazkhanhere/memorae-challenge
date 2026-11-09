@@ -75,7 +75,7 @@ DAY_PART = re.compile(
     re.IGNORECASE,
 )
 RECURRENCE = re.compile(
-    r"\bevery\s+(?P<days>(?:day|monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+    r"\bevery(?:\s+|(?=day\b))(?P<days>(?:day|monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
     r"(?:\s*(?:,|and)\s*(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))*)"
     r"\s+at\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*"
     r"(?P<meridiem>a\.m\.|p\.m\.|am|pm)?"
@@ -83,7 +83,7 @@ RECURRENCE = re.compile(
     re.IGNORECASE,
 )
 RECURRENCE_AFTER_TASK = re.compile(
-    r"(?P<task>.+?)\s+every\s+"
+    r"(?P<task>.+?)\s+every(?:\s+|(?=day\b))"
     r"(?P<days>(?:day|monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
     r"(?:\s*(?:,|and)\s*(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))*)"
     r"\s+at\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*"

@@ -462,4 +462,5 @@ class IntentInterpreter(Protocol):
         reschedule_candidates: Sequence[dict[str, str]] = (),
         cancellation_candidates: Sequence[dict[str, str]] = (),
         pending_reschedule: Any | None = None,
+        selection_context: Sequence[dict[str, str]] = (),
     ) -> Interpretation: ...

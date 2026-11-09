@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 
+from reminder_agent.features.intent.context import CONVERSATION_CONTEXT_TURNS
 from reminder_agent.features.intent.contracts import IntentRoute, PendingReminder
 
 MEMORY_SAVE_EXTRACTION_PROMPT = """
@@ -80,6 +81,7 @@ def build_prompt(
     reschedule_candidates: Sequence[dict[str, str]],
     cancellation_candidates: Sequence[dict[str, str]],
     pending_reschedule: Any | None,
+    selection_context: Sequence[dict[str, str]] = (),
 ) -> str:
     prompt = """
                 Extract structured reminder operations from the latest user message.
@@ -119,9 +121,15 @@ def build_prompt(
                 RESCHEDULE_REQUEST:
                 - RESCHEDULE_REMINDER: target_text, scope (OCCURRENCE/SERIES),
                 date_explicit, and exactly one of due_local or offset_minutes.
+                For NEEDS_CLARIFICATION where the destination date is known but
+                the clock time is missing, include destination_date as an ISO date
+                plus target_text so the application can continue the same operation.
                 date_explicit is true only for an explicitly supplied destination date/day.
                 "back"/"push back" = negative offset; "forward" = positive.
                 For multiple matches, request clarification without choosing.
+                If the user uses an indirect target such as "it" or "that reminder",
+                resolve it from the latest conversation and supplied candidates only when
+                exactly one active reminder is grounded; otherwise request clarification.
                 - With pending reschedule, use SELECT_CANDIDATE, UPDATE_PENDING_PARAMETERS,
                 SELECT_AND_UPDATE, START_NEW_OPERATION, CANCEL_PENDING, or NEEDS_CLARIFICATION.
                 Copy candidate IDs only from supplied candidates. Updates may contain
@@ -156,7 +164,10 @@ def build_prompt(
                 - Interpret relative dates using the user's local time, not UTC.
                 - Never invent missing tasks, times, dates, recurrence rules, or records.
                 - If required information is missing or ambiguous, return
-                NEEDS_CLARIFICATION with a focused question and relevant pending fields.
+                NEEDS_CLARIFICATION with a focused question and a pending object containing
+                every unambiguous field already extracted from the user's message. Never
+                omit a known task, date, time, or recurrence field merely because another
+                field is still missing; pending state must be resumable on the next reply.
                 - Return proposals only; the application validates and executes them.
             """
     if route is IntentRoute.SAVE_MEMORY:
@@ -170,7 +181,7 @@ def build_prompt(
     if recent_messages:
         prompt += (
             " Relevant recent conversation messages are "
-            f"{json.dumps(list(recent_messages)[-34:])}."
+            f"{json.dumps(list(recent_messages)[-CONVERSATION_CONTEXT_TURNS:])}."
         )
     if route is IntentRoute.RESCHEDULE_REQUEST and reschedule_candidates:
         prompt += (
@@ -178,6 +189,14 @@ def build_prompt(
             f"{json.dumps(list(reschedule_candidates))}. Use these current local due times "
             "when interpreting relative changes, and ask the user to choose a candidate "
             "when more than one reminder matches."
+        )
+    if route is IntentRoute.RESCHEDULE_REQUEST and selection_context:
+        prompt += (
+            " The most recent reminder list shown to the user was "
+            f"{json.dumps(list(selection_context))}. For an indirect reference such as "
+            '"that one", "the second one", or "last", resolve it only against this list. '
+            "Use the selected item's exact task as target_text; never return its ID. "
+            "If the reference is not resolvable from this list, ask a clarification question."
         )
     if route is IntentRoute.CANCEL_REQUEST and cancellation_candidates:
         prompt += (

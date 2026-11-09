@@ -28,8 +28,54 @@ from reminder_agent.features.intent.text_normalization import (
 )
 from reminder_agent.features.reminders.recurrence import WeeklyRecurrence
 
+_PARTIAL_WEEKLY = re.compile(
+    r"\bevery\s+(?P<days>day|monday|tuesday|wednesday|thursday|friday|saturday|sunday"
+    r"(?:\s*(?:,|and)\s*(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))*)"
+    r"\s+(?:to|for)\s+(?P<task>.+?)\s*$",
+    re.IGNORECASE,
+)
+
 
 class RecurrenceIntentMixin:
+    def _interpret_partial_weekly(
+        self,
+        text: str,
+        *,
+        timezone_name: str,
+        now: datetime,
+    ) -> Interpretation | None:
+        """Preserve a clear weekly task/cadence while asking only for time."""
+
+        match = _PARTIAL_WEEKLY.search(text)
+        if match is None:
+            return None
+        raw_days = match.group("days").lower()
+        weekdays = (
+            tuple(range(7))
+            if raw_days == "day"
+            else tuple(sorted({self._weekdays[day] for day in re.findall(
+                r"monday|tuesday|wednesday|thursday|friday|saturday|sunday",
+                raw_days,
+            )}))
+        )
+        task = _task_from_remainder(match.group("task"))
+        if not task or not weekdays:
+            return None
+        local_today = now.astimezone(ZoneInfo(timezone_name)).date()
+        pending = PendingReminder(
+            task=task,
+            date_local=local_today,
+            date_explicit=False,
+            recurrence_weekdays=weekdays,
+            timezone_name=timezone_name,
+        )
+        question = "What time should I use for that weekly reminder?"
+        return Interpretation(
+            clarification=NeedsClarification(pending=pending, question=question),
+            response_text=question,
+            fallback_allowed=False,
+        )
+
     def _build_recurring(
         self,
         match: re.Match[str],

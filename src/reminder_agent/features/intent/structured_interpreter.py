@@ -114,6 +114,7 @@ class OpenAICompatibleIntentInterpreter:
         reschedule_candidates: Sequence[dict[str, str]] = (),
         cancellation_candidates: Sequence[dict[str, str]] = (),
         pending_reschedule: Any | None = None,
+        selection_context: Sequence[dict[str, str]] = (),
     ) -> Interpretation:
         route = selected_route or (
             IntentRoute.UPDATE_PENDING if context is not None else IntentRoute.NEW_REQUEST
@@ -155,6 +156,7 @@ class OpenAICompatibleIntentInterpreter:
             reschedule_candidates=reschedule_candidates,
             cancellation_candidates=cancellation_candidates,
             pending_reschedule=pending_reschedule,
+            selection_context=selection_context,
         )
         request_payload = {
             "model": self._model,

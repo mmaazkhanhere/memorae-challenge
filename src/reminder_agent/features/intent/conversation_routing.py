@@ -7,6 +7,7 @@ import logging
 from datetime import datetime
 from typing import Any, cast
 
+from reminder_agent.features.intent.context import CONVERSATION_CONTEXT_TURNS
 from reminder_agent.features.intent.contracts import (
     IntentInterpreter,
     IntentRoute,
@@ -109,6 +110,7 @@ def route_and_interpret(
     intent_router: IntentRouter | None = None,
     recent_messages: list[str] | None = None,
     recent_delivered_reminders: list[dict[str, str]] | None = None,
+    selection_context: list[dict[str, str]] | None = None,
     deterministic_route: ConversationRoute | None = None,
 ) -> tuple[ConversationRoute, Interpretation]:
     """Route first, then interpret only the route that permits extraction."""
@@ -117,6 +119,7 @@ def route_and_interpret(
     original_route = route
     recent_messages = recent_messages or []
     recent_delivered_reminders = recent_delivered_reminders or []
+    selection_context = selection_context or []
     classifier_selected_update = False
     classifier_selected = False
     classifier_memory_evidence = None
@@ -130,12 +133,14 @@ def route_and_interpret(
             logging.INFO,
             "reminder_route_classifier_requested",
             has_pending=pending is not None,
-            recent_message_count=min(len(recent_messages), 34),
+            recent_message_count=min(len(recent_messages), CONVERSATION_CONTEXT_TURNS),
         )
         parameters = inspect.signature(intent_router.classify).parameters
         kwargs: dict[str, Any] = {"pending": pending, "recent_messages": recent_messages}
         if "recent_delivered_reminders" in parameters:
             kwargs["recent_delivered_reminders"] = recent_delivered_reminders
+        if "selection_context" in parameters:
+            kwargs["selection_context"] = selection_context
         suggestion_result = intent_router.classify(text, **kwargs)
         suggestion = suggestion_result.operation
         classifier_memory_evidence = getattr(suggestion_result, "memory_intent_evidence", None)

@@ -145,6 +145,15 @@ def decode_response(content: str | dict[str, Any]) -> tuple[dict[str, Any], str 
         raise ValueError("provider response was not an object")
     envelope_operation: str | None = None
     if "operation" not in data:
+        response_type = data.get("type")
+        if isinstance(response_type, str):
+            normalized_type = response_type.strip().upper()
+            if normalized_type in {"CLARIFICATION", "NEEDS_CLARIFICATION"}:
+                data = {**data, "operation": "NEEDS_CLARIFICATION"}
+                data.pop("type", None)
+            elif normalized_type in OPERATION_ENVELOPE_KEYS:
+                data = {**data, "operation": normalized_type}
+                data.pop("type", None)
         envelope_keys = [
             key
             for key, value in data.items()
@@ -381,6 +390,15 @@ def interpret_response(
             offset_minutes = data.get("offset_minutes")
             scope_value = data.get("scope")
             date_explicit = data.get("date_explicit")
+            destination_date_value = data.get("destination_date")
+            destination_date = None
+            if destination_date_value is not None:
+                if not isinstance(destination_date_value, str):
+                    raise ValueError("reschedule destination_date was not a string")
+                try:
+                    destination_date = date.fromisoformat(destination_date_value)
+                except ValueError as exc:
+                    raise ValueError("reschedule destination_date was invalid") from exc
             if not isinstance(target_text, str) or not target_text.strip():
                 raise ValueError("reschedule intent is missing target_text")
             if (isinstance(due_local_value, str)) == (
@@ -425,34 +443,43 @@ def interpret_response(
             offset_minutes = data.get("offset_minutes")
             scope_value = data.get("scope")
             date_explicit = data.get("date_explicit")
+            destination_date_value = data.get("destination_date")
+            destination_date = None
+            if destination_date_value is not None:
+                if not isinstance(destination_date_value, str):
+                    raise ValueError("reschedule destination_date was not a string")
+                try:
+                    destination_date = date.fromisoformat(destination_date_value)
+                except ValueError as exc:
+                    raise ValueError("reschedule destination_date was invalid") from exc
             has_absolute_time = isinstance(due_local_value, str)
             has_relative_time = isinstance(offset_minutes, int) and not isinstance(
                 offset_minutes, bool
             )
             if isinstance(target_text, str) and target_text.strip():
-                if has_absolute_time == has_relative_time:
-                    clarification_scope: RescheduleScope | None
-                    if scope_value is not None:
-                        try:
-                            clarification_scope = RescheduleScope(scope_value)
-                        except ValueError as exc:
-                            raise ValueError("reschedule intent has invalid scope") from exc
-                    else:
-                        clarification_scope = None
+                if not has_absolute_time and not has_relative_time:
+                    # Preserve the grounded target for durable clarification,
+                    # but leave it explicitly non-mutating because no time was
+                    # supplied.
                     return Interpretation(
                         reschedule_request=RescheduleRequest(
                             target_text=target_text,
-                            scope=clarification_scope,
-                            date_explicit=(
-                                date_explicit
-                                if isinstance(date_explicit, bool)
-                                else isinstance(due_local_value, str)
+                            scope=(
+                                RescheduleScope(scope_value)
+                                if scope_value is not None
+                                else None
                             ),
+                            date_explicit=(
+                                date_explicit if isinstance(date_explicit, bool) else False
+                            ),
+                            destination_date=destination_date,
                             source_text=text,
                         ),
                         response_text=question.strip(),
                         fallback_allowed=False,
                     )
+                if has_absolute_time and has_relative_time:
+                    raise ValueError("reschedule clarification has multiple time targets")
                 due_at = None
                 if has_absolute_time:
                     assert isinstance(due_local_value, str)

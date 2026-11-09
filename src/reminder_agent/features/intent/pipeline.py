@@ -19,6 +19,7 @@ from reminder_agent.features.intent.contracts import (
     NeedsClarification,
     PendingReminder,
 )
+from reminder_agent.features.reminders.reschedule.models import RescheduleClarification
 from reminder_agent.infrastructure.observability import get_logger, log_event
 
 logger = get_logger()
@@ -77,19 +78,34 @@ class ReminderIntentInterpreter:
         timezone_name: str,
         now: datetime,
         reschedule_candidates: Sequence[dict[str, str]] = (),
+        recent_messages: Sequence[str] = (),
+        selection_context: Sequence[dict[str, str]] = (),
     ) -> Any:
         """Return a non-authoritative reschedule proposal, if configured."""
 
         if not isinstance(self._model, _structured_interpreter.OpenAICompatibleIntentInterpreter):
             return None
+        kwargs = {
+            "selected_route": IntentRoute.RESCHEDULE_REQUEST,
+            "timezone_name": timezone_name,
+            "now": now,
+            "recent_messages": recent_messages,
+            "reschedule_candidates": reschedule_candidates,
+            "selection_context": selection_context,
+        }
+        parameters = inspect.signature(self._model.interpret).parameters
         result = self._model.interpret(
             text,
-            selected_route=IntentRoute.RESCHEDULE_REQUEST,
-            timezone_name=timezone_name,
-            now=now,
-            reschedule_candidates=reschedule_candidates,
+            **{key: value for key, value in kwargs.items() if key in parameters},
         )
         request = result.reschedule_request
+        if (
+            request is not None
+            and result.response_text is not None
+            and request.due_at is None
+            and request.offset_minutes is None
+        ):
+            return RescheduleClarification(request=request, question=result.response_text)
         if request is not None and request.offset_minutes is not None:
             normalized = text.lower()
             if re.search(r"\b(?:back|earlier)\b", normalized):
@@ -224,6 +240,11 @@ class ReminderIntentInterpreter:
                     "minute",
                     "meridiem",
                     "date_explicit",
+                    "recurrence_weekdays",
+                    "recurrence_frequency",
+                    "recurrence_interval",
+                    "recurrence_day_of_month",
+                    "recurrence_month",
                 ):
                     value = getattr(provider_pending, field)
                     if field in provider_pending.model_fields_set and value is not None:
