@@ -14,6 +14,7 @@ from reminder_agent.application.reminder_read_workflows import (
 from reminder_agent.application.response_staging import (
     ReminderReply,
     _application_request_from_telegram_update,
+    _store_response,
 )
 from reminder_agent.infrastructure.db.models import ChannelIdentity, User
 
@@ -48,4 +49,16 @@ def handle_list_reminder_request(
     )
     if result is None:
         return None
-    return ReminderReply(update.message.chat.id, result.content)
+    return _store_response(
+        db,
+        update=update,
+        user_id=user.id,
+        text=result.content,
+        response_kind=result.response_kind,
+        operation="LIST_REMINDERS",
+        response_metadata=(
+            {"selection_context": list(result.selection_context)}
+            if result.selection_context
+            else None
+        ),
+    )

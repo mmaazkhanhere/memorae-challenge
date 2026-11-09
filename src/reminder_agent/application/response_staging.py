@@ -169,6 +169,7 @@ def _store_response(
     operation: str = "CREATE_REMINDER",
     include_request_text: bool = True,
     cleanup_provider_message_id: str | None = None,
+    response_metadata: dict[str, Any] | None = None,
 ) -> ReminderReply:
     """Stage an idempotent Telegram response in the caller's transaction."""
 
@@ -199,6 +200,8 @@ def _store_response(
         response["request_text"] = update.message.text or ""
     if cleanup_provider_message_id is not None:
         response["cleanup_provider_message_id"] = cleanup_provider_message_id
+    if response_metadata:
+        response.update(response_metadata)
     db.add(
         IdempotencyRecord(
             source=TELEGRAM,
