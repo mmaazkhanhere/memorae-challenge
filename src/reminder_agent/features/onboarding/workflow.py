@@ -5,13 +5,8 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from reminder_agent.application.completion_callbacks import (
-    authorized_completion_identity,
-    parse_completion_callback,
-)
 from reminder_agent.application.contracts import ApplicationRequest
 from reminder_agent.application.voice_transcription import transcribe_telegram_voice
 from reminder_agent.features.intent.model_routing import IntentRouter
@@ -73,7 +68,7 @@ from reminder_agent.features.onboarding.responses import (
 from reminder_agent.features.onboarding.responses import (
     store_result as _store_result,
 )
-from reminder_agent.features.reminders.completion import complete_occurrence
+from reminder_agent.features.reminders.complete.service import handle_completion_callback
 from reminder_agent.infrastructure.db.models import User
 from reminder_agent.infrastructure.embeddings import EmbeddingPrivacyPolicy, EmbeddingProvider
 from reminder_agent.infrastructure.observability import get_logger, log_event
@@ -107,6 +102,7 @@ def handle_update(
     log_voice_transcript: bool = False,
     application_request: ApplicationRequest | None = None,
     onboarding_request: OnboardingRequest | None = None,
+    completion_callback: Any | None = None,
 ) -> OnboardingReply | None:
     """Apply one Telegram update and return its committed response, if any.
 
@@ -115,101 +111,9 @@ def handle_update(
     and idempotency response remain one transaction.
     """
     if update.callback_query is not None and update.callback_query.message is not None:
-        callback = parse_completion_callback(update, callback_secret=callback_secret)
-        if callback is None:
+        if completion_callback is None:
             return None
-        existing = _existing_record(db, update)
-        if existing is not None:
-            db.rollback()
-            log_event(
-                logger,
-                logging.INFO,
-                "completion_callback_duplicate",
-                update_id=update.update_id,
-                occurrence_id=str(callback.occurrence_id),
-            )
-            return _reply_from_record(existing)
-        identity = authorized_completion_identity(db, callback)
-        if identity is None:
-            log_event(
-                logger,
-                logging.WARNING,
-                "completion_callback_rejected",
-                update_id=update.update_id,
-                occurrence_id=str(callback.occurrence_id),
-                reason="telegram_identity_not_authorized",
-            )
-            return None
-        log_event(
-            logger,
-            logging.DEBUG,
-            "completion_callback_authorized",
-            update_id=update.update_id,
-            occurrence_id=str(callback.occurrence_id),
-            user_id=str(identity.user_id),
-            identity_id=str(identity.id),
-        )
-        result = complete_occurrence(
-            db,
-            user_id=identity.user_id,
-            identity_id=identity.id,
-            chat_id=callback.chat_id,
-            occurrence_id=callback.occurrence_id,
-            provider_message_id=callback.provider_message_id,
-        )
-        log_event(
-            logger,
-            logging.INFO,
-            "completion_callback_service_result",
-            update_id=callback.update_id,
-            occurrence_id=str(result.occurrence_id)
-            if result.occurrence_id
-            else str(callback.occurrence_id),
-            outcome=result.outcome,
-        )
-        reply = _store_result(
-            db,
-            update=update,
-            user_id=identity.user_id,
-            operation="COMPLETE_REMINDER",
-            text=result.text,
-        )
-        try:
-            db.commit()
-        except IntegrityError:
-            db.rollback()
-            duplicate = _existing_record(db, update)
-            if duplicate is not None:
-                log_event(
-                    logger,
-                    logging.INFO,
-                    "completion_callback_duplicate",
-                    update_id=update.update_id,
-                    occurrence_id=str(callback.occurrence_id),
-                    reason="idempotency_race",
-                )
-                return _reply_from_record(duplicate)
-            raise
-        log_event(
-            logger,
-            logging.INFO,
-            "completion_callback_committed",
-            update_id=update.update_id,
-            occurrence_id=str(result.occurrence_id)
-            if result.occurrence_id
-            else str(callback.occurrence_id),
-            outcome=result.outcome,
-        )
-        log_event(
-            logger,
-            logging.INFO,
-            "reminder_occurrence_completed",
-            update_id=update.update_id,
-            occurrence_id=str(result.occurrence_id) if result.occurrence_id else None,
-            outcome=result.outcome,
-            resolution="callback",
-        )
-        return reply
+        return handle_completion_callback(db, update, callback=completion_callback, now=now)
     if update.message is None or update.message.chat.type != "private":
         return None
     action = onboarding_request.action if onboarding_request is not None else None
