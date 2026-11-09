@@ -92,10 +92,19 @@ _COMPLETION = re.compile(
     r"mark\s+(?:the\s+)?(?:reminder|task)\s+(?:as\s+)?complete)\s*[.!?]*\s*$",
     re.IGNORECASE,
 )
+_REMINDER_STATUS_QUESTION = re.compile(
+    r"^\s*will\s+you\s+still\s+remind(?:\s+me)?\b.*[?!.]*\s*$",
+    re.IGNORECASE,
+)
 
 
 def is_completion_command(text: str) -> bool:
     return _COMPLETION.fullmatch(text.strip()) is not None
+
+
+def is_reminder_status_question(text: str) -> bool:
+    """Return whether text asks if a delivered reminder will recur."""
+    return _REMINDER_STATUS_QUESTION.fullmatch(text.strip()) is not None
 
 
 _ACKNOWLEDGEMENTS = {
