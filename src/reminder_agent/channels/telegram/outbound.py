@@ -97,6 +97,31 @@ def edit_text(
     )
 
 
+def remove_inline_keyboard(
+    client: TelegramClient,
+    *,
+    chat_id: int,
+    message_id: int,
+    text: str,
+) -> None:
+    """Remove an inline action keyboard while preserving the message text."""
+
+    if hasattr(client, "edit_message_reply_markup"):
+        client.edit_message_reply_markup(
+            chat_id,
+            message_id,
+            reply_markup={"inline_keyboard": []},
+        )
+    else:  # pragma: no cover - compatibility with older test doubles
+        edit_text(
+            client,
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup={"inline_keyboard": []},
+        )
+
+
 def delete_message(client: TelegramClient, *, chat_id: int, message_id: int) -> None:
     """Delete a Telegram message using the provider adapter."""
 

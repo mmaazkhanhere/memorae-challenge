@@ -107,6 +107,14 @@ class TelegramClient(Protocol):
         reply_markup: dict[str, Any] | None = None,
     ) -> TelegramDeliveryResult | None: ...
 
+    def edit_message_reply_markup(
+        self,
+        chat_id: int,
+        message_id: int,
+        *,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> TelegramDeliveryResult | None: ...
+
     def delete_message(self, chat_id: int, message_id: int) -> None: ...
 
     def get_file_path(self, file_id: str) -> str: ...
@@ -507,6 +515,26 @@ class HttpTelegramClient:
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
         result = self._call_mutation("editMessageText", payload)
+        provider_message_id = result.get("message_id") if isinstance(result, dict) else None
+        return TelegramDeliveryResult(
+            provider_message_id=(
+                str(provider_message_id) if provider_message_id is not None else None
+            )
+        )
+
+    def edit_message_reply_markup(
+        self,
+        chat_id: int,
+        message_id: int,
+        *,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> TelegramDeliveryResult:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reply_markup": reply_markup or {"inline_keyboard": []},
+        }
+        result = self._call_mutation("editMessageReplyMarkup", payload)
         provider_message_id = result.get("message_id") if isinstance(result, dict) else None
         return TelegramDeliveryResult(
             provider_message_id=(
