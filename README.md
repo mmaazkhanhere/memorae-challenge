@@ -50,11 +50,14 @@ phone-number or organization server configuration. Leave the phone number
 without a fixed assistant so the `assistant-request` decision can reject
 unknown callers before a conversation starts. Link the caller's E.164 number
 through Telegram first. The transient assistant exposes server tools for
-reminder creation and memory save/lookup. Each tool accepts only the caller's
+reminder creation and full reminder management (list, move, cancel, complete,
+and snooze), plus memory save/lookup. Each tool accepts only the caller's
 complete utterance and uses the shared deterministic-first application
-pipeline; caller-supplied user IDs, fact IDs, and reminder fields are never
-trusted. Sensitive memory facts are not disclosed over the phone and must be
-checked in the linked Telegram chat.
+pipeline; caller-supplied user IDs, fact IDs, reminder IDs, and reminder
+fields are never trusted. Reminder changes made on a call use the linked
+Telegram destination, and committed results are returned to Vapi before the
+assistant speaks. Unknown or ambiguous requests receive clarification without
+mutation.
 
 Production startup fails fast unless `DATABASE_URL` uses PostgreSQL,
 `TELEGRAM_BOT_TOKEN` is configured, and `TELEGRAM_WEBHOOK_SECRET` is a unique value of at
