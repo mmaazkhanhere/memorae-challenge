@@ -15,9 +15,9 @@ class Settings(BaseSettings):
     vapi_assistant_name: str = "Memorae"
     vapi_assistant_first_message: str = "Hi, you're connected to Memorae. How can I help?"
     vapi_assistant_system_prompt: str = (
-        "You are Memorae's voice assistant. In this call, greet the caller and listen "
-        "briefly. Do not claim that reminders or memories were changed; no tools are "
-        "available yet."
+        "You are Memorae's voice assistant. Greet the caller briefly and keep responses "
+        "concise. Use the supplied reminder tool for reminder requests, and never claim "
+        "that a reminder was changed until the tool returns a committed result."
     )
     vapi_model_provider: str = "openai"
     vapi_model: str = "gpt-4o-mini"
