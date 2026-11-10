@@ -8,7 +8,6 @@ from typing import Any, cast
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -16,6 +15,12 @@ from reminder_agent.application.cancellation_workflow import handle_cancellation
 from reminder_agent.application.contracts import ApplicationRequest
 from reminder_agent.application.conversation import (
     process_authenticated_conversation,
+)
+from reminder_agent.application.conversation.context import (
+    recent_delivered_reminders,
+    recent_messages,
+    recent_selection_context,
+    remember_selection_context,
 )
 from reminder_agent.application.conversations import (
     AWAITING_CLARIFICATION,
@@ -37,7 +42,6 @@ from reminder_agent.application.conversations import (
 from reminder_agent.application.conversations import (
     upsert_clarification_session as _upsert_clarification_session,
 )
-from reminder_agent.application.reminder_listing import stage_list_reminder_response
 from reminder_agent.application.response_staging import (
     ReminderReply,
     _application_request_from_telegram_update,
@@ -88,9 +92,6 @@ from reminder_agent.features.reminders.cancel.decisions import (
 from reminder_agent.features.reminders.cancel.service import (
     dispatch_cancellation,
 )
-from reminder_agent.features.reminders.complete.operations import (
-    resolve_latest_delivered,
-)
 from reminder_agent.features.reminders.complete.service import (
     _handle_completion_follow_up,
     _handle_completion_text,
@@ -101,6 +102,9 @@ from reminder_agent.features.reminders.create.service import (
 )
 from reminder_agent.features.reminders.listing.filters import (
     list_owned_reminders,  # noqa: F401 - adapter compatibility export
+)
+from reminder_agent.features.reminders.listing.service import (
+    list_reminders_from_interpretation,
 )
 from reminder_agent.features.reminders.listing.status import (
     answer_status_question_for_delivery,
@@ -124,7 +128,7 @@ from reminder_agent.features.reminders.snooze.service import (
 from reminder_agent.features.reminders.summary.telegram_adapter import (
     handle_reminder_summary_request,
 )
-from reminder_agent.infrastructure.db.models import ChannelIdentity, IdempotencyRecord, User
+from reminder_agent.infrastructure.db.models import ChannelIdentity, User
 from reminder_agent.infrastructure.embeddings import (
     EmbeddingPrivacyPolicy,
     EmbeddingProvider,
@@ -141,9 +145,6 @@ TELEGRAM = "TELEGRAM"
 LINKED = "LINKED"
 ACTIVE = "ACTIVE"
 logger = get_logger()
-
-_RECENT_SELECTION_CONTEXT: dict[UUID, tuple[dict[str, str], ...]] = {}
-
 
 # Compatibility wrapper; routing implementation lives in features.intent.
 def _route_and_interpret(*args: Any, **kwargs: Any):
@@ -167,84 +168,11 @@ def _route_and_interpret(*args: Any, **kwargs: Any):
     return feature_route_and_interpret(*args, **kwargs)
 
 
-def _recent_messages(db: Session, *, user_id: UUID) -> list[str]:
-    """Build bounded conversation context from durable response records."""
-
-    records = db.scalars(
-        select(IdempotencyRecord)
-        .where(
-            IdempotencyRecord.source == TELEGRAM,
-            IdempotencyRecord.user_id == user_id,
-        )
-        .order_by(IdempotencyRecord.created_at.desc())
-        .limit(34)
-    ).all()
-    messages: list[str] = []
-    for record in reversed(records):
-        if not isinstance(record.response, dict):
-            continue
-        request_text = record.response.get("request_text")
-        response_text = record.response.get("text")
-        if isinstance(request_text, str):
-            messages.append(f"user: {request_text}")
-        if isinstance(response_text, str):
-            messages.append(f"assistant: {response_text}")
-    return messages[-34:]
-
-
-def _recent_selection_context(
-    db: Session, *, user_id: UUID
-) -> tuple[dict[str, str], ...]:
-    """Return the most recent structured reminder list for ordinal references."""
-
-    cached = _RECENT_SELECTION_CONTEXT.get(user_id)
-    if cached:
-        return cached
-
-    records = db.scalars(
-        select(IdempotencyRecord)
-        .where(
-            IdempotencyRecord.source == TELEGRAM,
-            IdempotencyRecord.user_id == user_id,
-        )
-        .order_by(IdempotencyRecord.created_at.desc())
-        .limit(1)
-    ).all()
-    for record in records:
-        if not isinstance(record.response, dict):
-            continue
-        raw_context = record.response.get("selection_context")
-        if not isinstance(raw_context, list):
-            continue
-        context = tuple(
-            item
-            for item in raw_context
-            if isinstance(item, dict)
-            and isinstance(item.get("reminder_id"), str)
-            and isinstance(item.get("task"), str)
-        )
-        if context:
-            return context
-    return ()
-
-
-def _recent_delivered_reminders(
-    db: Session, *, user_id: UUID, identity_id: UUID, chat_id: int
-) -> list[dict[str, str]]:
-    """Build bounded, non-authoritative context for route classification."""
-
-    candidates = resolve_latest_delivered(
-        db, user_id=user_id, identity_id=identity_id, chat_id=chat_id
-    )
-    return [
-        {
-            "task": reminder.task,
-            "delivered_at": notification.sent_at.isoformat()
-            if notification.sent_at is not None
-            else "",
-        }
-        for _occurrence, reminder, notification in candidates
-    ]
+# Legacy imports remain available while context ownership moves to
+# ``conversation.context``.
+_recent_messages = recent_messages
+_recent_selection_context = recent_selection_context
+_recent_delivered_reminders = recent_delivered_reminders
 
 
 def _now_utc(value: datetime) -> datetime:
@@ -667,7 +595,7 @@ def handle_reminder_text(
         db.rollback()
         result = conversation_entry.response
         if result.selection_context:
-            _RECENT_SELECTION_CONTEXT[user.id] = tuple(result.selection_context)
+            remember_selection_context(user.id, tuple(result.selection_context))
         return ReminderReply(update.message.chat.id, result.content, response_kind=result.response_kind)
     assert conversation_entry.route is not None
     deterministic_route = conversation_entry.route
@@ -1354,18 +1282,21 @@ def handle_reminder_text(
                     response_kind=("social" if route is ConversationRoute.SOCIAL else "unrelated"),
                 )
 
-            list_reply = stage_list_reminder_response(
+            list_result = list_reminders_from_interpretation(
                 db,
-                update,
-                user=user,
                 request=normalized_request,
                 interpretation=interpretation,
                 now=now,
             )
-            if list_reply is not None:
-                if list_reply.selection_context:
-                    _RECENT_SELECTION_CONTEXT[user.id] = list_reply.selection_context
-                return list_reply
+            if list_result is not None:
+                if list_result.selection_context:
+                    remember_selection_context(user.id, tuple(list_result.selection_context))
+                return ReminderReply(
+                    chat_id=update.message.chat.id,
+                    text=list_result.content,
+                    response_kind=list_result.response_kind,
+                    selection_context=tuple(list_result.selection_context),
+                )
 
             summary_reply = handle_reminder_summary_request(
                 db,
