@@ -7,7 +7,7 @@ from reminder_agent.features.intent import (
     ListRemindersIntent,
 )
 from reminder_agent.features.reminders.listing.filters import REMINDER_SUMMARY_MESSAGES
-from reminder_agent.infrastructure.db.models import (
+from reminder_agent.infrastructure.database.models import (
     ConversationSession,
     IdempotencyRecord,
     Notification,

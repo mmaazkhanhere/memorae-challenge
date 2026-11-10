@@ -18,7 +18,7 @@ from reminder_agent.features.reminders.cancel.messages import REMINDER_CANCEL_ME
 from reminder_agent.features.reminders.recurrence_service import (
     materialize_active_recurring_reminders,
 )
-from reminder_agent.infrastructure.db.models import (
+from reminder_agent.infrastructure.database.models import (
     ConversationSession,
     IdempotencyRecord,
     Notification,
@@ -26,7 +26,7 @@ from reminder_agent.infrastructure.db.models import (
     ReminderOccurrence,
     ReminderRecurrenceException,
 )
-from reminder_agent.infrastructure.worker import NotificationWorker
+from reminder_agent.infrastructure.runtime.worker import NotificationWorker
 
 
 def post_update(api_client, update):

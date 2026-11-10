@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import func, select
 
 from reminder_agent.features.reminders.snooze import snooze_occurrence
-from reminder_agent.infrastructure.db.models import (
+from reminder_agent.infrastructure.database.models import (
     ChannelIdentity,
     ConversationSession,
     IdempotencyRecord,
@@ -18,7 +18,7 @@ from reminder_agent.infrastructure.db.models import (
     ReminderOccurrence,
     User,
 )
-from reminder_agent.infrastructure.worker import NotificationWorker
+from reminder_agent.infrastructure.runtime.worker import NotificationWorker
 
 HEADERS = {"X-Telegram-Bot-Api-Secret-Token": "test-secret"}
 
@@ -464,7 +464,7 @@ import time
 from datetime import datetime, timezone
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from reminder_agent.infrastructure.worker import NotificationWorker
+from reminder_agent.infrastructure.runtime.worker import NotificationWorker
 
 class FileTelegramClient:
     def send_message(self, chat_id, text, *, reply_markup=None):

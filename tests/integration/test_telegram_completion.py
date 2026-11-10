@@ -11,7 +11,7 @@ from reminder_agent.channels.telegram.callbacks import callback_data
 from reminder_agent.channels.telegram.provider import TelegramUpdate
 from reminder_agent.features.intent import IntentRoute, IntentRouteSuggestion
 from reminder_agent.features.reminders.complete.messages import REMINDER_COMPLETION_MESSAGES
-from reminder_agent.infrastructure.db.models import (
+from reminder_agent.infrastructure.database.models import (
     ChannelIdentity,
     ConversationSession,
     IdempotencyRecord,

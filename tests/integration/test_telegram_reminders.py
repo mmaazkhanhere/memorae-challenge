@@ -9,7 +9,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from reminder_agent.application import conversation_workflow as reminder_service
-from reminder_agent.application.bootstrap import create_app
+from reminder_agent.application.main import create_app
 from reminder_agent.application.conversation_coordinator import (
     handle_reminder_text,
     list_owned_reminders,
@@ -23,8 +23,8 @@ from reminder_agent.features.intent import (
     NeedsClarification,
     PendingReminderFieldUpdate,
 )
-from reminder_agent.features.intent.request_policy import OUT_OF_SCOPE_RESPONSE
-from reminder_agent.infrastructure.db.models import (
+from reminder_agent.features.intent.policy import OUT_OF_SCOPE_RESPONSE
+from reminder_agent.infrastructure.database.models import (
     ChannelIdentity,
     ConversationSession,
     IdempotencyRecord,
@@ -33,7 +33,7 @@ from reminder_agent.infrastructure.db.models import (
     ReminderOccurrence,
     User,
 )
-from reminder_agent.infrastructure.settings import Settings
+from reminder_agent.infrastructure.config.settings import Settings
 
 HEADERS = {"X-Telegram-Bot-Api-Secret-Token": "test-secret"}
 
@@ -769,7 +769,7 @@ def test_intent_timezone_mismatch_is_rejected_without_creating_reminder(
 def test_cross_user_identity_cannot_be_used_for_reminder_creation(
     session_factory, fixed_now, update_factory
 ) -> None:
-    from reminder_agent.infrastructure.db.models import ChannelIdentity, User
+    from reminder_agent.infrastructure.database.models import ChannelIdentity, User
 
     with session_factory.begin() as db:
         first = User(name="Ada", timezone="UTC", onboarding_status="ACTIVE")

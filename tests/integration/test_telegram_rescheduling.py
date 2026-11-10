@@ -17,14 +17,14 @@ from reminder_agent.features.reminders.reschedule.decisions import (
     apply_reschedule,
 )
 from reminder_agent.features.reminders.reschedule.models import RescheduleClarification
-from reminder_agent.infrastructure.db.models import (
+from reminder_agent.infrastructure.database.models import (
     ChannelIdentity,
     ConversationSession,
     Notification,
     Reminder,
     ReminderOccurrence,
 )
-from reminder_agent.infrastructure.worker import NotificationWorker
+from reminder_agent.infrastructure.runtime.worker import NotificationWorker
 
 
 def post_update(api_client, update):
