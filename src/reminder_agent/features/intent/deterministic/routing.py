@@ -1,0 +1,257 @@
+"""Route incoming reminder messages before any deterministic or model parsing."""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from enum import StrEnum
+
+from reminder_agent.features.intent.contracts import PendingReminder
+from reminder_agent.features.reminders.cancel.decisions import is_cancel_command
+from reminder_agent.features.reminders.snooze.operations import is_snooze_command
+from reminder_agent.shared.creation_routing import (
+    ExplicitCreateRoute,
+    explicit_create_route,
+)
+from reminder_agent.shared.memory_text import extract_memory_lookup_query
+
+
+class ConversationRoute(StrEnum):
+    NEW_REQUEST = "NEW_REQUEST"
+    LIST_REQUEST = "LIST_REQUEST"
+    SUMMARY_REQUEST = "SUMMARY_REQUEST"
+    RESCHEDULE_REQUEST = "RESCHEDULE_REQUEST"
+    CANCEL_REQUEST = "CANCEL_REQUEST"
+    COMPLETE_REQUEST = "COMPLETE_REQUEST"
+    SNOOZE_REQUEST = "SNOOZE_REQUEST"
+    SAVE_MEMORY_REQUEST = "SAVE_MEMORY_REQUEST"
+    RETRIEVE_MEMORY_REQUEST = "RETRIEVE_MEMORY_REQUEST"
+    CLARIFICATION_REPLY = "CLARIFICATION_REPLY"
+    CANCELLATION = "CANCELLATION"
+    SOCIAL = "SOCIAL"
+    MODEL_FALLBACK = "MODEL_FALLBACK"
+    UNRELATED = "UNRELATED"
+
+
+@dataclass(frozen=True)
+class RouteDecision:
+    route: ConversationRoute
+
+
+_LIST_REMINDERS = re.compile(
+    r"^\s*(?:can\s+you\s+)?(?:what\s+(?:do\s+i\s+have|are\s+my\s+reminders?|"
+    r"reminders?\s+do\s+i\s+have)|"
+    r"(?:any|do\s+i\s+have|are\s+there)\s+(?:any\s+)?reminders?(?:\s+(?:for|on)\s+\S+)?|"
+    r"what(?:['Ã¢â‚¬â„¢]s|\s+is)\s+(?:my\s+)?reminders?(?:\s+(?:for|on|tomorrow|today))?|"
+    r"(?:list|show)(?:\s+(?:my|me))?\s+(?:all\s+(?:the\s+)?)?(?:recurring\s+)?reminders?)\b",
+    re.IGNORECASE,
+)
+_SCHEDULE_LIST_REQUEST = re.compile(
+    r"^\s*(?:what(?:'s|\s+is)\s+(?:(?:on|in)\s+)?(?:my\s+)?schedule|"
+    r"what\s+is\s+scheduled|anything\s+coming\s+up)\b",
+    re.IGNORECASE,
+)
+_TASK_LIST_REQUEST = re.compile(
+    r"^\s*(?:when\s+(?:are|is)\s+(?:my\s+)?\S+|when\s+do\s+i\s+have\s+to\s+\S+|"
+    r"(?:show|list)\s+(?:my\s+)?\S.+\s+reminders?|"
+    r"(?:do\s+i\s+have|are\s+there)\s+(?:any\s+)?\S.+\s+reminders?)\b",
+    re.IGNORECASE,
+)
+_NEXT_REMINDER_REQUEST = re.compile(
+    r"^\s*what(?:'s|\s+is)\s+(?:my\s+)?(?:next|upcoming)\s+reminders?(?:\s+to\s+do)?\s*[?!.]*\s*$",
+    re.IGNORECASE,
+)
+_SUMMARY_REQUEST = re.compile(
+    r"^\s*(?:(?:how\s+many|what\s+is\s+the\s+number\s+of).*(?:pending|outstanding|unfinished|overdue|completed|done|finished)(?:.*(?:today|this\s+day))?"
+    r"|(?:what|which|show|list).*(?:still\s+have\s+to\s+do|have\s+left|remaining).*(?:today|this\s+day)"
+    r"|(?:what|which|show|list).*(?:today|this\s+day).*(?:still\s+have\s+to\s+do|have\s+left|remaining)"
+    r"|(?:what|which|show|list).*(?:completed|done|finished).*(?:today|this\s+day))\s*[?!.]*\s*$",
+    re.IGNORECASE,
+)
+_CLOCK_WITH_AT = re.compile(
+    r"\bat\s+\d{1,2}(?::\d{2})?\s*(?:a\.m\.|p\.m\.|am|pm)?\b",
+    re.IGNORECASE,
+)
+_BARE_CLOCK = re.compile(
+    r"\s*\d{1,2}(?::\d{2})?\s*(?:a\.m\.|p\.m\.|am|pm)?\s*[,.]?\s*",
+    re.IGNORECASE,
+)
+_DAY = re.compile(
+    r"\b(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    re.IGNORECASE,
+)
+_TASK_CORRECTION = re.compile(
+    r"^\s*(?:change|update|replace)\s+(?:the\s+)?(?:task|reminder|it)\s+"
+    r"(?:to|with)\s+\S+",
+    re.IGNORECASE,
+)
+_CANCELLATIONS = {"cancel", "cancel it", "never mind", "nevermind", "not now"}
+_COMPLETION = re.compile(
+    r"^\s*(?:done(?:\s*,?\s*thanks?)?|completed|finished(?:\s+it)?|"
+    r"mark(?:ed)?\s+(?:it|that)\s+done|"
+    r"mark\s+(?:the\s+)?(?:reminder|task)\s+(?:as\s+)?complete)\s*[.!?]*\s*$",
+    re.IGNORECASE,
+)
+_REMINDER_STATUS_QUESTION = re.compile(
+    r"^\s*will\s+you\s+still\s+remind(?:\s+me)?\b.*[?!.]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def is_completion_command(text: str) -> bool:
+    return _COMPLETION.fullmatch(text.strip()) is not None
+
+
+def is_reminder_status_question(text: str) -> bool:
+    """Return whether text asks if a delivered reminder will recur."""
+    return _REMINDER_STATUS_QUESTION.fullmatch(text.strip()) is not None
+
+
+_ACKNOWLEDGEMENTS = {
+    "yes",
+    "yeah",
+    "okay",
+    "ok",
+    "sure",
+    "no",
+    "nope",
+    "thanks",
+    "thank you",
+}
+_CONFIRMATION_WORDS = {"yes", "yeah", "okay", "ok", "sure", "no", "nope"}
+_GREETINGS = {
+    "hi",
+    "hello",
+    "hey",
+    "good morning",
+    "good afternoon",
+    "good evening",
+}
+_QUESTION = re.compile(
+    r"^(?:what|when|where|who|why|how|can|could|do|does|is|are)\b", re.IGNORECASE
+)
+
+
+def is_new_reminder_command(text: str) -> bool:
+    """Return whether text explicitly starts a separate reminder request."""
+    return explicit_create_route(text) is ExplicitCreateRoute.NEW_REMINDER
+
+
+def is_memory_save_command(text: str) -> bool:
+    """Return whether text explicitly asks to save information."""
+    return explicit_create_route(text) is ExplicitCreateRoute.SAVE_MEMORY
+
+
+def is_memory_lookup_command(text: str) -> bool:
+    """Return whether text is a high-precision saved-fact lookup question."""
+    # Reminder-shaped questions can match the broad "what's my ..." memory
+    # pattern. Keep the semantic boundary explicit for direct callers too.
+    return not is_list_request_command(text) and extract_memory_lookup_query(text) is not None
+
+
+def is_list_request_command(text: str) -> bool:
+    """Return whether text explicitly asks to view reminders or a schedule."""
+    raw = text.strip()
+    return (
+        _LIST_REMINDERS.match(raw) is not None
+        or _SCHEDULE_LIST_REQUEST.match(raw) is not None
+        or _TASK_LIST_REQUEST.match(raw) is not None
+        or _NEXT_REMINDER_REQUEST.match(raw) is not None
+    )
+
+
+def is_summary_request_command(text: str) -> bool:
+    """Return whether text asks for reminder progress/count information."""
+    normalized = text.strip().strip('"“”')
+    return _SUMMARY_REQUEST.fullmatch(normalized) is not None
+
+
+def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecision:
+    """Choose a safe deterministic path or the model fallback.
+
+    This deliberately does not attempt to determine whether free-form text is
+    a reminder.  Apart from short social messages and a bare clock with no
+    pending conversation, that judgment belongs to the model.
+    """
+    raw = text.strip()
+    normalized = re.sub(r"[.!?]+$", "", raw.lower()).strip()
+
+    if is_completion_command(raw):
+        return RouteDecision(ConversationRoute.COMPLETE_REQUEST)
+    if is_snooze_command(raw):
+        return RouteDecision(ConversationRoute.SNOOZE_REQUEST)
+    # Reminder/date wording wins over a broad question-shaped memory lookup.
+    # For example, "What's my reminder for tomorrow?" is a schedule query,
+    # while "What's my gate code?" remains an exact memory lookup.
+    if is_list_request_command(raw):
+        return RouteDecision(ConversationRoute.LIST_REQUEST)
+    if is_memory_lookup_command(raw):
+        return RouteDecision(ConversationRoute.RETRIEVE_MEMORY_REQUEST)
+    creation_route = explicit_create_route(raw)
+    if creation_route is ExplicitCreateRoute.SAVE_MEMORY:
+        return RouteDecision(ConversationRoute.SAVE_MEMORY_REQUEST)
+    if creation_route is ExplicitCreateRoute.NEW_REMINDER:
+        return RouteDecision(ConversationRoute.NEW_REQUEST)
+    if creation_route is ExplicitCreateRoute.MODEL_FALLBACK:
+        return RouteDecision(ConversationRoute.MODEL_FALLBACK)
+
+    # An acknowledgement is conversational only when there is no active
+    # clarification.  With pending context it must be interpreted as an answer
+    # to the outstanding question, or preserve that state and ask again.
+    if pending is None and (normalized in _ACKNOWLEDGEMENTS or normalized in _GREETINGS):
+        return RouteDecision(ConversationRoute.SOCIAL)
+
+    if pending is None:
+        if is_summary_request_command(raw):
+            return RouteDecision(ConversationRoute.SUMMARY_REQUEST)
+        if is_cancel_command(raw):
+            return RouteDecision(ConversationRoute.CANCEL_REQUEST)
+        if _BARE_CLOCK.fullmatch(raw):
+            return RouteDecision(ConversationRoute.UNRELATED)
+        return RouteDecision(ConversationRoute.MODEL_FALLBACK)
+
+    if normalized in _CANCELLATIONS:
+        return RouteDecision(ConversationRoute.CANCELLATION)
+    if is_cancel_command(raw):
+        return RouteDecision(ConversationRoute.CANCEL_REQUEST)
+    if normalized in _CONFIRMATION_WORDS:
+        return RouteDecision(ConversationRoute.CLARIFICATION_REPLY)
+    if normalized in _ACKNOWLEDGEMENTS:
+        return RouteDecision(ConversationRoute.SOCIAL)
+    if is_list_request_command(raw):
+        return RouteDecision(ConversationRoute.LIST_REQUEST)
+    if is_summary_request_command(raw):
+        return RouteDecision(ConversationRoute.SUMMARY_REQUEST)
+    # Only explicit new-reminder commands are classified before considering
+    # the active conversation.  A message containing a date/time may still be
+    # a new reminder, an answer to the pending question, or something else;
+    # preserve context and let the interpreter decide semantically.
+    if _TASK_CORRECTION.match(raw):
+        return RouteDecision(ConversationRoute.CLARIFICATION_REPLY)
+
+    # A follow-up that cannot be verified as a simple field is context-aware
+    # interpretation and therefore belongs to the model.  The service still
+    # permits only explicit, validated field updates from that model response.
+    return RouteDecision(ConversationRoute.MODEL_FALLBACK)
+
+
+def social_response(text: str, *, user_name: str | None = None) -> str:
+    """Return a small, deterministic response without invoking the model."""
+    normalized = re.sub(r"[.!?]+$", "", text.strip().lower()).strip()
+    name = user_name.strip().split(maxsplit=1)[0] if user_name and user_name.strip() else None
+    if normalized in _GREETINGS:
+        greeting = f"Hi {name}!" if name else "Hi!"
+        return f"{greeting} What would you like me to remind you about?"
+    if normalized in _ACKNOWLEDGEMENTS:
+        return "You're welcome."
+    return "I can help create reminders. Tell me what to remember and when."
+
+
+def unrelated_response(text: str, *, pending: PendingReminder | None) -> str:
+    """Return a non-mutating response for text outside the reminder flow."""
+    normalized = re.sub(r"[.!?]+$", "", text.strip().lower()).strip()
+    if normalized in _ACKNOWLEDGEMENTS or normalized in _GREETINGS:
+        return social_response(text)
+    if pending is not None:
+        return "Your unfinished reminder is still saved for when you're ready."
+    return "I didn't find a reminder request in that message."
