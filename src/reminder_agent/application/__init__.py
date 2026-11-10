@@ -43,20 +43,7 @@ from reminder_agent.application.identity.resolve import (
 from reminder_agent.application.identity.resolve import (
     resolve_linked_identity,
 )
-from reminder_agent.application.memory_operations import save_memory_for_request
-from reminder_agent.application.reminder_operations import (
-    cancel_reminder_for_request,
-    complete_reminder_for_request,
-    list_reminders_for_request,
-    reschedule_reminder_for_request,
-    reschedule_reminder_for_user,
-    snooze_reminder_for_request,
-)
-from reminder_agent.application.reminder_read_workflows import (
-    list_reminders_from_interpretation,
-    summarize_reminders_from_interpretation,
-)
-from reminder_agent.application.snooze_workflow import handle_snooze_clarification
+from reminder_agent.features.memory.saving import save_memory_for_request
 from reminder_agent.features.onboarding.phone_linking_service import (
     PhoneLinkDecision,
     process_phone_link,
@@ -68,6 +55,23 @@ from reminder_agent.features.onboarding.request_contracts import (
     classify_onboarding_text,
 )
 from reminder_agent.features.onboarding.service import handle_onboarding_request
+from reminder_agent.features.reminders.cancel.service import cancel_reminder_for_request
+from reminder_agent.features.reminders.listing.service import (
+    list_reminders_for_request,
+    list_reminders_from_interpretation,
+)
+from reminder_agent.features.reminders.reschedule.service import (
+    reschedule_reminder_for_request,
+    reschedule_reminder_for_user,
+)
+from reminder_agent.features.reminders.service import (
+    complete_reminder_for_request,
+    snooze_reminder_for_request,
+)
+from reminder_agent.features.reminders.snooze.service import handle_snooze_clarification
+from reminder_agent.features.reminders.summary.service import (
+    summarize_reminders_from_interpretation,
+)
 
 __all__ = [
     "ApplicationRequest",
