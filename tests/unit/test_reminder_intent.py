@@ -32,7 +32,7 @@ from reminder_agent.features.reminders.reschedule.decisions import (
     RescheduleScope,
 )
 from reminder_agent.features.reminders.reschedule.models import RescheduleClarification
-from reminder_agent.infrastructure.settings import Settings
+from reminder_agent.infrastructure.config.settings import Settings
 from reminder_agent.shared.memory_contracts import SaveMemoryFact
 
 NOW = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)

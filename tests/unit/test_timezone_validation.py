@@ -1,6 +1,9 @@
 import pytest
 
-from reminder_agent.onboarding import InvalidTimezone, validate_timezone
+from reminder_agent.features.onboarding.onboarding_validation import (
+    InvalidTimezone,
+    validate_timezone,
+)
 
 
 def test_valid_iana_timezone_is_accepted() -> None:
