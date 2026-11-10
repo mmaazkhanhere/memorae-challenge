@@ -23,6 +23,7 @@ from reminder_agent.infrastructure.database.models import (
     MemoryFact,
     Notification,
     Reminder,
+    ReminderOccurrence,
     User,
     VoiceCallAuthorization,
 )
@@ -770,5 +771,150 @@ def test_resolver_revalidates_identity_and_expiry(session_factory, fixed_now) ->
             )
             is None
         )
+    finally:
+        db.close()
+
+
+def _seed_voice_reminder(session_factory, *, user_id, telegram_identity_id, fixed_now, task, status="PENDING"):
+    reminder = Reminder(
+        user_id=user_id,
+        task=task,
+        schedule_type="ONE_TIME",
+        start_local="2026-10-31T13:00:00",
+        timezone="UTC",
+        status="ACTIVE",
+    )
+    db = session_factory()
+    try:
+        db.add(reminder)
+        db.flush()
+        occurrence = ReminderOccurrence(
+            reminder_id=reminder.id,
+            scheduled_at=fixed_now + timedelta(days=1),
+            next_due_at=fixed_now + timedelta(days=1),
+            status=status,
+        )
+        db.add(occurrence)
+        db.flush()
+        db.add(
+            Notification(
+                occurrence_id=occurrence.id,
+                destination_identity_id=telegram_identity_id,
+                sequence=1,
+                due_at=occurrence.scheduled_at,
+                status="SENT" if status == "NOTIFIED" else "PENDING",
+                sent_at=occurrence.scheduled_at if status == "NOTIFIED" else None,
+                provider_message_id="voice-provider-message" if status == "NOTIFIED" else None,
+            )
+        )
+        db.commit()
+        return reminder.id, occurrence.id
+    finally:
+        db.close()
+
+
+def test_vapi_lists_and_reschedules_existing_reminders(session_factory, fixed_now) -> None:
+    user, _phone, telegram = _seed_linked_user_with_telegram(session_factory)
+    reminder_id, _ = _seed_voice_reminder(
+        session_factory,
+        user_id=user.id,
+        telegram_identity_id=telegram.id,
+        fixed_now=fixed_now,
+        task="call the bank",
+    )
+    app = create_app(_settings(), session_factory=session_factory, clock=lambda: fixed_now)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    with TestClient(app) as client:
+        client.post("/webhook/vapi", json=_payload(), headers=headers)
+        listed = client.post(
+            "/webhook/vapi",
+            json=_tool_payload(tool_call_id="voice-list-1", utterance="What do I have tomorrow?"),
+            headers=headers,
+        )
+        moved = client.post(
+            "/webhook/vapi",
+            json=_tool_payload(
+                tool_call_id="voice-move-1",
+                utterance="Move the bank one to tomorrow at 14:00",
+            ),
+            headers=headers,
+        )
+    assert "call the bank" in listed.json()["results"][0]["result"]
+    assert "call the bank" in moved.json()["results"][0]["result"]
+    db = session_factory()
+    try:
+        assert db.get(Reminder, reminder_id).status == "ACTIVE"
+        assert db.scalar(select(ReminderOccurrence).where(ReminderOccurrence.reminder_id == reminder_id)).next_due_at.hour == 14
+    finally:
+        db.close()
+
+
+def test_vapi_completes_and_snoozes_the_linked_telegram_delivery(session_factory, fixed_now) -> None:
+    user, _phone, telegram = _seed_linked_user_with_telegram(session_factory)
+    _seed_voice_reminder(
+        session_factory,
+        user_id=user.id,
+        telegram_identity_id=telegram.id,
+        fixed_now=fixed_now,
+        task="take medicine",
+        status="NOTIFIED",
+    )
+    _seed_voice_reminder(
+        session_factory,
+        user_id=user.id,
+        telegram_identity_id=telegram.id,
+        fixed_now=fixed_now,
+        task="send the report",
+        status="NOTIFIED",
+    )
+    app = create_app(_settings(), session_factory=session_factory, clock=lambda: fixed_now)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    with TestClient(app) as client:
+        client.post("/webhook/vapi", json=_payload(), headers=headers)
+        snoozed = client.post(
+            "/webhook/vapi",
+            json=_tool_payload(
+                tool_call_id="voice-snooze-1", utterance="Snooze take medicine for 10 minutes"
+            ),
+            headers=headers,
+        )
+        completed = client.post(
+            "/webhook/vapi",
+            json=_tool_payload(tool_call_id="voice-complete-1", utterance="Done"),
+            headers=headers,
+        )
+    assert "10" in snoozed.json()["results"][0]["result"]
+    assert "report" in completed.json()["results"][0]["result"]
+    db = session_factory()
+    try:
+        occurrence = db.scalar(select(ReminderOccurrence).where(ReminderOccurrence.status == "PENDING"))
+        assert occurrence is not None
+        assert db.scalar(select(func.count()).select_from(Notification).where(Notification.status == "PENDING")) == 1
+    finally:
+        db.close()
+
+
+def test_vapi_cancels_an_existing_reminder(session_factory, fixed_now) -> None:
+    user, _phone, telegram = _seed_linked_user_with_telegram(session_factory)
+    reminder_id, _ = _seed_voice_reminder(
+        session_factory,
+        user_id=user.id,
+        telegram_identity_id=telegram.id,
+        fixed_now=fixed_now,
+        task="attend the standup",
+    )
+    app = create_app(_settings(), session_factory=session_factory, clock=lambda: fixed_now)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    with TestClient(app) as client:
+        client.post("/webhook/vapi", json=_payload(), headers=headers)
+        response = client.post(
+            "/webhook/vapi",
+            json=_tool_payload(tool_call_id="voice-cancel-1", utterance="Cancel the standup"),
+            headers=headers,
+        )
+    assert "standup" in response.json()["results"][0]["result"]
+    db = session_factory()
+    try:
+        assert db.get(Reminder, reminder_id).status == "CANCELED"
     finally:
         db.close()
