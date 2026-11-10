@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable, Mapping
 from datetime import datetime
 from typing import Protocol, TypeVar
@@ -22,17 +23,100 @@ from reminder_agent.application.conversations import (
     load_session,
     pending_memory_from_session,
 )
-from reminder_agent.features.memory.create.service import save_memory_for_request
-from reminder_agent.features.memory.create.messages import memory_message
-from reminder_agent.features.memory.create.validation import validated_memory_content
-from reminder_agent.features.memory.service import index_memory_fact_for_owner
+from reminder_agent.application.identity.context import ACTIVE, authorized_user_for_request
+from reminder_agent.features.memory.messages import save_memory_message
+from reminder_agent.features.memory.persistence import index_memory_fact_for_owner, save_memory_fact
+from reminder_agent.features.memory.validation import is_memory_content_grounded
 from reminder_agent.infrastructure.embeddings import EmbeddingPrivacyPolicy, EmbeddingProvider
 from reminder_agent.infrastructure.observability import get_logger, log_event
-from reminder_agent.shared.memory_contracts import PendingMemory
+from reminder_agent.shared.memory_contracts import PendingMemory, SaveMemoryFact
+from reminder_agent.shared.memory_text import extract_memory_content
 
 ResponseT_co = TypeVar("ResponseT_co", covariant=True)
 logger = get_logger()
 DEFAULT_EMBEDDING_PRIVACY_POLICY = EmbeddingPrivacyPolicy()
+
+_INCOMPLETE_FACT_PHRASE = re.compile(
+    r"^\s*(?:my|the|our|your)\s+"
+    r"(?:[\w'-]+\s+){0,6}"
+    r"(?:number|code|password|passcode|pin|email|e-mail|address|phone|"
+    r"phone\s+number|name|birthday|birth\s+date|favorite\s+food|"
+    r"favourite\s+food|favorite\s+color|favourite\s+colour|parking\s+slot|"
+    r"locker\s+number)\s*[?.!]*\s*$",
+    re.IGNORECASE,
+)
+_INCOMPLETE_FACT_CLAUSE = re.compile(r"(?:\bis\b|\bare\b|\bequals\b|[:=])\s*[?.!]*$", re.IGNORECASE)
+
+
+def save_memory_for_request(
+    db: Session,
+    *,
+    request: ApplicationRequest,
+    command: SaveMemoryCommand,
+    now: datetime,
+) -> ApplicationResult:
+    """Stage one authorized, owner-scoped memory fact without committing."""
+
+    if request.idempotency_key is None:
+        return ApplicationResult(
+            content=save_memory_message("idempotency_error"),
+            response_kind="IDEMPOTENCY_KEY_REQUIRED",
+        )
+    user = authorized_user_for_request(db, request=request)
+    if user is None or user.onboarding_status != ACTIVE:
+        return ApplicationResult(
+            content=save_memory_message("authorization_failed"),
+            response_kind="AUTHORIZATION_FAILURE",
+        )
+    saved = save_memory_fact(db, user_id=user.id, content=command.content, now=now)
+    return ApplicationResult(
+        content=save_memory_message("confirmation", fact=command.content),
+        response_kind="MEMORY_CONFIRMATION",
+        resource_id=saved.fact_id,
+    )
+
+
+def _is_incomplete_fact_phrase(content: str) -> bool:
+    """Reject a subject-only fact such as ``my locker number``."""
+
+    normalized = content.strip(" .!?\t")
+    tokens = re.findall(r"[^\W_]+", normalized, flags=re.UNICODE)
+    if (
+        len(tokens) <= 3
+        and tokens
+        and tokens[0].casefold() in {"my", "the", "our", "your"}
+        and not any(char.isdigit() for char in normalized)
+        and not re.search(r"\b(?:is|are|equals)\b|[:=]", normalized, re.IGNORECASE)
+        and "@" not in normalized
+    ):
+        return True
+    return (
+        _INCOMPLETE_FACT_PHRASE.fullmatch(content) is not None
+        or _INCOMPLETE_FACT_CLAUSE.search(content) is not None
+    )
+
+
+def validated_memory_content(
+    *,
+    text: str,
+    pending: PendingMemory | None,
+    model_content: str | None,
+    from_model: bool,
+) -> str | None:
+    """Return validated, grounded content or require a non-mutating clarification."""
+
+    content = model_content if from_model else (extract_memory_content(text) if pending is None else text.strip())
+    if content is None:
+        return None
+    try:
+        content = SaveMemoryFact(content=content).content
+    except (TypeError, ValueError):
+        return None
+    if _is_incomplete_fact_phrase(content):
+        return None
+    if from_model and not is_memory_content_grounded(text, content):
+        return None
+    return content
 
 
 class MemoryWorkflowResponses(Protocol[ResponseT_co]):
@@ -84,7 +168,7 @@ def _clarification_response[ResponseT_co](
         if pending is not None and pending_memory_from_session(locked_session) is None:
             return responses.stage(
                 user_id=user_id,
-                text=memory_message("memory_clarification_expired"),
+                text=save_memory_message("clarification_expired"),
                 response_kind="memory_clarification_expired",
                 operation="SAVE_MEMORY",
             )
@@ -98,7 +182,7 @@ def _clarification_response[ResponseT_co](
         )
         return responses.stage(
             user_id=user_id,
-            text=clarification_text or memory_message("memory_clarification"),
+            text=clarification_text or save_memory_message("clarification"),
             response_kind="memory_clarification",
             operation="SAVE_MEMORY",
         )
@@ -145,7 +229,7 @@ def _save_transaction[ResponseT_co](
             return (
                 responses.stage(
                     user_id=user_id,
-                    text=memory_message("memory_clarification_expired"),
+                    text=save_memory_message("clarification_expired"),
                     response_kind="memory_clarification_expired",
                     operation="SAVE_MEMORY",
                 ),
@@ -228,7 +312,7 @@ def _failed_save_response[ResponseT_co](
     if exception is not None:
         context["reason_type"] = type(exception).__name__
     log_event_fn(logger, logging.ERROR, "memory_fact_save_failed", **context)
-    return responses.direct(memory_message("memory_save_failed"))
+    return responses.direct(save_memory_message("save_failed"))
 
 
 def run_memory_save_workflow[ResponseT_co](

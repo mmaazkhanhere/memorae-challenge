@@ -16,18 +16,18 @@ from reminder_agent.application.conversations import (
     load_session,
     pending_memory_lookup_from_session,
 )
+from reminder_agent.features.memory.messages import lookup_memory_message
 from reminder_agent.features.memory.retrieve.answering import (
     MemoryAnswerer,
     MemoryAnswerProposal,
     memory_answer_preserves_exact_values,
 )
-from reminder_agent.features.memory.retrieve.domain import (
+from reminder_agent.features.memory.retrieve.contracts import (
     MemoryLookupResult,
     MemoryRetrievalPolicy,
     is_memory_lookup_query_grounded,
 )
-from reminder_agent.features.memory.retrieve.messages import retrieval_message
-from reminder_agent.features.memory.retrieve.service import (
+from reminder_agent.features.memory.retrieve.persistence import (
     lookup_memory_fact,
     revalidate_owned_memory_candidates,
 )
@@ -105,7 +105,7 @@ def run_memory_lookup_workflow[ResponseT_co](
             reason="missing_or_ungrounded_query",
             from_model=from_model,
         )
-        return responses.direct(retrieval_message("missing_subject"))
+        return responses.direct(lookup_memory_message("missing_subject"))
 
     db.rollback()
     try:
@@ -119,7 +119,7 @@ def run_memory_lookup_workflow[ResponseT_co](
                 or locked_user.id != user_id
                 or locked_user.onboarding_status != "ACTIVE"
             ):
-                return responses.direct(retrieval_message("authorization_failed"))
+                return responses.direct(lookup_memory_message("authorization_failed"))
 
             result = lookup_memory_operation(
                 db,
@@ -266,7 +266,7 @@ def run_memory_lookup_workflow[ResponseT_co](
                     ):
                         end_session(session, now=now)
                 reply = responses.direct(
-                    answer_text or retrieval_message("fact_found", fact=result.fact.content)
+                    answer_text or lookup_memory_message("fact_found", fact=result.fact.content)
                 )
                 log_event_fn(
                     logger,
@@ -291,7 +291,7 @@ def run_memory_lookup_workflow[ResponseT_co](
                     channel_type=channel_type,
                 )
                 reply = responses.direct(
-                    answer_text or retrieval_message("ambiguous_matches")
+                    answer_text or lookup_memory_message("ambiguous_matches")
                 )
                 log_event_fn(
                     logger,
@@ -314,7 +314,7 @@ def run_memory_lookup_workflow[ResponseT_co](
                 )
                 if session is not None and pending_memory_lookup_from_session(session) is not None:
                     end_session(session, now=now)
-            reply = responses.direct(retrieval_message("unknown_fact"))
+            reply = responses.direct(lookup_memory_message("unknown_fact"))
             log_event_fn(
                 logger,
                 logging.INFO,
@@ -333,7 +333,7 @@ def run_memory_lookup_workflow[ResponseT_co](
             **event_context,
             reason="database_error",
         )
-        return responses.direct(retrieval_message("retrieval_failed"))
+        return responses.direct(lookup_memory_message("retrieval_failed"))
 
 
 __all__ = [

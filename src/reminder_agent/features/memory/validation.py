@@ -1,33 +1,11 @@
-"""Compatibility façade for shared memory domain contracts.
-
-Retrieval-specific contracts and policies live in ``memory.retrieve.domain``;
-creation-specific grounding remains here because it is shared by the create
-workflow and deterministic intent routing.
-"""
+"""Pure validation for memory save intent and model-proposed content."""
 
 from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass
-from datetime import datetime
-from uuid import UUID
 
-from reminder_agent.features.memory.retrieve.domain import (
-    DEFAULT_MEMORY_RETRIEVAL_POLICY,
-    MemoryLookupResult,
-    MemoryRetrievalPolicy,
-    cosine_similarity,
-    is_memory_lookup_query_grounded,
-)
 from reminder_agent.shared.memory_contracts import MemoryIntentEvidence
-
-
-@dataclass(frozen=True)
-class SavedMemory:
-    fact_id: UUID
-    saved_at: datetime
-    embedding_status: str
 
 
 def is_memory_intent_evidence_grounded(
@@ -60,15 +38,3 @@ def is_memory_content_grounded(source: str, content: str) -> bool:
         if len(token) > 2
     }
     return bool(source_tokens & content_tokens)
-
-
-__all__ = [
-    "DEFAULT_MEMORY_RETRIEVAL_POLICY",
-    "MemoryLookupResult",
-    "MemoryRetrievalPolicy",
-    "SavedMemory",
-    "cosine_similarity",
-    "is_memory_content_grounded",
-    "is_memory_intent_evidence_grounded",
-    "is_memory_lookup_query_grounded",
-]

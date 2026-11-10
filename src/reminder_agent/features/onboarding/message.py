@@ -12,7 +12,7 @@ from reminder_agent.features.intent.contracts import IntentInterpreter
 from reminder_agent.features.intent.model.router import IntentRouter
 from reminder_agent.features.intent.pipeline import ReminderIntentInterpreter
 from reminder_agent.features.memory.retrieve.answering import MemoryAnswerer
-from reminder_agent.features.memory.retrieve.domain import MemoryRetrievalPolicy
+from reminder_agent.features.memory.retrieve.contracts import MemoryRetrievalPolicy
 from reminder_agent.features.onboarding import message_templates as messages
 from reminder_agent.features.onboarding.onboarding_validation import (
     InvalidTimezone,

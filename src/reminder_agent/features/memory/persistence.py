@@ -1,12 +1,8 @@
-"""Shared memory persistence and compatibility exports.
-
-Memory retrieval implementations live in ``memory.retrieve.service``.  This
-module retains the save/index/update persistence API and legacy imports used by
-older callers.
-"""
+"""Owner-scoped memory fact persistence and embedding lifecycle operations."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 from uuid import UUID
@@ -14,26 +10,6 @@ from uuid import UUID
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from reminder_agent.features.memory.memory_domain import (
-    SavedMemory,
-    is_memory_content_grounded,  # noqa: F401 - compatibility export
-    is_memory_intent_evidence_grounded,  # noqa: F401 - compatibility export
-)
-from reminder_agent.features.memory.retrieve.answering import (
-    MemoryAnswerer,  # noqa: F401 - compatibility export
-    MemoryAnswerProposal,  # noqa: F401 - compatibility export
-    memory_answer_preserves_exact_values,  # noqa: F401 - compatibility export
-)
-from reminder_agent.features.memory.retrieve.domain import (
-    DEFAULT_MEMORY_RETRIEVAL_POLICY,  # noqa: F401 - compatibility export
-    MemoryLookupResult,  # noqa: F401 - compatibility export
-    MemoryRetrievalPolicy,  # noqa: F401 - compatibility export
-    is_memory_lookup_query_grounded,  # noqa: F401 - compatibility export
-)
-from reminder_agent.features.memory.retrieve.service import (
-    lookup_memory_fact,  # noqa: F401 - compatibility export
-    revalidate_owned_memory_candidates,  # noqa: F401 - compatibility export
-)
 from reminder_agent.infrastructure.db.models import MEMORY_EMBEDDING_DIMENSIONS, MemoryFact
 from reminder_agent.infrastructure.embeddings import (
     EmbeddingPrivacyPolicy,
@@ -43,20 +19,18 @@ from reminder_agent.infrastructure.embeddings import (
     embed_document,
     validate_embedding,
 )
-from reminder_agent.shared.memory_contracts import (
-    MemoryIntentEvidence,  # noqa: F401 - compatibility export
-    PendingMemory,  # noqa: F401 - compatibility export
-    PendingMemoryLookup,  # noqa: F401 - compatibility export
-    RetrieveMemoryQuery,  # noqa: F401 - compatibility export
-    SaveMemoryFact,
-)
-from reminder_agent.shared.memory_text import (
-    extract_memory_content,  # noqa: F401 - compatibility export
-    extract_memory_lookup_query,  # noqa: F401 - compatibility export
-    is_memory_save_command,  # noqa: F401 - compatibility export
-)
+from reminder_agent.shared.memory_contracts import SaveMemoryFact
 
 DEFAULT_EMBEDDING_PRIVACY_POLICY = EmbeddingPrivacyPolicy()
+
+
+@dataclass(frozen=True)
+class SavedMemory:
+    """Identity and indexing state of a newly persisted memory fact."""
+
+    fact_id: UUID
+    saved_at: datetime
+    embedding_status: str
 
 
 def save_memory_fact(

@@ -8,7 +8,7 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from reminder_agent.features.memory.retrieve.domain import (
+from reminder_agent.features.memory.retrieve.contracts import (
     DEFAULT_MEMORY_RETRIEVAL_POLICY,
     MemoryLookupResult,
     MemoryRetrievalPolicy,

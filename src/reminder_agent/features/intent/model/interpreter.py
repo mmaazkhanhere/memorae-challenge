@@ -31,8 +31,7 @@ from reminder_agent.features.intent.model.response import (
     interpret_response,
 )
 from reminder_agent.features.intent.pending import reminder_creation as _pending_reminders
-from reminder_agent.features.memory.create.messages import memory_message
-from reminder_agent.features.memory.retrieve.messages import retrieval_message
+from reminder_agent.features.memory.messages import lookup_memory_message, save_memory_message
 from reminder_agent.infrastructure.llm import (
     OpenAICompatibleLLMClient,
     StructuredIntentProvider,
@@ -251,12 +250,12 @@ class OpenAICompatibleIntentInterpreter:
             )
             if route is IntentRoute.SAVE_MEMORY:
                 return Interpretation(
-                    response_text=memory_message("memory_clarification"),
+                    response_text=save_memory_message("clarification"),
                     fallback_allowed=False,
                 )
             if route is IntentRoute.RETRIEVE_MEMORY:
                 return Interpretation(
-                    response_text=retrieval_message("missing_subject"),
+                    response_text=lookup_memory_message("missing_subject"),
                     fallback_allowed=False,
                 )
             return Interpretation(
@@ -275,12 +274,12 @@ class OpenAICompatibleIntentInterpreter:
             )
             if route is IntentRoute.SAVE_MEMORY:
                 return Interpretation(
-                    response_text=memory_message("memory_clarification"),
+                    response_text=save_memory_message("clarification"),
                     fallback_allowed=False,
                 )
             if route is IntentRoute.RETRIEVE_MEMORY:
                 return Interpretation(
-                    response_text=retrieval_message("missing_subject"),
+                    response_text=lookup_memory_message("missing_subject"),
                     fallback_allowed=False,
                 )
             return Interpretation(

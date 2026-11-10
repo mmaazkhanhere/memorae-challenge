@@ -25,8 +25,8 @@ from reminder_agent.features.intent import (
 )
 from reminder_agent.features.intent.deterministic.routing import ConversationRoute
 from reminder_agent.features.intent.policy import OUT_OF_SCOPE_RESPONSE
-from reminder_agent.features.memory.retrieve.contract import MemoryAnswerProposal
-from reminder_agent.features.memory.retrieve.messages import MEMORY_RETRIEVAL_MESSAGES
+from reminder_agent.features.memory.messages import MEMORY_LOOKUP_MESSAGES
+from reminder_agent.features.memory.retrieve.contracts import MemoryAnswerProposal
 from reminder_agent.features.reminders.reschedule.decisions import (
     RescheduleRequest,
     RescheduleScope,
@@ -522,7 +522,7 @@ def test_malformed_memory_lookup_extraction_is_clarification_only(
     )
 
     assert result.memory_query is None
-    assert result.response_text in MEMORY_RETRIEVAL_MESSAGES["missing_subject"]
+    assert result.response_text in MEMORY_LOOKUP_MESSAGES["missing_subject"]
 
 
 def test_memory_classifier_and_extractor_logs_redact_fact_content(monkeypatch) -> None:

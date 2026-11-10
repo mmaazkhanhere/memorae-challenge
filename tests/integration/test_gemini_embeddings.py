@@ -5,8 +5,8 @@ import httpx
 import pytest
 
 from reminder_agent.features.intent import OpenAICompatibleMemoryAnswerer
-from reminder_agent.features.memory.retrieve.service import lookup_memory_fact
-from reminder_agent.features.memory.service import save_memory_fact
+from reminder_agent.features.memory.persistence import save_memory_fact
+from reminder_agent.features.memory.retrieve.persistence import lookup_memory_fact
 from reminder_agent.infrastructure.db.models import User
 from reminder_agent.infrastructure.embeddings import (
     EmbeddingProviderError,

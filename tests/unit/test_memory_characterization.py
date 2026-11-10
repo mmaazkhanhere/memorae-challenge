@@ -5,20 +5,19 @@ from uuid import uuid4
 
 import pytest
 
-from reminder_agent.features.memory import memory_domain
-from reminder_agent.features.memory import service as memories
+from reminder_agent.features.memory.persistence import SavedMemory
 from reminder_agent.features.memory.retrieve import answering as memory_answering
-from reminder_agent.features.memory.retrieve import contract as memory_answer_contract
-from reminder_agent.features.memory.retrieve import domain as retrieve_domain
-from reminder_agent.features.memory.service import (
+from reminder_agent.features.memory.retrieve import contracts as retrieval_contracts
+from reminder_agent.features.memory.retrieve.contracts import (
     MemoryAnswerProposal,
     MemoryLookupResult,
     MemoryRetrievalPolicy,
-    SavedMemory,
-    is_memory_content_grounded,
-    is_memory_intent_evidence_grounded,
     is_memory_lookup_query_grounded,
     memory_answer_preserves_exact_values,
+)
+from reminder_agent.features.memory.validation import (
+    is_memory_content_grounded,
+    is_memory_intent_evidence_grounded,
 )
 from reminder_agent.shared.memory_contracts import MemoryIntentEvidence
 
@@ -87,13 +86,11 @@ def test_memory_answer_contract_preserves_exact_values() -> None:
     )
 
 
-def test_memory_retrieval_exports_preserve_canonical_identity() -> None:
-    assert memories.MemoryLookupResult is retrieve_domain.MemoryLookupResult
-    assert memories.MemoryRetrievalPolicy is retrieve_domain.MemoryRetrievalPolicy
-    assert memories.SavedMemory is memory_domain.SavedMemory
-    assert memories.MemoryAnswerProposal is memory_answer_contract.MemoryAnswerProposal
-    assert memory_answering.MemoryAnswerProposal is memory_answer_contract.MemoryAnswerProposal
+def test_memory_retrieval_modules_preserve_canonical_identity() -> None:
+    assert retrieval_contracts.MemoryLookupResult is MemoryLookupResult
+    assert retrieval_contracts.MemoryRetrievalPolicy is MemoryRetrievalPolicy
+    assert memory_answering.MemoryAnswerProposal is MemoryAnswerProposal
     assert (
-        memories.memory_answer_preserves_exact_values
-        is memory_answer_contract.memory_answer_preserves_exact_values
+        memory_answering.memory_answer_preserves_exact_values
+        is memory_answer_preserves_exact_values
     )

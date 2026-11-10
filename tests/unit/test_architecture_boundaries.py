@@ -50,23 +50,23 @@ FEATURE_INFRASTRUCTURE_ALLOWLIST = {
     ("reminder_agent.features.intent.routing", "reminder_agent.infrastructure.observability"),
     ("reminder_agent.features.intent.model.interpreter", "reminder_agent.infrastructure.llm"),
     ("reminder_agent.features.intent.model.interpreter", "reminder_agent.infrastructure.observability"),
-    ("reminder_agent.features.memory.service", "reminder_agent.infrastructure.db.models"),
-    ("reminder_agent.features.memory.service", "reminder_agent.infrastructure.embeddings"),
-    ("reminder_agent.features.memory.service", "reminder_agent.infrastructure.observability"),
-    ("reminder_agent.features.memory.create.workflow", "reminder_agent.infrastructure.embeddings"),
-    ("reminder_agent.features.memory.create.workflow", "reminder_agent.infrastructure.observability"),
+    ("reminder_agent.features.memory.persistence", "reminder_agent.infrastructure.db.models"),
+    ("reminder_agent.features.memory.persistence", "reminder_agent.infrastructure.embeddings"),
+    ("reminder_agent.features.memory.persistence", "reminder_agent.infrastructure.observability"),
+    ("reminder_agent.features.memory.saving", "reminder_agent.infrastructure.embeddings"),
+    ("reminder_agent.features.memory.saving", "reminder_agent.infrastructure.observability"),
     ("reminder_agent.features.memory.retrieve.answering", "reminder_agent.infrastructure.llm"),
     ("reminder_agent.features.memory.retrieve.answering", "reminder_agent.infrastructure.observability"),
-    ("reminder_agent.features.memory.retrieve.service", "reminder_agent.infrastructure.db.models"),
-    ("reminder_agent.features.memory.retrieve.service", "reminder_agent.infrastructure.embeddings"),
-    ("reminder_agent.features.memory.retrieve.service", "reminder_agent.infrastructure.observability"),
+    ("reminder_agent.features.memory.retrieve.persistence", "reminder_agent.infrastructure.db.models"),
+    ("reminder_agent.features.memory.retrieve.persistence", "reminder_agent.infrastructure.embeddings"),
+    ("reminder_agent.features.memory.retrieve.persistence", "reminder_agent.infrastructure.observability"),
     ("reminder_agent.features.memory.retrieve.workflow", "reminder_agent.infrastructure.db.models"),
     ("reminder_agent.features.memory.retrieve.workflow", "reminder_agent.infrastructure.embeddings"),
     ("reminder_agent.features.memory.retrieve.workflow", "reminder_agent.infrastructure.observability"),
-    ("reminder_agent.features.memory.memory_backfill", "reminder_agent.infrastructure.db.session"),
-    ("reminder_agent.features.memory.memory_backfill", "reminder_agent.infrastructure.embeddings"),
-    ("reminder_agent.features.memory.memory_backfill", "reminder_agent.infrastructure.observability"),
-    ("reminder_agent.features.memory.memory_backfill", "reminder_agent.infrastructure.settings"),
+    ("reminder_agent.features.memory.backfill", "reminder_agent.infrastructure.db.session"),
+    ("reminder_agent.features.memory.backfill", "reminder_agent.infrastructure.embeddings"),
+    ("reminder_agent.features.memory.backfill", "reminder_agent.infrastructure.observability"),
+    ("reminder_agent.features.memory.backfill", "reminder_agent.infrastructure.settings"),
     ("reminder_agent.features.memory.adapters", "reminder_agent.infrastructure.db.models"),
     ("reminder_agent.features.memory.adapters", "reminder_agent.infrastructure.embeddings"),
     ("reminder_agent.features.memory.adapters", "reminder_agent.infrastructure.observability"),
@@ -116,10 +116,9 @@ FEATURE_INFRASTRUCTURE_ALLOWLIST = {
 MEMORY_ADAPTER_APPLICATION_ALLOWLIST = {
     ("reminder_agent.features.memory.adapters", "reminder_agent.application.conversations"),
     ("reminder_agent.features.memory.adapters", "reminder_agent.application.response_staging"),
-    ("reminder_agent.features.memory.create.service", "reminder_agent.application.contracts"),
-    ("reminder_agent.features.memory.create.service", "reminder_agent.application.identity.context"),
-    ("reminder_agent.features.memory.create.workflow", "reminder_agent.application.contracts"),
-    ("reminder_agent.features.memory.create.workflow", "reminder_agent.application.conversations"),
+    ("reminder_agent.features.memory.saving", "reminder_agent.application.contracts"),
+    ("reminder_agent.features.memory.saving", "reminder_agent.application.identity.context"),
+    ("reminder_agent.features.memory.saving", "reminder_agent.application.conversations"),
     ("reminder_agent.features.memory.retrieve.workflow", "reminder_agent.application.conversations"),
 }
 
@@ -144,6 +143,11 @@ FEATURE_DEPENDENCY_RULES = {
         "reminder_agent.features.memory",
         "reminder_agent.channels",
     ),
+}
+FEATURE_DEPENDENCY_ALLOWLIST = {
+    # Intent formats validated memory prompts but must not own their text.
+    ("reminder_agent.features.intent.deterministic.interpreter", "reminder_agent.features.memory.messages"),
+    ("reminder_agent.features.intent.model.interpreter", "reminder_agent.features.memory.messages"),
 }
 LEGACY_MODULE_PREFIXES = (
     "reminder_agent.api",
@@ -380,7 +384,10 @@ def test_feature_dependencies_do_not_cross_private_boundaries() -> None:
             continue
         forbidden = FEATURE_DEPENDENCY_RULES[owner]
         for imported in _imported_modules(ast.parse(path.read_text(encoding="utf-8-sig"))):
-            if _is_prefixed(imported, forbidden):
+            if (
+                _is_prefixed(imported, forbidden)
+                and (module, imported) not in FEATURE_DEPENDENCY_ALLOWLIST
+            ):
                 violations.append(f"{path.relative_to(REPOSITORY_ROOT)} -> {imported}")
     assert violations == [], "feature dependency violations:\n" + "\n".join(violations)
 

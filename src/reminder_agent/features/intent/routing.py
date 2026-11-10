@@ -26,8 +26,8 @@ from reminder_agent.features.intent.pending.reminder_creation import (
     restrict_to_explicit_field_updates,
 )
 from reminder_agent.features.intent.policy import OUT_OF_SCOPE_RESPONSE
-from reminder_agent.features.memory.create.messages import memory_message
-from reminder_agent.features.memory.memory_domain import is_memory_intent_evidence_grounded
+from reminder_agent.features.memory.messages import save_memory_message
+from reminder_agent.features.memory.validation import is_memory_intent_evidence_grounded
 from reminder_agent.infrastructure.observability import get_logger, log_event
 
 logger = get_logger()
@@ -211,7 +211,7 @@ def route_and_interpret(
         )
         if not grounded:
             return ConversationRoute.UNRELATED, Interpretation(
-                response_text=memory_message("memory_clarification"),
+                response_text=save_memory_message("clarification"),
                 fallback_allowed=False,
             )
         interpretation = interpret_for_route(

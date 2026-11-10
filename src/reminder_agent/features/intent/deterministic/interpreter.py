@@ -88,7 +88,7 @@ from reminder_agent.features.intent.deterministic.support import (
 from reminder_agent.features.intent.pending.reminder_creation import (
     PendingIntentMixin as _PendingIntentMixin,
 )
-from reminder_agent.features.memory.create.messages import memory_message
+from reminder_agent.features.memory.messages import save_memory_message
 from reminder_agent.infrastructure.observability import get_logger, log_event
 from reminder_agent.shared.creation_routing import (
     REMINDER_COMMAND_PREFIX,
@@ -194,7 +194,7 @@ class RuleBasedIntentInterpreter(
             content = extract_memory_content(raw)
             if content is None:
                 return Interpretation(
-                    response_text=memory_message("memory_clarification"),
+                    response_text=save_memory_message("clarification"),
                     fallback_allowed=True,
                 )
             return Interpretation(

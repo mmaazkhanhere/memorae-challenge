@@ -5,26 +5,32 @@ import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
-from reminder_agent.features.memory.service import (
-    MemoryAnswerProposal,
-    MemoryIntentEvidence,
-    MemoryRetrievalPolicy,
-    PendingMemory,
-    RetrieveMemoryQuery,
-    SaveMemoryFact,
+from reminder_agent.features.memory.persistence import (
     backfill_memory_embeddings,
-    extract_memory_content,
-    extract_memory_lookup_query,
-    is_memory_intent_evidence_grounded,
-    is_memory_lookup_query_grounded,
-    is_memory_save_command,
-    lookup_memory_fact,
-    memory_answer_preserves_exact_values,
     save_memory_fact,
     update_memory_fact_content,
 )
+from reminder_agent.features.memory.retrieve.contracts import (
+    MemoryAnswerProposal,
+    MemoryRetrievalPolicy,
+    is_memory_lookup_query_grounded,
+    memory_answer_preserves_exact_values,
+)
+from reminder_agent.features.memory.retrieve.persistence import lookup_memory_fact
+from reminder_agent.features.memory.validation import is_memory_intent_evidence_grounded
 from reminder_agent.infrastructure.db.models import Base, MemoryFact
 from reminder_agent.infrastructure.embeddings import EmbeddingProviderError
+from reminder_agent.shared.memory_contracts import (
+    MemoryIntentEvidence,
+    PendingMemory,
+    RetrieveMemoryQuery,
+    SaveMemoryFact,
+)
+from reminder_agent.shared.memory_text import (
+    extract_memory_content,
+    extract_memory_lookup_query,
+    is_memory_save_command,
+)
 
 
 def _vector(*coordinates: float) -> list[float]:

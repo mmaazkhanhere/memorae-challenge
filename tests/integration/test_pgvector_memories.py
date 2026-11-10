@@ -4,8 +4,8 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import func, select
 
-from reminder_agent.features.memory.retrieve.service import lookup_memory_fact
-from reminder_agent.features.memory.service import save_memory_fact
+from reminder_agent.features.memory.persistence import save_memory_fact
+from reminder_agent.features.memory.retrieve.persistence import lookup_memory_fact
 from reminder_agent.infrastructure.db.models import (
     MemoryFact,
     Notification,

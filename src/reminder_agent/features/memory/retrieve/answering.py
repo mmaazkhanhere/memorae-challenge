@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 import httpx
 from pydantic import ValidationError
 
-from reminder_agent.features.memory.retrieve.contract import (
+from reminder_agent.features.memory.retrieve.contracts import (
     MemoryAnswerProposal,
     memory_answer_preserves_exact_values,
 )

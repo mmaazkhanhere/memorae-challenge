@@ -10,8 +10,7 @@ from reminder_agent.application import (
     RequestSource,
     VerifiedChannelIdentity,
 )
-from reminder_agent.features.memory.create.workflow import run_memory_save_workflow
-from reminder_agent.features.memory.create.validation import validated_memory_content
+from reminder_agent.features.memory.saving import run_memory_save_workflow, validated_memory_content
 
 
 class _Responses:
