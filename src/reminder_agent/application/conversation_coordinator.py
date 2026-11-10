@@ -77,11 +77,11 @@ from reminder_agent.features.memory.adapters import (
     _handle_memory_lookup_text,
     _handle_memory_text,
 )
-from reminder_agent.features.memory.create.messages import memory_message
+from reminder_agent.features.memory.messages import save_memory_message
 from reminder_agent.features.memory.retrieve.answering import (
     MemoryAnswerer,
 )
-from reminder_agent.features.memory.retrieve.domain import MemoryRetrievalPolicy
+from reminder_agent.features.memory.retrieve.contracts import MemoryRetrievalPolicy
 from reminder_agent.features.reminders.cancel.decisions import (
     is_cancel_command,
 )
@@ -365,7 +365,7 @@ def _legacy_routing_tail() -> None:
                 source=("llm_classifier" if classifier_selected else "deterministic_router"),
             )
             return ConversationRoute.UNRELATED, Interpretation(
-                response_text=memory_message("memory_clarification"),
+                response_text=save_memory_message("clarification"),
                 fallback_allowed=False,
             )
         interpretation = interpret_for_route(
@@ -834,12 +834,12 @@ def handle_reminder_text(
             user=user,
             now=now,
             session_ttl_seconds=session_ttl_seconds,
-            response_text=memory_message("memory_clarification_expired"),
+            response_text=save_memory_message("clarification_expired"),
             response_kind="memory_clarification_expired",
             operation="SAVE_MEMORY",
         ) or ReminderReply(
             update.message.chat.id,
-            memory_message("memory_clarification_expired"),
+            save_memory_message("clarification_expired"),
         )
 
     # A pending memory accepts a plain fact as its answer. Explicit commands
@@ -859,10 +859,10 @@ def handle_reminder_text(
                 user=user,
                 now=now,
                 session_ttl_seconds=session_ttl_seconds,
-                response_text=memory_message("memory_canceled"),
+                response_text=save_memory_message("canceled"),
                 response_kind="memory_canceled",
                 operation="SAVE_MEMORY",
-            ) or ReminderReply(update.message.chat.id, memory_message("memory_canceled"))
+            ) or ReminderReply(update.message.chat.id, save_memory_message("canceled"))
 
         if deterministic_route in {
             ConversationRoute.NEW_REQUEST,
