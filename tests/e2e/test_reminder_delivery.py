@@ -2,9 +2,8 @@ from datetime import timedelta
 
 from sqlalchemy import select
 
-from reminder_agent.db.models import Notification, Reminder, ReminderOccurrence
-from reminder_agent.worker import NotificationWorker
-
+from reminder_agent.infrastructure.database.models import Notification, Reminder, ReminderOccurrence
+from reminder_agent.infrastructure.runtime.worker import NotificationWorker
 
 HEADERS = {"X-Telegram-Bot-Api-Secret-Token": "test-secret"}
 
@@ -26,7 +25,7 @@ def test_telegram_reminder_is_confirmed_persisted_and_delivered_when_due(
     assert _post_update(
         api_client, update_factory(3, text="Remind me in five minutes to call the bank.")
     ).json() == {"ok": True}
-    assert "2026-10-30 17:05" in telegram_client.messages[-1][1]
+    assert "today at 5:05 PM PKT" in telegram_client.messages[-1][1]
 
     reminder = db.scalar(select(Reminder))
     occurrence = db.scalar(select(ReminderOccurrence))

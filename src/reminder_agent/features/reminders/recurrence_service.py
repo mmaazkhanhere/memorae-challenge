@@ -16,14 +16,14 @@ from reminder_agent.features.reminders.recurrence import (
     iter_recurrence_occurrences,
     parse_recurrence_rule,
 )
-from reminder_agent.infrastructure.db.models import (
+from reminder_agent.infrastructure.database.models import (
     ChannelIdentity,
     Notification,
     Reminder,
     ReminderOccurrence,
     ReminderRecurrenceException,
 )
-from reminder_agent.infrastructure.db.session import SessionFactory
+from reminder_agent.infrastructure.database.session import SessionFactory
 from reminder_agent.infrastructure.observability import get_logger, log_event
 
 TELEGRAM = "TELEGRAM"

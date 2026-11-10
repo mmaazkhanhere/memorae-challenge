@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime, timedelta
 from threading import Event, Thread
-from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import select
 
-from reminder_agent.completion import parse_callback_data
-from reminder_agent.db.models import (
+from reminder_agent.channels.telegram.callbacks import parse_callback_data
+from reminder_agent.channels.telegram.provider import TelegramAPIError, TelegramDeliveryResult
+from reminder_agent.infrastructure.database.models import (
     ChannelIdentity,
     IdempotencyRecord,
     Notification,
@@ -16,8 +17,7 @@ from reminder_agent.db.models import (
     ReminderOccurrence,
     User,
 )
-from reminder_agent.telegram import TelegramAPIError, TelegramDeliveryResult
-from reminder_agent.worker import ConfirmationWorker, NotificationWorker
+from reminder_agent.infrastructure.runtime.worker import ConfirmationWorker, NotificationWorker
 
 
 def _seed_notification(db, now: datetime, *, due_at: datetime | None = None, **kwargs):
@@ -66,8 +66,8 @@ def _seed_notification(db, now: datetime, *, due_at: datetime | None = None, **k
 
 def _utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 class RecordingTelegramClient:
@@ -118,9 +118,10 @@ def test_due_notification_is_sent_and_records_provider_result(session_factory, f
         notification_id, occurrence_id = _seed_notification(db, fixed_now)
 
     client = RecordingTelegramClient()
-    assert _worker(
-        session_factory, client, fixed_now, callback_secret="callback-secret"
-    ).run_once() == 1
+    assert (
+        _worker(session_factory, client, fixed_now, callback_secret="callback-secret").run_once()
+        == 1
+    )
 
     with session_factory() as db:
         notification = db.get(Notification, notification_id)
@@ -135,6 +136,30 @@ def test_due_notification_is_sent_and_records_provider_result(session_factory, f
     assert client.reply_markups[0]["inline_keyboard"][0][0]["text"] == "Done"
     callback = client.reply_markups[0]["inline_keyboard"][0][0]["callback_data"]
     assert parse_callback_data(callback, "callback-secret") == occurrence_id
+
+
+def test_delivery_grace_defers_a_notification_until_after_the_grace_window(
+    session_factory, fixed_now
+):
+    with session_factory() as db:
+        notification_id, _ = _seed_notification(db, fixed_now)
+
+    client = RecordingTelegramClient()
+    worker = _worker(
+        session_factory,
+        client,
+        fixed_now,
+        delivery_grace_seconds=15,
+    )
+
+    assert worker.run_once() == 0
+    assert client.messages == []
+    assert worker.claim_due_notifications(fixed_now + timedelta(seconds=14)) == []
+    claims = worker.claim_due_notifications(fixed_now + timedelta(seconds=15))
+    assert len(claims) == 1
+    assert worker.deliver(claims[0], fixed_now + timedelta(seconds=15)) == "SENT"
+    with session_factory() as db:
+        assert db.get(Notification, notification_id).status == "SENT"
 
 
 def test_confirmation_worker_retries_failed_confirmation(session_factory, fixed_now):
@@ -167,9 +192,7 @@ def test_worker_restart_before_due_does_not_lose_notification(session_factory, f
     assert worker.run_once() == 0
     assert client.messages == []
 
-    due_worker = _worker(
-        session_factory, client, fixed_now + timedelta(minutes=5, seconds=1)
-    )
+    due_worker = _worker(session_factory, client, fixed_now + timedelta(minutes=5, seconds=1))
     assert due_worker.run_once() == 1
     with session_factory() as db:
         assert db.get(Notification, notification_id).status == "SENT"
@@ -348,9 +371,7 @@ def test_postgres_workers_use_skip_locked_concurrency(session_factory, fixed_now
     holder = session_factory()
     holder.begin()
     holder.execute(
-        select(Notification.id)
-        .where(Notification.id == notification_id)
-        .with_for_update()
+        select(Notification.id).where(Notification.id == notification_id).with_for_update()
     ).scalar_one()
 
     second = _worker(

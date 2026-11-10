@@ -1,28 +1,36 @@
+"""Durable delivery of scheduled Telegram reminder notifications."""
+
 from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Callable
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
 
-from reminder_agent.db.models import (
+from reminder_agent.channels.telegram.callbacks import callback_data
+from reminder_agent.channels.telegram.provider import (
+    TelegramAPIError,
+    TelegramClient,
+)
+from reminder_agent.features.reminders.recurrence_service import (
+    materialize_active_recurring_reminders,
+)
+from reminder_agent.infrastructure.database.models import (
     ChannelIdentity,
-    IdempotencyRecord,
     Notification,
     Reminder,
     ReminderOccurrence,
 )
-from reminder_agent.db.session import build_engine
-from reminder_agent.observability import configure_logging, get_logger, log_event
-from reminder_agent.recurrence_service import materialize_active_recurring_reminders
-from reminder_agent.settings import get_settings, validate_runtime_settings
-from reminder_agent.telegram import HttpTelegramClient, TelegramAPIError, TelegramClient
-from reminder_agent.completion import callback_data
+from reminder_agent.infrastructure.database.session import SessionFactory
+from reminder_agent.infrastructure.observability import get_logger, log_event
+
+if TYPE_CHECKING:
+    from reminder_agent.infrastructure.runtime.confirmations import ConfirmationWorker
 
 TELEGRAM = "TELEGRAM"
 LINKED = "LINKED"
@@ -36,14 +44,14 @@ NOTIFIED = "NOTIFIED"
 logger = get_logger()
 
 
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
 
 
 def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 @dataclass(frozen=True)
@@ -52,224 +60,6 @@ class ClaimedNotification:
     worker_id: str
     attempt_count: int
     due_at: datetime
-
-
-@dataclass(frozen=True)
-class ClaimedConfirmation:
-    record_id: object
-    attempt_count: int
-    chat_id: int
-    text: str
-    reply_markup: dict | None
-
-
-class ConfirmationWorker:
-    """Retry durable Telegram confirmations after an outbound failure."""
-
-    def __init__(
-        self,
-        session_factory: Callable[[], Session],
-        telegram_client: TelegramClient,
-        *,
-        worker_id: str | None = None,
-        claim_lease_seconds: float = 120.0,
-        max_attempts: int = 3,
-        retry_base_delay_seconds: float = 30.0,
-        clock: Callable[[], datetime] = utc_now,
-    ) -> None:
-        self.session_factory = session_factory
-        self.telegram_client = telegram_client
-        self.worker_id = worker_id or f"confirmation-{uuid4().hex}"
-        self.claim_lease_seconds = claim_lease_seconds
-        self.max_attempts = max_attempts
-        self.retry_base_delay_seconds = retry_base_delay_seconds
-        self.clock = clock
-
-    def recover_expired_claims(self, now: datetime) -> None:
-        with self.session_factory.begin() as db:
-            records = db.scalars(
-                select(IdempotencyRecord).where(
-                    IdempotencyRecord.source == TELEGRAM,
-                    IdempotencyRecord.delivery_status == "ATTEMPTED",
-                    IdempotencyRecord.delivery_claimed_until <= now,
-                )
-            ).all()
-            for record in records:
-                record.delivery_status = "UNKNOWN"
-                record.delivery_claimed_by = None
-                record.delivery_claimed_until = None
-                if record.delivery_attempt_count < self.max_attempts:
-                    record.delivery_next_attempt_at = now
-                log_event(
-                    logger,
-                    logging.WARNING,
-                    "confirmation_claim_recovered",
-                    worker_id=self.worker_id,
-                    record_id=str(record.id),
-                    attempt_count=record.delivery_attempt_count,
-                )
-
-    def claim_due(self, now: datetime, *, limit: int = 25) -> list[ClaimedConfirmation]:
-        claimed: list[ClaimedConfirmation] = []
-        lease_until = now + timedelta(seconds=self.claim_lease_seconds)
-        with self.session_factory.begin() as db:
-            rows = db.execute(
-                select(IdempotencyRecord)
-                .where(
-                    IdempotencyRecord.source == TELEGRAM,
-                    IdempotencyRecord.delivery_status == "UNKNOWN",
-                    IdempotencyRecord.delivery_next_attempt_at <= now,
-                    IdempotencyRecord.delivery_attempt_count < self.max_attempts,
-                    IdempotencyRecord.delivery_claimed_until.is_(None),
-                )
-                .order_by(IdempotencyRecord.delivery_next_attempt_at, IdempotencyRecord.id)
-                .limit(limit)
-                .with_for_update(skip_locked=True)
-            ).scalars().all()
-            for record in rows:
-                response = record.response or {}
-                if not response.get("chat_id") or not response.get("text"):
-                    record.delivery_last_error_kind = "invalid_stored_response"
-                    record.delivery_next_attempt_at = None
-                    continue
-                record.delivery_status = "ATTEMPTED"
-                record.delivery_claimed_by = self.worker_id
-                record.delivery_claimed_until = lease_until
-                record.delivery_attempted_at = now
-                record.delivery_attempt_count += 1
-                claimed.append(
-                    ClaimedConfirmation(
-                        record.id,
-                        record.delivery_attempt_count,
-                        int(response["chat_id"]),
-                        str(response["text"]),
-                        response.get("reply_markup"),
-                    )
-                )
-                log_event(
-                    logger,
-                    logging.DEBUG,
-                    "confirmation_claimed",
-                    worker_id=self.worker_id,
-                    record_id=str(record.id),
-                    attempt_count=record.delivery_attempt_count,
-                    claim_expires_at=lease_until.isoformat(),
-                )
-        return claimed
-
-    def _finish(self, claim: ClaimedConfirmation, now: datetime, *, sent: bool, error=None) -> str:
-        with self.session_factory.begin() as db:
-            record = db.scalar(
-                select(IdempotencyRecord).where(
-                    IdempotencyRecord.id == claim.record_id,
-                    IdempotencyRecord.delivery_status == "ATTEMPTED",
-                    IdempotencyRecord.delivery_claimed_by == self.worker_id,
-                )
-            )
-            if record is None:
-                return "lost_claim"
-            record.delivery_claimed_by = None
-            record.delivery_claimed_until = None
-            if sent:
-                record.delivery_status = "SENT"
-                record.delivery_next_attempt_at = None
-                record.delivery_last_error_kind = None
-                outcome = "SENT"
-            else:
-                permanent = error.status_code in {400, 401, 403, 404}
-                safe_retryable = error.failure_kind in {
-                    "dns_error",
-                    "connect_error",
-                    "connect_timeout",
-                    "pool_timeout",
-                }
-                uncertain = error.failure_kind in {
-                    "network",
-                    "network_timeout",
-                    "read_timeout",
-                    "write_timeout",
-                    "read_error",
-                    "write_error",
-                } or (
-                    error.status_code is not None and 500 <= error.status_code <= 599
-                )
-                rate_limited = error.status_code == 429
-                record.delivery_status = "FAILED" if permanent else "UNKNOWN"
-                record.delivery_last_error_kind = error.failure_kind
-                can_retry = (
-                    (safe_retryable or uncertain or rate_limited)
-                    and record.delivery_attempt_count < self.max_attempts
-                )
-                if can_retry:
-                    delay = error.retry_after_seconds or (
-                        self.retry_base_delay_seconds
-                        * (2 ** max(record.delivery_attempt_count - 1, 0))
-                    )
-                    record.delivery_next_attempt_at = now + timedelta(seconds=delay)
-                    outcome = "RETRY_PENDING"
-                    record.delivery_status = "UNKNOWN"
-                elif permanent or safe_retryable:
-                    record.delivery_next_attempt_at = None
-                    outcome = "FAILED"
-                else:
-                    record.delivery_next_attempt_at = None
-                    outcome = "UNKNOWN"
-                log_event(
-                    logger,
-                    logging.INFO,
-                    "confirmation_delivery_outcome_recorded",
-                    worker_id=self.worker_id,
-                    record_id=str(claim.record_id),
-                    outcome=outcome,
-                    failure_kind=error.failure_kind,
-                    retry_after_seconds=error.retry_after_seconds,
-                )
-            return outcome
-
-    def deliver(self, claim: ClaimedConfirmation, now: datetime) -> str:
-        log_event(
-            logger,
-            logging.DEBUG,
-            "confirmation_delivery_attempt_started",
-            worker_id=self.worker_id,
-            record_id=str(claim.record_id),
-            attempt_count=claim.attempt_count,
-        )
-        try:
-            self.telegram_client.send_message(
-                claim.chat_id, claim.text, reply_markup=claim.reply_markup
-            )
-        except TelegramAPIError as exc:
-            outcome = self._finish(claim, now, sent=False, error=exc)
-            log_event(
-                logger,
-                logging.WARNING,
-                "confirmation_delivery_failed",
-                worker_id=self.worker_id,
-                record_id=str(claim.record_id),
-                outcome=outcome,
-                failure_kind=exc.failure_kind,
-                network_cause=exc.cause,
-            )
-            return outcome
-        outcome = self._finish(claim, now, sent=True)
-        log_event(
-            logger,
-            logging.INFO,
-            "confirmation_delivered",
-            worker_id=self.worker_id,
-            record_id=str(claim.record_id),
-            outcome=outcome,
-        )
-        return outcome
-
-    def run_once(self) -> int:
-        now = _as_utc(self.clock())
-        self.recover_expired_claims(now)
-        claims = self.claim_due(now)
-        for claim in claims:
-            self.deliver(claim, now)
-        return len(claims)
 
 
 class NotificationWorker:
@@ -283,18 +73,19 @@ class NotificationWorker:
 
     def __init__(
         self,
-        session_factory: Callable[[], Session],
+        session_factory: SessionFactory,
         telegram_client: TelegramClient,
         *,
         worker_id: str | None = None,
         poll_interval_seconds: float = 5.0,
         claim_lease_seconds: float = 60.0,
+        delivery_grace_seconds: float = 0.0,
         max_attempts: int = 3,
         uncertain_max_retries: int = 2,
         retry_base_delay_seconds: float = 30.0,
         recurrence_materialization_horizon_days: int = 35,
         recurrence_materialization_batch_size: int = 100,
-        clock: Callable[[], datetime] = utc_now,
+        clock: Callable[[], datetime] = _utc_now,
         sleep: Callable[[float], None] = time.sleep,
         callback_secret: str = "development",
     ) -> None:
@@ -303,6 +94,7 @@ class NotificationWorker:
         self.worker_id = worker_id or f"worker-{uuid4().hex}"
         self.poll_interval_seconds = poll_interval_seconds
         self.claim_lease_seconds = claim_lease_seconds
+        self.delivery_grace_seconds = max(delivery_grace_seconds, 0.0)
         self.max_attempts = max_attempts
         self.uncertain_max_retries = min(max(uncertain_max_retries, 0), 2)
         self.retry_base_delay_seconds = retry_base_delay_seconds
@@ -344,6 +136,7 @@ class NotificationWorker:
     ) -> list[ClaimedNotification]:
         now = _as_utc(now or self.clock())
         lease_until = now + timedelta(seconds=self.claim_lease_seconds)
+        eligible_before = now - timedelta(seconds=self.delivery_grace_seconds)
         claimed: list[ClaimedNotification] = []
         with self.session_factory.begin() as db:
             rows = db.execute(
@@ -353,7 +146,7 @@ class NotificationWorker:
                 .join(ChannelIdentity, ChannelIdentity.id == Notification.destination_identity_id)
                 .where(
                     Notification.status == PENDING,
-                    Notification.due_at <= now,
+                    Notification.due_at <= eligible_before,
                     Reminder.status == ACTIVE,
                     ReminderOccurrence.status == PENDING,
                     ChannelIdentity.channel_type == TELEGRAM,
@@ -401,7 +194,9 @@ class NotificationWorker:
             )
         return claimed
 
-    def _load_claim(self, notification_id: object, now: datetime):
+    def _load_deliverable_claim(
+        self, notification_id: object, now: datetime
+    ) -> tuple[Notification, str, int] | None:
         with self.session_factory() as db:
             row = db.execute(
                 select(Notification, Reminder.task, ChannelIdentity.telegram_chat_id)
@@ -424,9 +219,11 @@ class NotificationWorker:
             if row is None:
                 return None
             notification, task, chat_id = row
+            if chat_id is None:
+                return None
             return notification, str(task), int(chat_id)
 
-    def _finalize_success(
+    def _finalize_successful_delivery(
         self, notification_id: object, now: datetime, provider_message_id: str | None
     ) -> bool:
         with self.session_factory.begin() as db:
@@ -449,7 +246,7 @@ class NotificationWorker:
                 occurrence.status = NOTIFIED
             return True
 
-    def _finalize_error(
+    def _finalize_failed_delivery(
         self, notification_id: object, now: datetime, error: TelegramAPIError
     ) -> str:
         with self.session_factory.begin() as db:
@@ -476,9 +273,7 @@ class NotificationWorker:
                 "write_timeout",
                 "read_error",
                 "write_error",
-            } or (
-                error.status_code is not None and 500 <= error.status_code <= 599
-            )
+            } or (error.status_code is not None and 500 <= error.status_code <= 599)
             rate_limited = error.status_code == 429
             retries_so_far = max(notification.attempt_count - 1, 0)
             can_retry = notification.attempt_count < self.max_attempts
@@ -490,7 +285,7 @@ class NotificationWorker:
                 if rate_limited and error.retry_after_seconds is not None:
                     delay = float(error.retry_after_seconds)
                 else:
-                    delay = self.retry_base_delay_seconds * (2 ** retries_so_far)
+                    delay = self.retry_base_delay_seconds * (2**retries_so_far)
                 notification.due_at = now + timedelta(seconds=delay)
                 notification.status = PENDING
                 outcome = PENDING
@@ -520,7 +315,7 @@ class NotificationWorker:
 
     def deliver(self, claim: ClaimedNotification, now: datetime | None = None) -> str:
         now = _as_utc(now or self.clock())
-        loaded = self._load_claim(claim.notification_id, now)
+        loaded = self._load_deliverable_claim(claim.notification_id, now)
         if loaded is None:
             log_event(
                 logger,
@@ -539,19 +334,19 @@ class NotificationWorker:
             notification_id=str(claim.notification_id),
             attempt_count=notification.attempt_count,
             due_at=_as_utc(notification.due_at).isoformat(),
-            lateness_seconds=max(
-                0.0, (now - _as_utc(notification.due_at)).total_seconds()
-            ),
+            lateness_seconds=max(0.0, (now - _as_utc(notification.due_at)).total_seconds()),
         )
         done_markup = {
-            "inline_keyboard": [[
-                {
-                    "text": "Done",
-                    "callback_data": callback_data(
-                        notification.occurrence_id, self.callback_secret
-                    ),
-                }
-            ]]
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "Done",
+                        "callback_data": callback_data(
+                            notification.occurrence_id, self.callback_secret
+                        ),
+                    }
+                ]
+            ]
         }
         log_event(
             logger,
@@ -569,7 +364,7 @@ class NotificationWorker:
                 reply_markup=done_markup,
             )
         except TelegramAPIError as exc:
-            outcome = self._finalize_error(claim.notification_id, now, exc)
+            outcome = self._finalize_failed_delivery(claim.notification_id, now, exc)
             log_event(
                 logger,
                 logging.WARNING if outcome in {PENDING, UNKNOWN} else logging.ERROR,
@@ -583,7 +378,7 @@ class NotificationWorker:
             )
             return outcome
         provider_message_id = getattr(result, "provider_message_id", None)
-        finalized = self._finalize_success(
+        finalized = self._finalize_successful_delivery(
             claim.notification_id, now, provider_message_id
         )
         outcome = SENT if finalized else "lost_claim"
@@ -635,6 +430,8 @@ class NotificationWorker:
         return len(claims)
 
     def run_forever(self, confirmation_worker: ConfirmationWorker | None = None) -> None:
+        """Run notification and response-retry delivery until the process stops."""
+
         while True:
             try:
                 self.run_once()
@@ -649,54 +446,3 @@ class NotificationWorker:
                     exc_info=True,
                 )
             self.sleep(self.poll_interval_seconds)
-
-
-def run() -> None:
-    settings = get_settings()
-    configure_logging(
-        settings.log_level,
-        settings.log_format,
-        settings.log_include_traceback,
-        settings.log_color,
-    )
-    validate_runtime_settings(settings)
-    engine = build_engine(settings.database_url)
-    from sqlalchemy.orm import sessionmaker
-
-    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
-    worker = NotificationWorker(
-        session_factory,
-        HttpTelegramClient(settings.telegram_bot_token, settings.telegram_api_timeout_seconds),
-        poll_interval_seconds=settings.worker_poll_interval_seconds,
-        claim_lease_seconds=settings.worker_claim_lease_seconds,
-        max_attempts=settings.notification_retry_max_attempts,
-        uncertain_max_retries=settings.notification_uncertain_max_retries,
-        retry_base_delay_seconds=settings.notification_retry_base_delay_seconds,
-        recurrence_materialization_horizon_days=settings.recurrence_materialization_horizon_days,
-        recurrence_materialization_batch_size=settings.recurrence_materialization_batch_size,
-        callback_secret=settings.telegram_webhook_secret,
-    )
-    confirmation_worker = ConfirmationWorker(
-        session_factory,
-        HttpTelegramClient(settings.telegram_bot_token, settings.telegram_api_timeout_seconds),
-        claim_lease_seconds=settings.worker_claim_lease_seconds,
-        max_attempts=settings.telegram_confirmation_background_max_attempts,
-        retry_base_delay_seconds=(
-            settings.telegram_confirmation_background_retry_base_delay_seconds
-        ),
-    )
-    log_event(
-        logger,
-        logging.INFO,
-        "notification_worker_started",
-        worker_id=worker.worker_id,
-        poll_interval_seconds=settings.worker_poll_interval_seconds,
-        claim_lease_seconds=settings.worker_claim_lease_seconds,
-        max_attempts=settings.notification_retry_max_attempts,
-        uncertain_max_retries=settings.notification_uncertain_max_retries,
-    )
-    try:
-        worker.run_forever(confirmation_worker)
-    finally:
-        log_event(logger, logging.INFO, "notification_worker_stopped", worker_id=worker.worker_id)
-        engine.dispose()

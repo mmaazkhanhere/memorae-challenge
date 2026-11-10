@@ -2,8 +2,8 @@ from datetime import UTC, datetime
 
 from sqlalchemy import select
 
-from reminder_agent.infrastructure.db.models import Notification, Reminder, ReminderOccurrence
-from reminder_agent.infrastructure.worker import NotificationWorker
+from reminder_agent.infrastructure.database.models import Notification, Reminder, ReminderOccurrence
+from reminder_agent.infrastructure.runtime.worker import NotificationWorker
 
 HEADERS = {"X-Telegram-Bot-Api-Secret-Token": "test-secret"}
 

@@ -1512,7 +1512,12 @@ src/reminder_agent/
 │   ├── memory/                  # owner-scoped memory save and lookup
 │   ├── onboarding/              # reusable onboarding validation
 │   └── reminders/               # reminder lifecycle and recurrence
-├── infrastructure/              # SQLAlchemy, providers, settings, worker
+├── infrastructure/
+│   ├── database/                 # SQLAlchemy models and session lifecycle
+│   ├── providers/                # LLM, embeddings, and transcription adapters
+│   ├── runtime/                  # worker process, scheduling, and delivery
+│   ├── config/                   # runtime settings
+│   └── observability/            # logging and structured events
 └── shared/                      # cross-feature idempotency contract
 ```
 

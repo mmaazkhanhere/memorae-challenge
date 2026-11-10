@@ -18,14 +18,14 @@ from reminder_agent.features.reminders.recurrence_service import (
     materialize_active_recurring_reminders,
     materialize_recurring_reminder,
 )
-from reminder_agent.infrastructure.db.models import (
+from reminder_agent.infrastructure.database.models import (
     ChannelIdentity,
     Notification,
     Reminder,
     ReminderOccurrence,
     User,
 )
-from reminder_agent.infrastructure.worker import NotificationWorker
+from reminder_agent.infrastructure.runtime.worker import NotificationWorker
 
 
 def utc_timestamp(value: datetime) -> datetime:

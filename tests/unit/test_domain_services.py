@@ -18,7 +18,7 @@ from reminder_agent.features.onboarding.message_templates import ONBOARDING_MESS
 from reminder_agent.features.onboarding.workflow import handle_update
 from reminder_agent.features.reminders.cancel.decisions import CancellationScope, apply_cancellation
 from reminder_agent.features.reminders.recurrence_service import materialize_recurring_reminder
-from reminder_agent.features.reminders.rescheduling import (
+from reminder_agent.features.reminders.reschedule.decisions import (
     RescheduleCandidate,
     RescheduleScope,
     apply_reschedule,
@@ -26,7 +26,7 @@ from reminder_agent.features.reminders.rescheduling import (
     find_candidates,
     format_candidates,
 )
-from reminder_agent.infrastructure.db.models import (
+from reminder_agent.infrastructure.database.models import (
     ChannelIdentity,
     IdempotencyRecord,
     Notification,
@@ -34,7 +34,7 @@ from reminder_agent.infrastructure.db.models import (
     ReminderOccurrence,
     User,
 )
-from reminder_agent.infrastructure.worker import NotificationWorker
+from reminder_agent.infrastructure.runtime.worker import NotificationWorker
 
 
 class OneTimeInterpreter:

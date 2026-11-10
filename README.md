@@ -13,7 +13,7 @@ docker compose --profile test up -d postgres-test
 $env:DATABASE_URL = "postgresql+psycopg://memorae:memorae@localhost:5433/memorae"
 $env:TEST_DATABASE_URL = "postgresql+psycopg://memorae:memorae@localhost:5434/memorae_test"
 uv run alembic upgrade head
-uv run uvicorn reminder_agent.main:app --reload
+uv run uvicorn reminder_agent.application.main:app --reload
 # In a second process:
 uv run reminder-worker
 ```
