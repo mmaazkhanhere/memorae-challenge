@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from reminder_agent.infrastructure.db.models import ChannelIdentity, User
+from reminder_agent.infrastructure.database.models import ChannelIdentity, User
 
 LINKED = "LINKED"
 

@@ -8,7 +8,7 @@ from reminder_agent.application.contracts import (
     ApplicationRequest,
     AuthenticatedRequestContext,
 )
-from reminder_agent.infrastructure.db.models import ChannelIdentity, User
+from reminder_agent.infrastructure.database.models import ChannelIdentity, User
 
 ACTIVE = "ACTIVE"
 LINKED = "LINKED"

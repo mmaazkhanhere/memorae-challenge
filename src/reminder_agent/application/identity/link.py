@@ -14,7 +14,7 @@ from reminder_agent.features.onboarding.onboarding_validation import (
     InvalidPhoneNumber,
     normalize_phone_number,
 )
-from reminder_agent.infrastructure.db.models import ChannelIdentity, User
+from reminder_agent.infrastructure.database.models import ChannelIdentity, User
 
 LINKED = "LINKED"
 PENDING = "PENDING"
