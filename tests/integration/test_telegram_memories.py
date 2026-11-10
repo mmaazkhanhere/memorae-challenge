@@ -16,13 +16,9 @@ from reminder_agent.features.intent import (
     ReminderIntentInterpreter,
 )
 from reminder_agent.features.intent.deterministic.routing import ConversationRoute, route_message
-from reminder_agent.features.memory.messages import MEMORY_LOOKUP_MESSAGES
+from reminder_agent.features.memory.messages import MEMORY_LOOKUP_MESSAGES, MEMORY_SAVE_MESSAGES
 from reminder_agent.features.memory.retrieve.contracts import MemoryAnswerProposal
-from reminder_agent.shared.memory_contracts import (
-    MemoryIntentEvidence,
-    RetrieveMemoryQuery,
-    SaveMemoryFact,
-)
+from reminder_agent.infrastructure.config.settings import Settings
 from reminder_agent.infrastructure.database.models import (
     ChannelIdentity,
     ConversationSession,
@@ -34,10 +30,21 @@ from reminder_agent.infrastructure.database.models import (
     User,
 )
 from reminder_agent.infrastructure.providers.embeddings import EmbeddingProviderError
-from reminder_agent.infrastructure.config.settings import Settings
 from reminder_agent.shared.idempotency import IdempotencyConflict
+from reminder_agent.shared.memory_contracts import (
+    MemoryIntentEvidence,
+    RetrieveMemoryQuery,
+    SaveMemoryFact,
+)
 
 HEADERS = {"X-Telegram-Bot-Api-Secret-Token": "test-secret"}
+
+
+def _fact_found_response(message: str, fact: str) -> bool:
+    return any(
+        message == template.replace("{saved_fact}", fact)
+        for template in MEMORY_LOOKUP_MESSAGES["fact_found"]
+    )
 
 
 def _semantic_vector(axis: int) -> list[float]:
@@ -161,7 +168,7 @@ def test_explicit_memory_save_creates_one_owned_fact_and_no_reminder_rows(
     )
 
     assert response.status_code == 200
-    assert telegram_client.messages[-1][1] == "I saved that information."
+    assert telegram_client.messages[-1][1] in MEMORY_SAVE_MESSAGES["confirmation"]
     fact = db.scalar(select(MemoryFact))
     assert fact is not None
     assert fact.content == "my gate code is 4512"
@@ -171,11 +178,9 @@ def test_explicit_memory_save_creates_one_owned_fact_and_no_reminder_rows(
     record = db.scalar(select(IdempotencyRecord).where(IdempotencyRecord.idempotency_key == "102"))
     assert record is not None
     assert record.operation == "SAVE_MEMORY"
-    assert record.response == {
-        "chat_id": 2001,
-        "text": "I saved that information.",
-        "reply_markup": None,
-    }
+    assert record.response["chat_id"] == 2001
+    assert record.response["text"] in MEMORY_SAVE_MESSAGES["confirmation"]
+    assert record.response["reply_markup"] is None
 
 
 def test_replayed_memory_update_does_not_duplicate_fact_or_confirmation(
@@ -229,11 +234,9 @@ def test_conflicting_memory_replay_keeps_the_original_durable_response(
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
     record = db.scalar(select(IdempotencyRecord).where(IdempotencyRecord.idempotency_key == "206"))
     assert record is not None
-    assert record.response == {
-        "chat_id": 2001,
-        "text": "I saved that information.",
-        "reply_markup": None,
-    }
+    assert record.response["chat_id"] == 2001
+    assert record.response["text"] in MEMORY_SAVE_MESSAGES["confirmation"]
+    assert record.response["reply_markup"] is None
 
 
 def test_memory_delivery_failure_after_commit_preserves_replay_compatibility(
@@ -275,11 +278,9 @@ def test_memory_delivery_failure_after_commit_preserves_replay_compatibility(
             )
         )
         assert record is not None
-        assert record.response == {
-            "chat_id": 2001,
-            "text": "I saved that information.",
-            "reply_markup": None,
-        }
+        assert record.response["chat_id"] == 2001
+        assert record.response["text"] in MEMORY_SAVE_MESSAGES["confirmation"]
+        assert record.response["reply_markup"] is None
         assert record.delivery_status == "UNKNOWN"
 
 
@@ -333,7 +334,7 @@ def test_concurrent_memory_replay_commits_one_fact_and_idempotency_response(
         responses = list(executor.map(lambda _: invoke(), range(2)))
 
     db.expire_all()
-    assert responses == ["I saved that information.", "I saved that information."]
+    assert all(response in MEMORY_SAVE_MESSAGES["confirmation"] for response in responses)
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
     assert (
         db.scalar(
@@ -805,7 +806,7 @@ def test_unexpected_memory_save_failure_rolls_back_and_never_confirms(
 
     assert telegram_client.messages[-1][1] == "I couldn't save that information. Please try again."
     assert not any(
-        message[1] == "I saved that information." for message in telegram_client.messages
+        message[1] in MEMORY_SAVE_MESSAGES["confirmation"] for message in telegram_client.messages
     )
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == 0
     assert (
@@ -1075,7 +1076,7 @@ def test_keep_in_mind_completes_model_fallback_memory_sequence_once(
         "memory_extraction",
         "authorized_transactional_memory_service",
     ]
-    assert telegram_client.messages[-1][1] == "I saved that information."
+    assert telegram_client.messages[-1][1] in MEMORY_SAVE_MESSAGES["confirmation"]
 
     fact = db.scalar(select(MemoryFact))
     assert fact is not None
@@ -1124,7 +1125,7 @@ def test_model_routed_memory_save_for_dog_name_creates_only_one_fact(
     )
 
     assert post_update(api_client, update_factory(1452, text=text)).status_code == 200
-    assert telegram_client.messages[-1][1] == "I saved that information."
+    assert telegram_client.messages[-1][1] in MEMORY_SAVE_MESSAGES["confirmation"]
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
     assert db.scalar(select(func.count()).select_from(Reminder)) == 0
     assert db.scalar(select(func.count()).select_from(ReminderOccurrence)) == 0
@@ -1328,7 +1329,7 @@ def test_semantic_lookup_emits_privacy_safe_diagnostics_and_uses_deterministic_r
         == 200
     )
 
-    assert telegram_client.messages[-1][1] == 'You told me: "my parking slot is B17"'
+    assert "my parking slot is B17" in telegram_client.messages[-1][1]
     assert provider.calls == ["my parking slot is B17", "Where do I leave my car?"]
 
     route_events = [context for event, context in events if event == "reminder_route_decision"]
@@ -1395,7 +1396,9 @@ def test_disabled_embedding_provider_falls_back_to_deterministic_lexical_lookup(
         ).status_code
         == 200
     )
-    assert telegram_client.messages[-1][1] == 'You told me: "my parking slot is B17"'
+    assert _fact_found_response(
+        telegram_client.messages[-1][1], "my parking slot is B17"
+    )
     fact = db.scalar(select(MemoryFact))
     assert fact is not None and fact.embedding is None
 
@@ -1705,7 +1708,7 @@ def test_embedding_failure_saves_once_and_replay_does_not_repeat_work(
     onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=2200)
     update = update_factory(2202, text="Remember my favorite food is biryani")
     assert post_update(api_client, update).status_code == 200
-    assert telegram_client.messages[-1][1] == "I saved that information."
+    assert telegram_client.messages[-1][1] in MEMORY_SAVE_MESSAGES["confirmation"]
     assert post_update(api_client, update).status_code == 200
 
     fact = db.scalar(select(MemoryFact))
