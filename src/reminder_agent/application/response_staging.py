@@ -48,6 +48,7 @@ class ReminderReply:
     reply_markup: dict | None = None
     response_kind: str = "clarification"
     cleanup_provider_message_id: str | None = None
+    selection_context: tuple[dict[str, str], ...] = ()
 
 
 def _existing_record(db: Session, update: Any) -> IdempotencyRecord | None:

@@ -12,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from reminder_agent.application.cancellation_workflow import handle_cancellation_request
 from reminder_agent.application.contracts import ApplicationRequest
 from reminder_agent.application.conversation import (
     process_authenticated_conversation,
@@ -44,10 +45,6 @@ from reminder_agent.application.response_staging import (
     _recover_from_idempotency_race,
     _reply_from_record,
     _store_response,
-)
-from reminder_agent.channels.telegram.cancellation import handle_cancellation_text
-from reminder_agent.channels.telegram.reminder_listing import (
-    handle_list_reminder_request,
 )
 from reminder_agent.features.intent.contracts import (
     IntentInterpreter,
@@ -144,6 +141,8 @@ LINKED = "LINKED"
 ACTIVE = "ACTIVE"
 logger = get_logger()
 
+_RECENT_SELECTION_CONTEXT: dict[UUID, tuple[dict[str, str], ...]] = {}
+
 
 # Compatibility wrapper; routing implementation lives in features.intent.
 def _route_and_interpret(*args: Any, **kwargs: Any):
@@ -196,6 +195,10 @@ def _recent_selection_context(
     db: Session, *, user_id: UUID
 ) -> tuple[dict[str, str], ...]:
     """Return the most recent structured reminder list for ordinal references."""
+
+    cached = _RECENT_SELECTION_CONTEXT.get(user_id)
+    if cached:
+        return cached
 
     records = db.scalars(
         select(IdempotencyRecord)
@@ -661,24 +664,10 @@ def handle_reminder_text(
     )
     if conversation_entry.response is not None:
         db.rollback()
-        with db.begin():
-            existing = _existing_record(db, update)
-            if existing is not None:
-                return _reply_from_record(existing)
-            result = conversation_entry.response
-            return _store_response(
-                db,
-                update=update,
-                user_id=user.id,
-                text=result.content,
-                response_kind=result.response_kind,
-                operation="LIST_REMINDERS",
-                response_metadata=(
-                    {"selection_context": list(result.selection_context)}
-                    if result.selection_context
-                    else None
-                ),
-            )
+        result = conversation_entry.response
+        if result.selection_context:
+            _RECENT_SELECTION_CONTEXT[user.id] = tuple(result.selection_context)
+        return ReminderReply(update.message.chat.id, result.content, response_kind=result.response_kind)
     assert conversation_entry.route is not None
     deterministic_route = conversation_entry.route
     log_event(
@@ -991,12 +980,12 @@ def handle_reminder_text(
         is_new_reminder=is_new_reminder_command(text),
         is_reschedule=is_reschedule_command(text),
         is_cancel_command=is_cancel_command(text),
-        handle=lambda pending_value: handle_cancellation_text(
+        handle=lambda pending_value: handle_cancellation_request(
             db,
             update,
+            request=normalized_request,
             user_id=cast(User, user).id,
             user=cast(User, user),
-            identity=cast(ChannelIdentity, identity),
             pending=pending_value,
             now=now,
             session_ttl_seconds=session_ttl_seconds,
@@ -1122,12 +1111,12 @@ def handle_reminder_text(
             if reschedule_reply is not None:
                 return reschedule_reply
         elif route is ConversationRoute.CANCEL_REQUEST:
-            cancellation_reply = handle_cancellation_text(
+            cancellation_reply = handle_cancellation_request(
                 db,
                 update,
+                request=normalized_request,
                 user_id=user.id,
                 user=user,
-                identity=identity,
                 pending=pending_cancellation,
                 now=now,
                 session_ttl_seconds=session_ttl_seconds,
@@ -1364,15 +1353,17 @@ def handle_reminder_text(
                     response_kind=("social" if route is ConversationRoute.SOCIAL else "unrelated"),
                 )
 
-            list_reply = handle_list_reminder_request(
+            list_reply = stage_list_reminder_response(
                 db,
                 update,
                 user=user,
-                identity=identity,
+                request=normalized_request,
                 interpretation=interpretation,
                 now=now,
             )
             if list_reply is not None:
+                if list_reply.selection_context:
+                    _RECENT_SELECTION_CONTEXT[user.id] = list_reply.selection_context
                 return list_reply
 
             summary_reply = handle_reminder_summary_request(

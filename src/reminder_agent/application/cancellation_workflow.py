@@ -1,8 +1,8 @@
-"""Telegram adaptation for the shared reminder-cancellation workflow.
+"""Application orchestration for an authenticated cancellation request.
 
 The cancellation feature owns parsing, target resolution, validation, and the
-state transition.  This adapter owns Telegram update handling, durable Telegram
-responses, and the provider-specific request conversion.
+state transition. This workflow owns session state and durable response
+staging; the Telegram adapter supplies a validated update and neutral request.
 """
 
 from __future__ import annotations
@@ -15,22 +15,12 @@ from uuid import UUID
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from reminder_agent.application.cancellation import (
-    CancellationConflict,
-    CancellationRequest,
-    PendingCancellation,
-    cancel_reminder_for_request,
-    cancellation_command_for_decision,
-    decide_cancellation,
-    is_cancel_command,
-    prepare_cancellation,
-)
+from reminder_agent.application.contracts import ApplicationRequest
 from reminder_agent.application.conversations import (
     end_session,
     load_session,
     pending_cancellation_from_session,
     save_pending_clarification_session,
-    telegram_session_id,
 )
 from reminder_agent.application.response_staging import (
     ReminderReply,
@@ -39,24 +29,32 @@ from reminder_agent.application.response_staging import (
     _reply_from_record,
     _store_response,
 )
-from reminder_agent.channels.telegram.inbound import message_input, to_application_request
-from reminder_agent.channels.telegram.presentation.reminders import (
-    durable_cancellation_response,
+from reminder_agent.features.reminders.cancel.decisions import (
+    CancellationConflict,
+    CancellationRequest,
+    PendingCancellation,
+    decide_cancellation,
+    is_cancel_command,
 )
 from reminder_agent.features.reminders.cancel.messages import cancel_message
-from reminder_agent.infrastructure.db.models import ChannelIdentity, User
+from reminder_agent.features.reminders.cancel.service import (
+    cancel_reminder_for_request,
+    cancellation_command_for_decision,
+    prepare_cancellation,
+)
+from reminder_agent.infrastructure.db.models import User
 from reminder_agent.infrastructure.observability import get_logger, log_event
 
 logger = get_logger()
 
 
-def handle_cancellation_text(
+def handle_cancellation_request(
     db: Session,
     update: Any,
     *,
+    request: ApplicationRequest,
     user_id: UUID,
     user: User,
-    identity: ChannelIdentity,
     pending: PendingCancellation | None,
     now: datetime,
     session_ttl_seconds: int = 900,
@@ -65,11 +63,9 @@ def handle_cancellation_text(
     recent_messages: list[str] | None = None,
     force: bool = False,
 ) -> ReminderReply | None:
-    """Adapt one authenticated Telegram message to the shared cancellation service."""
+    """Process one authenticated cancellation request without channel parsing."""
 
-    inbound = message_input(update)
-    assert inbound is not None
-    text = inbound.text
+    text = request.message_text
     log_event(
         logger,
         logging.INFO,
@@ -108,7 +104,7 @@ def handle_cancellation_text(
             session = load_session(
                 db,
                 user_id=user_id,
-                external_session_id=telegram_session_id(inbound.chat_id),
+                external_session_id=request.context.external_session_id,
                 now=now,
                 ttl_seconds=session_ttl_seconds,
                 for_update=True,
@@ -151,8 +147,8 @@ def handle_cancellation_text(
                 )
 
             if decision.kind == "CLARIFY":
-                request = decision.request
-                if request is None:
+                cancellation_request = decision.request
+                if cancellation_request is None:
                     return _store_response(
                         db,
                         update=update,
@@ -162,16 +158,16 @@ def handle_cancellation_text(
                         operation="CANCEL_REMINDER",
                     )
                 pending_record = PendingCancellation(
-                    target_text=request.target_text,
+                    target_text=cancellation_request.target_text,
                     candidate_ids=decision.candidate_ids,
-                    scope=request.scope,
-                    occurrence_date=request.occurrence_date,
+                    scope=cancellation_request.scope,
+                    occurrence_date=cancellation_request.occurrence_date,
                     timezone_name=user.timezone or "UTC",
                 )
                 save_pending_clarification_session(
                     db,
                     user_id=user_id,
-                    external_session_id=telegram_session_id(inbound.chat_id),
+                    external_session_id=request.context.external_session_id,
                     pending=pending_record,
                     now=now,
                 )
@@ -203,11 +199,7 @@ def handle_cancellation_text(
                 )
             result = cancel_reminder_for_request(
                 db,
-                request=to_application_request(
-                    inbound,
-                    user=user,
-                    identity=identity,
-                ),
+                request=request,
                 command=cancellation_command,
                 now=now,
             )
@@ -236,7 +228,7 @@ def handle_cancellation_text(
                 db,
                 update=update,
                 user_id=user_id,
-                durable_response=durable_cancellation_response(result),
+                durable_response=result.durable_response,
                 response_kind="cancellation_confirmation",
                 operation="CANCEL_REMINDER",
             )
@@ -258,7 +250,7 @@ def handle_cancellation_text(
             session = load_session(
                 db,
                 user_id=user_id,
-                external_session_id=telegram_session_id(inbound.chat_id),
+                external_session_id=request.context.external_session_id,
                 now=now,
                 ttl_seconds=session_ttl_seconds,
                 for_update=True,
