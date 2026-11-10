@@ -14,7 +14,7 @@ from reminder_agent.features.reminders.complete.operations import (
     resolve_by_provider_message,
     resolve_latest_delivered,
 )
-from reminder_agent.infrastructure.db.models import Notification, Reminder, ReminderOccurrence
+from reminder_agent.infrastructure.database.models import Notification, Reminder, ReminderOccurrence
 
 CompletionCandidate = tuple[ReminderOccurrence, Reminder, Notification]
 

@@ -39,7 +39,7 @@ from reminder_agent.features.reminders.complete.response import (
     commit_completion_response,
     stage_completion_response,
 )
-from reminder_agent.infrastructure.db.models import (
+from reminder_agent.infrastructure.database.models import (
     ChannelIdentity,
     User,
 )

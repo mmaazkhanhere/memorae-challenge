@@ -21,7 +21,7 @@ from reminder_agent.features.reminders.complete.resolution import (
     CompletionCandidate,
     resolve_pending_completion_target,
 )
-from reminder_agent.infrastructure.db.models import ConversationSession
+from reminder_agent.infrastructure.database.models import ConversationSession
 
 
 @dataclass(frozen=True)

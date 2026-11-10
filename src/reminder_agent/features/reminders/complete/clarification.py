@@ -11,7 +11,7 @@ from uuid import UUID
 from reminder_agent.application.conversations import end_session
 from reminder_agent.application.pending_contracts import PendingCompletion
 from reminder_agent.features.reminders.complete.response import stage_completion_response
-from reminder_agent.infrastructure.db.models import ConversationSession
+from reminder_agent.infrastructure.database.models import ConversationSession
 from reminder_agent.infrastructure.observability import get_logger, log_event
 
 ResponseT = TypeVar("ResponseT")

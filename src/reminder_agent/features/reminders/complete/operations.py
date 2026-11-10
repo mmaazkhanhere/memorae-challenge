@@ -20,7 +20,7 @@ from reminder_agent.features.reminders.complete.messages import (
     reminder_completed_message,
     reminder_not_available_message,
 )
-from reminder_agent.infrastructure.db.models import (
+from reminder_agent.infrastructure.database.models import (
     ChannelIdentity,
     Notification,
     Reminder,
