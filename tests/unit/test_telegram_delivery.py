@@ -5,13 +5,17 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from reminder_agent.telegram import HttpTelegramClient, TelegramAPIError, _connect_failure_kind
-from reminder_agent.api.telegram import (
+from reminder_agent.application.response_staging import ReminderReply
+from reminder_agent.channels.telegram.provider import (
+    HttpTelegramClient,
+    TelegramAPIError,
+    _connect_failure_kind,
+)
+from reminder_agent.channels.telegram.webhook import (
     _send_reply_with_retry,
     _split_telegram_text,
     _telegram_error_is_retryable,
 )
-from reminder_agent.reminders import ReminderReply
 
 
 def test_http_telegram_client_returns_provider_message_id(monkeypatch):
@@ -20,11 +24,33 @@ def test_http_telegram_client_returns_provider_message_id(monkeypatch):
         is_success=True,
         json=lambda: {"ok": True, "result": {"message_id": 987}},
     )
-    monkeypatch.setattr("reminder_agent.telegram.httpx.post", lambda *args, **kwargs: response)
+    monkeypatch.setattr(
+        "reminder_agent.channels.telegram.provider.httpx.post", lambda *args, **kwargs: response
+    )
 
     result = HttpTelegramClient("token").send_message(2001, "Reminder: call the bank")
 
     assert result.provider_message_id == "987"
+
+
+def test_http_telegram_client_supports_edit_and_delete(monkeypatch):
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append((url, kwargs["json"]))
+        result = {"message_id": 987} if url.endswith("editMessageText") else True
+        return SimpleNamespace(status_code=200, is_success=True, json=lambda: {"ok": True, "result": result})
+
+    monkeypatch.setattr("reminder_agent.channels.telegram.provider.httpx.post", post)
+    client = HttpTelegramClient("token")
+
+    edited = client.edit_message_text(2001, 987, "Updated", reply_markup={"inline_keyboard": []})
+    client.delete_message(2001, 987)
+
+    assert edited.provider_message_id == "987"
+    assert calls[0][0].endswith("editMessageText")
+    assert calls[0][1]["reply_markup"] == {"inline_keyboard": []}
+    assert calls[1][0].endswith("deleteMessage")
 
 
 def test_telegram_error_cause_redacts_bot_token():
@@ -43,7 +69,9 @@ def test_http_telegram_client_preserves_retry_after(monkeypatch):
         request=httpx.Request("POST", "https://api.telegram.org/botsecret/sendMessage"),
         json={"ok": False, "description": "Too Many Requests", "parameters": {"retry_after": 19}},
     )
-    monkeypatch.setattr("reminder_agent.telegram.httpx.post", lambda *args, **kwargs: response)
+    monkeypatch.setattr(
+        "reminder_agent.channels.telegram.provider.httpx.post", lambda *args, **kwargs: response
+    )
 
     with pytest.raises(TelegramAPIError) as raised:
         HttpTelegramClient("secret").send_message(2001, "Reminder")
@@ -106,7 +134,9 @@ def test_long_reply_is_delivered_as_ordered_chunks():
 )
 def test_malformed_telegram_success_response_is_rejected(monkeypatch, payload) -> None:
     response = SimpleNamespace(status_code=200, is_success=True, json=lambda: payload)
-    monkeypatch.setattr("reminder_agent.telegram.httpx.post", lambda *args, **kwargs: response)
+    monkeypatch.setattr(
+        "reminder_agent.channels.telegram.provider.httpx.post", lambda *args, **kwargs: response
+    )
 
     with pytest.raises(TelegramAPIError) as raised:
         HttpTelegramClient("secret-token").send_message(2001, "Reminder")
@@ -121,7 +151,9 @@ def test_telegram_ok_false_http_success_is_treated_as_provider_rejection(monkeyp
         is_success=True,
         json=lambda: {"ok": False, "description": "chat is unavailable"},
     )
-    monkeypatch.setattr("reminder_agent.telegram.httpx.post", lambda *args, **kwargs: response)
+    monkeypatch.setattr(
+        "reminder_agent.channels.telegram.provider.httpx.post", lambda *args, **kwargs: response
+    )
 
     with pytest.raises(TelegramAPIError) as raised:
         HttpTelegramClient("secret-token").send_message(2001, "Reminder")
@@ -144,7 +176,9 @@ def test_transport_failures_are_classified(monkeypatch, exception, failure_kind)
     def raise_transport_error(*args, **kwargs):
         raise exception
 
-    monkeypatch.setattr("reminder_agent.telegram.httpx.post", raise_transport_error)
+    monkeypatch.setattr(
+        "reminder_agent.channels.telegram.provider.httpx.post", raise_transport_error
+    )
 
     with pytest.raises(TelegramAPIError) as raised:
         HttpTelegramClient("secret-token").send_message(2001, "Reminder")
@@ -169,7 +203,9 @@ def test_http_failure_classification_distinguishes_retryable_rate_limits(
         request=httpx.Request("POST", "https://api.telegram.org/botsecret-token/sendMessage"),
         json=payload,
     )
-    monkeypatch.setattr("reminder_agent.telegram.httpx.post", lambda *args, **kwargs: response)
+    monkeypatch.setattr(
+        "reminder_agent.channels.telegram.provider.httpx.post", lambda *args, **kwargs: response
+    )
 
     with pytest.raises(TelegramAPIError) as raised:
         HttpTelegramClient("secret-token").send_message(2001, "Reminder")
@@ -194,7 +230,9 @@ def test_transport_exception_causes_redact_tokens_in_all_supported_formats(
     def raise_transport_error(*args, **kwargs):
         raise exception
 
-    monkeypatch.setattr("reminder_agent.telegram.httpx.post", raise_transport_error)
+    monkeypatch.setattr(
+        "reminder_agent.channels.telegram.provider.httpx.post", raise_transport_error
+    )
 
     with pytest.raises(TelegramAPIError) as raised:
         HttpTelegramClient("secret-token").send_message(2001, "Reminder")
@@ -209,7 +247,9 @@ def test_provider_descriptions_and_invalid_json_causes_redact_tokens(monkeypatch
         is_success=True,
         json=lambda: {"ok": False, "description": "invalid botsecret-token credential"},
     )
-    monkeypatch.setattr("reminder_agent.telegram.httpx.post", lambda *args, **kwargs: rejected)
+    monkeypatch.setattr(
+        "reminder_agent.channels.telegram.provider.httpx.post", lambda *args, **kwargs: rejected
+    )
 
     with pytest.raises(TelegramAPIError) as provider_error:
         HttpTelegramClient("secret-token").send_message(2001, "Reminder")
@@ -219,7 +259,9 @@ def test_provider_descriptions_and_invalid_json_causes_redact_tokens(monkeypatch
         raise ValueError("response contains secret-token")
 
     malformed = SimpleNamespace(status_code=200, is_success=True, json=malformed_json)
-    monkeypatch.setattr("reminder_agent.telegram.httpx.post", lambda *args, **kwargs: malformed)
+    monkeypatch.setattr(
+        "reminder_agent.channels.telegram.provider.httpx.post", lambda *args, **kwargs: malformed
+    )
     with pytest.raises(TelegramAPIError) as invalid_response:
         HttpTelegramClient("secret-token").send_message(2001, "Reminder")
     assert "secret-token" not in (invalid_response.value.cause or "")
