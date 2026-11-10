@@ -11,7 +11,7 @@ from reminder_agent.features.onboarding.request_contracts import (
     classify_onboarding_text,
 )
 from reminder_agent.features.onboarding.service import handle_onboarding_request
-from reminder_agent.infrastructure.db.models import User
+from reminder_agent.infrastructure.database.models import User
 
 
 def test_onboarding_command_classifier_is_channel_neutral() -> None:

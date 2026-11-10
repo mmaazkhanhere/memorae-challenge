@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from reminder_agent.channels.telegram.provider import TelegramUpdate
 from reminder_agent.features.onboarding.message_templates import ONBOARDING_MESSAGES
 from reminder_agent.features.onboarding.workflow import handle_update
-from reminder_agent.infrastructure.db.models import ChannelIdentity, IdempotencyRecord, User
+from reminder_agent.infrastructure.database.models import ChannelIdentity, IdempotencyRecord, User
 
 
 def post_update(client, update: dict):

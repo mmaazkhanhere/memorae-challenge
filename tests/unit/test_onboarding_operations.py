@@ -8,7 +8,7 @@ from reminder_agent.features.onboarding.phone_linking import (
     process_phone_link as process_feature_phone_link,
 )
 from reminder_agent.features.onboarding.phone_linking_service import process_phone_link
-from reminder_agent.infrastructure.db.models import ChannelIdentity, User
+from reminder_agent.infrastructure.database.models import ChannelIdentity, User
 
 
 def test_prepare_phone_link_stages_local_number_until_region_is_known(db):

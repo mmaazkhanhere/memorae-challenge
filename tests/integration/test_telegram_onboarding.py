@@ -2,7 +2,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from reminder_agent.features.onboarding.message_templates import ONBOARDING_MESSAGES
-from reminder_agent.infrastructure.db.models import ChannelIdentity, IdempotencyRecord, User
+from reminder_agent.infrastructure.database.models import ChannelIdentity, IdempotencyRecord, User
 
 HEADERS = {"X-Telegram-Bot-Api-Secret-Token": "test-secret"}
 
@@ -158,8 +158,8 @@ def test_database_failure_does_not_send_false_success(
     from fastapi.testclient import TestClient
     from sqlalchemy.orm import Session as SQLAlchemySession
 
-    from reminder_agent.application.bootstrap import create_app
-    from reminder_agent.infrastructure.settings import Settings
+    from reminder_agent.application.main import create_app
+    from reminder_agent.infrastructure.config.settings import Settings
 
     class FailingSession(SQLAlchemySession):
         def flush(self, *args, **kwargs) -> None:
@@ -189,9 +189,9 @@ def test_telegram_502_is_acknowledged_without_duplicate_retry(
 ) -> None:
     from fastapi.testclient import TestClient
 
-    from reminder_agent.application.bootstrap import create_app
+        from reminder_agent.application.main import create_app
     from reminder_agent.channels.telegram.provider import TelegramAPIError
-    from reminder_agent.infrastructure.settings import Settings
+    from reminder_agent.infrastructure.config.settings import Settings
 
     class FailingTelegramClient:
         attempts = 0
