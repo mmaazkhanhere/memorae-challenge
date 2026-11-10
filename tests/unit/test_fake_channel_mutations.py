@@ -19,8 +19,10 @@ from reminder_agent.application import (
 )
 from reminder_agent.features.onboarding.identity_operations import link_phone_identity
 from reminder_agent.features.reminders.cancel.decisions import CancellationScope
-from reminder_agent.features.reminders.rescheduling import RescheduleScope
-from reminder_agent.infrastructure.db.models import (
+from reminder_agent.features.reminders.cancel.messages import REMINDER_CANCEL_MESSAGES
+from reminder_agent.features.reminders.complete.messages import REMINDER_COMPLETION_MESSAGES
+from reminder_agent.features.reminders.reschedule.decisions import RescheduleScope
+from reminder_agent.infrastructure.database.models import (
     ChannelIdentity,
     Notification,
     Reminder,
@@ -108,8 +110,11 @@ def test_fake_channel_completion_uses_verified_delivery_context_and_replay_is_sa
 
     assert first.response_kind == "completion"
     assert isinstance(first, OutboundResponse)
-    assert first.content == "Marked as done: call the bank."
-    assert second.content == "That reminder is already marked as done."
+    assert first.content in {
+        message.format(task="call the bank")
+        for message in REMINDER_COMPLETION_MESSAGES["reminder_completed"]
+    }
+    assert second.content in set(REMINDER_COMPLETION_MESSAGES["reminder_already_completed"])
     assert db.get(Reminder, reminder.id).status == "COMPLETED"
 
 
@@ -166,7 +171,10 @@ def test_fake_channel_cancellation_and_rescheduling_use_application_commands(db)
     )
 
     assert canceled.response_kind == "CANCELLATION_REMINDER"
-    assert canceled.content == "Canceled 'call the bank'."
+    assert canceled.content in {
+        template.format(task="call the bank")
+        for template in REMINDER_CANCEL_MESSAGES["one_time_cancelled"]
+    }
 
     user2, identity2, reminder2, occurrence2, notification2 = _seed_phone_delivery(
         db, suffix="ada-2"
