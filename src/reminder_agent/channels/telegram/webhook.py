@@ -78,7 +78,7 @@ def _send_reply_with_retry(
     if chat_id is None:
         # Compatibility for direct callers of the old Telegram delivery helper.
         chat_id = reply.chat_id
-    text = onboarding_text(reply) if isinstance(reply, OutboundResponse) else reply.text
+    text = reply.content if isinstance(reply, OutboundResponse) else reply.text
     send_text(
         client,
         chat_id=chat_id,

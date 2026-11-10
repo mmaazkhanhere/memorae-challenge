@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 from reminder_agent.application.contracts import OutboundResponse
 from reminder_agent.channels.telegram import webhook
-from reminder_agent.channels.telegram.presentation.keyboards import (
+from reminder_agent.channels.telegram.outbound import (
     PHONE_KEYBOARD,
     REMOVE_KEYBOARD,
 )
