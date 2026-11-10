@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from reminder_agent.channels.telegram.provider import TelegramClient
 from reminder_agent.channels.telegram.webhook import router as telegram_router
+from reminder_agent.channels.vapi.webhook import router as vapi_router
 from reminder_agent.features.intent.model.interpreter import OpenAICompatibleIntentInterpreter
 from reminder_agent.features.intent.model.router import (
     IntentRouter,
@@ -25,16 +26,23 @@ from reminder_agent.features.memory.retrieve.answering import (
     OpenAICompatibleMemoryAnswerer,
 )
 from reminder_agent.features.memory.retrieve.contracts import MemoryRetrievalPolicy
+from reminder_agent.infrastructure.config.settings import (
+    Settings,
+    get_settings,
+    validate_runtime_settings,
+)
 from reminder_agent.infrastructure.database.session import SessionFactory, get_db
+from reminder_agent.infrastructure.observability import configure_logging, log_event, request_id
 from reminder_agent.infrastructure.providers.embeddings import (
     EmbeddingPrivacyPolicy,
     EmbeddingProvider,
     create_embedding_provider,
 )
 from reminder_agent.infrastructure.providers.llm import OpenAICompatibleLLMClient
-from reminder_agent.infrastructure.observability import configure_logging, log_event, request_id
-from reminder_agent.infrastructure.config.settings import Settings, get_settings, validate_runtime_settings
-from reminder_agent.infrastructure.providers.transcription import AudioTranscriber, GroqWhisperTranscriber
+from reminder_agent.infrastructure.providers.transcription import (
+    AudioTranscriber,
+    GroqWhisperTranscriber,
+)
 
 REQUIRED_SCHEMA_TABLES = (
     "users",
@@ -46,8 +54,9 @@ REQUIRED_SCHEMA_TABLES = (
     "notifications",
     "conversation_sessions",
     "memory_facts",
+    "voice_call_authorizations",
 )
-REQUIRED_SCHEMA_VERSION = "0016_memory_embeddings"
+REQUIRED_SCHEMA_VERSION = "0017_voice_call_authorizations"
 REQUIRED_SCHEMA_COLUMNS = {
     "notifications": {
         "claimed_by",
@@ -85,6 +94,15 @@ REQUIRED_SCHEMA_COLUMNS = {
         "embedding_updated_at",
         "created_at",
         "updated_at",
+    },
+    "voice_call_authorizations": {
+        "provider_call_id",
+        "user_id",
+        "phone_identity_id",
+        "status",
+        "created_at",
+        "expires_at",
+        "ended_at",
     },
 }
 
@@ -290,6 +308,7 @@ def create_app(
         return {"status": "ready"}
 
     app.include_router(telegram_router)
+    app.include_router(vapi_router)
     return app
 
 
