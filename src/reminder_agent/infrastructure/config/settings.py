@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     )
     worker_poll_interval_seconds: float = Field(default=5.0, gt=0, le=60)
     worker_claim_lease_seconds: float = Field(default=60.0, gt=10, le=600)
+    worker_delivery_grace_seconds: float = Field(default=15.0, ge=0, le=60)
     recurrence_materialization_horizon_days: int = Field(default=35, ge=7, le=366)
     recurrence_materialization_batch_size: int = Field(default=100, ge=1, le=1000)
     notification_retry_max_attempts: int = Field(default=3, ge=1, le=10)
@@ -85,9 +86,10 @@ def validate_runtime_settings(settings: Settings, *, allow_local_database: bool 
     embedding_provider = settings.embedding_provider.strip().casefold()
     if embedding_provider not in {"disabled", "openai_compatible", "gemini"}:
         errors.append("EMBEDDING_PROVIDER must be disabled, openai_compatible, or gemini")
-    if embedding_provider in {"openai_compatible", "gemini"} and not (
-        settings.embedding_api_key or ""
-    ).strip():
+    if (
+        embedding_provider in {"openai_compatible", "gemini"}
+        and not (settings.embedding_api_key or "").strip()
+    ):
         errors.append("EMBEDDING_API_KEY must be configured for semantic indexing")
     if embedding_provider == "gemini" and settings.embedding_gemini_model != "gemini-embedding-001":
         errors.append("EMBEDDING_GEMINI_MODEL must be gemini-embedding-001")

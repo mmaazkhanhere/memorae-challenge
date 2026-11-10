@@ -1,6 +1,6 @@
 import pytest
 
-from reminder_agent.settings import Settings, validate_runtime_settings
+from reminder_agent.infrastructure.config.settings import Settings, validate_runtime_settings
 
 
 def test_production_configuration_rejects_placeholder_secret_and_sqlite() -> None:
