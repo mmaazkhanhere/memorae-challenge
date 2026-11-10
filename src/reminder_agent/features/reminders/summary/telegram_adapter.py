@@ -16,7 +16,7 @@ from reminder_agent.features.intent.contracts import Interpretation
 from reminder_agent.features.reminders.listing.service import (
     summarize_reminders_from_interpretation,
 )
-from reminder_agent.infrastructure.db.models import ChannelIdentity, User
+from reminder_agent.infrastructure.database.models import ChannelIdentity, User
 
 
 def handle_reminder_summary_request(
