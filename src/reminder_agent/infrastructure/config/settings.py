@@ -9,6 +9,20 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./memorae.db"
     telegram_bot_token: str = ""
     telegram_webhook_secret: str = Field(default="change-me", min_length=1)
+    vapi_enabled: bool = False
+    vapi_webhook_bearer_token: str = ""
+    vapi_call_authorization_ttl_seconds: int = Field(default=3600, ge=60, le=86400)
+    vapi_assistant_name: str = "Memorae"
+    vapi_assistant_first_message: str = "Hi, you're connected to Memorae. How can I help?"
+    vapi_assistant_system_prompt: str = (
+        "You are Memorae's voice assistant. In this call, greet the caller and listen "
+        "briefly. Do not claim that reminders or memories were changed; no tools are "
+        "available yet."
+    )
+    vapi_model_provider: str = "openai"
+    vapi_model: str = "gpt-4o-mini"
+    vapi_voice_provider: str = "11labs"
+    vapi_voice_id: str = "sarah"
     telegram_api_timeout_seconds: float = Field(default=10.0, gt=0)
     telegram_voice_max_bytes: int = Field(default=20 * 1024 * 1024, ge=1024, le=50 * 1024 * 1024)
     telegram_voice_max_duration_seconds: int = Field(default=300, ge=1, le=3600)
@@ -82,6 +96,19 @@ def validate_runtime_settings(settings: Settings, *, allow_local_database: bool 
 
     if not (settings.stt_api_key or "").strip():
         errors.append("STT_API_KEY must be configured before production startup")
+
+    if settings.vapi_enabled:
+        token = settings.vapi_webhook_bearer_token.strip()
+        if token.lower() in {"replace-with-vapi-token", "change-me"} or len(token) < 32:
+            errors.append(
+                "VAPI_WEBHOOK_BEARER_TOKEN must be a unique value of at least 32 characters"
+            )
+        if not settings.vapi_assistant_name.strip():
+            errors.append("VAPI_ASSISTANT_NAME must be configured when Vapi is enabled")
+        if not settings.vapi_model_provider.strip() or not settings.vapi_model.strip():
+            errors.append("VAPI model settings must be configured when Vapi is enabled")
+        if not settings.vapi_voice_provider.strip() or not settings.vapi_voice_id.strip():
+            errors.append("VAPI voice settings must be configured when Vapi is enabled")
 
     embedding_provider = settings.embedding_provider.strip().casefold()
     if embedding_provider not in {"disabled", "openai_compatible", "gemini"}:
