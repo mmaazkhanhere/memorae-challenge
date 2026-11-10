@@ -20,7 +20,7 @@ from reminder_agent.features.reminders.recurrence import (
     parse_recurrence_rule,
     recurrence_due_for_local_date,
 )
-from reminder_agent.infrastructure.db.models import (
+from reminder_agent.infrastructure.database.models import (
     Notification,
     Reminder,
     ReminderOccurrence,
