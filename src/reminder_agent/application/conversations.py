@@ -13,7 +13,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from reminder_agent.application.pending_contracts import PendingCompletion, PendingSnooze
-from reminder_agent.infrastructure.db.models import ConversationSession
+from reminder_agent.infrastructure.database.models import ConversationSession
 from reminder_agent.infrastructure.observability import get_logger, log_event
 from reminder_agent.shared.memory_contracts import PendingMemory, PendingMemoryLookup
 

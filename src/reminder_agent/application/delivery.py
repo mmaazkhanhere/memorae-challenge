@@ -9,7 +9,7 @@ from typing import Protocol
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from reminder_agent.infrastructure.db.models import IdempotencyRecord
+from reminder_agent.infrastructure.database.models import IdempotencyRecord
 
 
 class ResponseDeliveryPort(Protocol):

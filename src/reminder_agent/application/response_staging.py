@@ -23,7 +23,7 @@ from reminder_agent.application.contracts import (
     VerifiedChannelIdentity,
 )
 from reminder_agent.application.conversations import telegram_session_id
-from reminder_agent.infrastructure.db.models import ChannelIdentity, IdempotencyRecord, User
+from reminder_agent.infrastructure.database.models import ChannelIdentity, IdempotencyRecord, User
 from reminder_agent.infrastructure.observability import get_logger, log_event
 from reminder_agent.shared.idempotency import (
     IdempotencyConflict,
