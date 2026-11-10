@@ -23,6 +23,8 @@ from reminder_agent.application.conversations import (
     end_session,
     load_session,
     pending_from_session,
+    pending_memory_from_session,
+    pending_memory_lookup_from_session,
     save_pending_clarification_session,
 )
 from reminder_agent.application.identity.context import authorized_user_for_request
@@ -190,6 +192,13 @@ def _creation_response(
         channel_type=VOICE_CALL,
     )
     pending = pending_from_session(voice_session)
+    if voice_session is not None and (
+        pending_memory_from_session(voice_session) is not None
+        or pending_memory_lookup_from_session(voice_session) is not None
+    ):
+        # A reminder tool call is an explicit new operation. Do not let a
+        # previous memory clarification consume a later reminder turn.
+        end_session(voice_session, now=now)
 
     if (
         route in {ConversationRoute.CANCELLATION, ConversationRoute.CANCEL_REQUEST}
