@@ -1,16 +1,14 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
-from reminder_agent.db.models import Base, MemoryFact
-from reminder_agent.embeddings import EmbeddingProviderError
-from reminder_agent.memories import (
+from reminder_agent.features.memory.service import (
     MemoryAnswerProposal,
-    MemoryRetrievalPolicy,
     MemoryIntentEvidence,
+    MemoryRetrievalPolicy,
     PendingMemory,
     RetrieveMemoryQuery,
     SaveMemoryFact,
@@ -25,6 +23,8 @@ from reminder_agent.memories import (
     save_memory_fact,
     update_memory_fact_content,
 )
+from reminder_agent.infrastructure.db.models import Base, MemoryFact
+from reminder_agent.infrastructure.embeddings import EmbeddingProviderError
 
 
 def _vector(*coordinates: float) -> list[float]:
@@ -57,9 +57,7 @@ class FailingEmbeddingProvider(FakeEmbeddingProvider):
 def test_explicit_memory_command_is_detected_and_extracted() -> None:
     cases = {
         "Remember my gate code is 4512": "my gate code is 4512",
-        "Make a note that my laptop model is ThinkPad T14": (
-            "my laptop model is ThinkPad T14"
-        ),
+        "Make a note that my laptop model is ThinkPad T14": ("my laptop model is ThinkPad T14"),
         "Take note of my backup email": "my backup email",
     }
     for text, expected_content in cases.items():
@@ -75,14 +73,17 @@ def test_explicit_memory_command_is_detected_and_extracted() -> None:
     ],
 )
 def test_contracted_intentional_memory_request_is_authorized(text: str) -> None:
-    assert is_memory_intent_evidence_grounded(
-        text,
-        MemoryIntentEvidence(
-            kind="EXPLICIT_SAVE_REQUEST",
-            confidence="CLEAR",
-            evidence_text="remember",
-        ),
-    ) is True
+    assert (
+        is_memory_intent_evidence_grounded(
+            text,
+            MemoryIntentEvidence(
+                kind="EXPLICIT_SAVE_REQUEST",
+                confidence="CLEAR",
+                evidence_text="remember",
+            ),
+        )
+        is True
+    )
 
 
 @pytest.mark.parametrize(
@@ -138,7 +139,7 @@ def test_save_memory_fact_persists_only_to_memory_table() -> None:
             db,
             user_id=user_id,
             content="Wi-Fi password is Andorra2026",
-            now=datetime(2026, 10, 30, tzinfo=timezone.utc),
+            now=datetime(2026, 10, 30, tzinfo=UTC),
         )
         db.commit()
         fact = db.scalar(select(MemoryFact).where(MemoryFact.id == saved.fact_id))
@@ -159,13 +160,13 @@ def test_memory_lookup_returns_exact_owned_fact_without_mutation() -> None:
             db,
             user_id=owner_id,
             content="Wi-Fi password is Andorra2026",
-            now=datetime(2026, 10, 30, tzinfo=timezone.utc),
+            now=datetime(2026, 10, 30, tzinfo=UTC),
         )
         save_memory_fact(
             db,
             user_id=other_id,
             content="Wi-Fi password is NotYours",
-            now=datetime(2026, 10, 30, tzinfo=timezone.utc),
+            now=datetime(2026, 10, 30, tzinfo=UTC),
         )
         db.commit()
         before = db.get(MemoryFact, saved.fact_id)
@@ -191,13 +192,13 @@ def test_memory_lookup_is_unknown_or_ambiguous_without_guessing() -> None:
             db,
             user_id=user_id,
             content="Gate code is 4512",
-            now=datetime(2026, 10, 30, tzinfo=timezone.utc),
+            now=datetime(2026, 10, 30, tzinfo=UTC),
         )
         second = save_memory_fact(
             db,
             user_id=user_id,
             content="Backup gate code is 9921",
-            now=datetime(2026, 10, 30, tzinfo=timezone.utc),
+            now=datetime(2026, 10, 30, tzinfo=UTC),
         )
         db.commit()
         ambiguous = lookup_memory_fact(db, user_id=user_id, query="gate code")
@@ -217,13 +218,13 @@ def test_memory_lookup_does_not_rank_away_a_plausible_conflicting_fact() -> None
             db,
             user_id=user_id,
             content="Gate code is 4512",
-            now=datetime(2026, 10, 30, tzinfo=timezone.utc),
+            now=datetime(2026, 10, 30, tzinfo=UTC),
         )
         second = save_memory_fact(
             db,
             user_id=user_id,
             content="Code for the gate is 9921",
-            now=datetime(2026, 10, 30, tzinfo=timezone.utc),
+            now=datetime(2026, 10, 30, tzinfo=UTC),
         )
         db.commit()
 
@@ -305,9 +306,7 @@ def test_sensitive_memory_is_not_sent_to_external_provider_by_default() -> None:
 def test_backfill_and_content_regeneration_are_resumable_and_idempotent() -> None:
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)
-    provider = FakeEmbeddingProvider(
-        {"biryani": _vector(1, 0), "nihari": _vector(0, 1)}
-    )
+    provider = FakeEmbeddingProvider({"biryani": _vector(1, 0), "nihari": _vector(0, 1)})
     owner_id = uuid4()
     with Session(engine) as db:
         saved = save_memory_fact(
@@ -456,9 +455,7 @@ def test_memory_answer_contract_and_exact_value_preservation() -> None:
     )
     assert answer.validates_candidate_count(1)
     assert not answer.validates_candidate_count(0)
-    assert memory_answer_preserves_exact_values(
-        answer.answer or "", ("my parking slot is B17",)
-    )
+    assert memory_answer_preserves_exact_values(answer.answer or "", ("my parking slot is B17",))
     assert not memory_answer_preserves_exact_values(
         "Your parking slot is B 17.", ("my parking slot is B17",)
     )

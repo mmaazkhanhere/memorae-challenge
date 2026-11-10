@@ -4,9 +4,15 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import func, select
 
-from reminder_agent.db.models import MemoryFact, Notification, Reminder, ReminderOccurrence, User
-from reminder_agent.memories import lookup_memory_fact, save_memory_fact
-
+from reminder_agent.features.memory.retrieve.service import lookup_memory_fact
+from reminder_agent.features.memory.service import save_memory_fact
+from reminder_agent.infrastructure.db.models import (
+    MemoryFact,
+    Notification,
+    Reminder,
+    ReminderOccurrence,
+    User,
+)
 
 pytestmark = pytest.mark.skipif(
     os.getenv("TEST_DATABASE_URL", "sqlite://").startswith("sqlite"),
@@ -84,18 +90,22 @@ def test_pgvector_owner_scoped_semantic_lookup_survives_new_session(
         assert result.status == "CANDIDATES"
         assert result.candidates[0].id == owned.fact_id
         assert result.candidates[0].content == "my parking slot is B17"
-        assert db.scalar(
-            select(func.count())
-            .select_from(MemoryFact)
-            .where(MemoryFact.user_id.in_((owner_id, other_id)))
-        ) == 2
+        assert (
+            db.scalar(
+                select(func.count())
+                .select_from(MemoryFact)
+                .where(MemoryFact.user_id.in_((owner_id, other_id)))
+            )
+            == 2
+        )
         assert db.scalar(select(func.count()).select_from(Reminder)) == 0
         assert db.scalar(select(func.count()).select_from(ReminderOccurrence)) == 0
         assert db.scalar(select(func.count()).select_from(Notification)) == 0
         db.expire_all()
-        assert db.scalar(
-            select(MemoryFact.updated_at).where(MemoryFact.id == owned.fact_id)
-        ) == before_updated_at
+        assert (
+            db.scalar(select(MemoryFact.updated_at).where(MemoryFact.id == owned.fact_id))
+            == before_updated_at
+        )
 
 
 def test_pgvector_old_fact_with_null_embedding_uses_lexical_fallback_only(
