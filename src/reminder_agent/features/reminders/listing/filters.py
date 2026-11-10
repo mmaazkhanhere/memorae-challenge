@@ -16,7 +16,7 @@ from reminder_agent.features.reminders.recurrence import (
     parse_recurrence_rule,
     resolve_local_datetime,
 )
-from reminder_agent.infrastructure.db.models import (
+from reminder_agent.infrastructure.database.models import (
     Reminder,
     ReminderOccurrence,
     ReminderRecurrenceException,

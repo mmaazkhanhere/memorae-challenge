@@ -11,7 +11,7 @@ from reminder_agent.features.reminders.recurrence import (
     YearlyRecurrence,
     parse_recurrence_rule,
 )
-from reminder_agent.infrastructure.db.models import Notification, Reminder, ReminderOccurrence
+from reminder_agent.infrastructure.database.models import Notification, Reminder, ReminderOccurrence
 
 
 def answer_status_question_for_delivery(

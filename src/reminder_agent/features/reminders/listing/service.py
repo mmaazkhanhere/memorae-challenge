@@ -25,7 +25,7 @@ from reminder_agent.features.reminders.listing.filters import (
     list_reminders_in_range,
     summarize_reminders,
 )
-from reminder_agent.infrastructure.db.models import User
+from reminder_agent.infrastructure.database.models import User
 
 
 def list_reminders_for_request(
