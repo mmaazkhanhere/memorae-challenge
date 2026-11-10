@@ -131,6 +131,12 @@ def test_router_recognizes_memory_lookup_without_model_fallback() -> None:
         assert route_message(text, pending=None).route is ConversationRoute.RETRIEVE_MEMORY_REQUEST
 
 
+def test_ambiguous_temporal_personal_question_uses_model_fallback() -> None:
+    assert route_message("When is my birthday?", pending=None).route is (
+        ConversationRoute.MODEL_FALLBACK
+    )
+
+
 @pytest.mark.parametrize(
     "text",
     [
