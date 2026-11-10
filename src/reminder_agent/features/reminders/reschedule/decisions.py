@@ -75,7 +75,7 @@ from reminder_agent.features.reminders.reschedule.parser import (
 from reminder_agent.features.reminders.reschedule.parser import (
     scope_from_text as _scope_from_text,
 )
-from reminder_agent.infrastructure.db.models import (
+from reminder_agent.infrastructure.database.models import (
     ChannelIdentity,
     Notification,
     Reminder,

@@ -69,7 +69,7 @@ from reminder_agent.features.reminders.reschedule.messages import (
     reschedule_message,
 )
 from reminder_agent.features.reminders.reschedule.models import RescheduleClarification
-from reminder_agent.infrastructure.db.models import ChannelIdentity, Reminder, User
+from reminder_agent.infrastructure.database.models import ChannelIdentity, Reminder, User
 from reminder_agent.infrastructure.observability import get_logger, log_event
 
 logger = get_logger()
