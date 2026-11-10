@@ -35,7 +35,7 @@ from reminder_agent.channels.telegram.updates import (
 )
 from reminder_agent.features.onboarding.service import handle_onboarding_request
 from reminder_agent.features.onboarding.workflow import handle_update
-from reminder_agent.infrastructure.db.session import get_db
+from reminder_agent.infrastructure.database.session import get_db
 from reminder_agent.infrastructure.observability import get_logger, log_event
 from reminder_agent.shared.idempotency import IdempotencyConflict, find_idempotency_record
 

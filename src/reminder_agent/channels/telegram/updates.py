@@ -29,7 +29,7 @@ from reminder_agent.features.onboarding.request_contracts import (
     OnboardingRequest,
     classify_onboarding_text,
 )
-from reminder_agent.infrastructure.db.models import ChannelIdentity, User
+from reminder_agent.infrastructure.database.models import ChannelIdentity, User
 from reminder_agent.infrastructure.observability import get_logger, log_event
 from reminder_agent.shared.idempotency import request_hash
 
