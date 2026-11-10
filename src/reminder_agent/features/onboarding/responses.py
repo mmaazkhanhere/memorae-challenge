@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from reminder_agent.application.contracts import OutboundResponse
 from reminder_agent.application.delivery import SqlAlchemyResponseDelivery
 from reminder_agent.application.identity.resolve import resolve_linked_identity
-from reminder_agent.infrastructure.db.models import ChannelIdentity, IdempotencyRecord
+from reminder_agent.infrastructure.database.models import ChannelIdentity, IdempotencyRecord
 from reminder_agent.shared.idempotency import (
     ensure_request_matches,
     find_idempotency_record,

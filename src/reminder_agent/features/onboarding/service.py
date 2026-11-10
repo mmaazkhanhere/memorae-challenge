@@ -32,7 +32,7 @@ from reminder_agent.features.onboarding.request_contracts import (
     OnboardingAction,
     OnboardingRequest,
 )
-from reminder_agent.infrastructure.db.models import ChannelIdentity, IdempotencyRecord, User
+from reminder_agent.infrastructure.database.models import ChannelIdentity, IdempotencyRecord, User
 from reminder_agent.shared.idempotency import IdempotencyConflict
 
 ACTIVE: Final = "ACTIVE"

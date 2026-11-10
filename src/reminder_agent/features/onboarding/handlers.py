@@ -44,7 +44,7 @@ from reminder_agent.features.onboarding.responses import (
 from reminder_agent.features.onboarding.responses import (
     store_result as _store_result,
 )
-from reminder_agent.infrastructure.db.models import ChannelIdentity, User
+from reminder_agent.infrastructure.database.models import ChannelIdentity, User
 from reminder_agent.infrastructure.observability import get_logger, log_event
 
 TELEGRAM = "TELEGRAM"

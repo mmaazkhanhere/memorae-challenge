@@ -10,7 +10,7 @@ from reminder_agent.application.identity.link import (
 )
 from reminder_agent.application.identity.resolve import ResolvedIdentity as ResolvedLinkedIdentity
 from reminder_agent.application.identity.resolve import resolve_linked_identity
-from reminder_agent.infrastructure.db.models import ChannelIdentity
+from reminder_agent.infrastructure.database.models import ChannelIdentity
 
 ACTIVE = "ACTIVE"
 LINKED = "LINKED"
