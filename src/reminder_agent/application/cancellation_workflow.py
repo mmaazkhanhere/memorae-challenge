@@ -42,7 +42,7 @@ from reminder_agent.features.reminders.cancel.service import (
     cancellation_command_for_decision,
     prepare_cancellation,
 )
-from reminder_agent.infrastructure.db.models import User
+from reminder_agent.infrastructure.database.models import User
 from reminder_agent.infrastructure.observability import get_logger, log_event
 
 logger = get_logger()
