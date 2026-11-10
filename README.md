@@ -41,12 +41,24 @@ text. Audio and transcripts are not retained or written to logs; voice replies
 are Telegram text messages. Failed or inaudible notes never mutate reminders
 or memories.
 
+### VS-16 Vapi inbound authorization
+
+Set `VAPI_ENABLED=true`, configure a unique `VAPI_WEBHOOK_BEARER_TOKEN`, and
+run `uv run alembic upgrade head`. In Vapi, attach the HTTPS Server URL
+`POST /webhook/vapi` and the matching saved Bearer credential to the inbound
+phone-number or organization server configuration. Leave the phone number
+without a fixed assistant so the `assistant-request` decision can reject
+unknown callers before a conversation starts. Link the caller's E.164 number
+through Telegram first. VS-16 returns a transient assistant with no mutation
+tools and stores only an opaque call authorization; VS-17 will add typed tools
+that use the shared deterministic-first application pipeline.
+
 Production startup fails fast unless `DATABASE_URL` uses PostgreSQL,
 `TELEGRAM_BOT_TOKEN` is configured, and `TELEGRAM_WEBHOOK_SECRET` is a unique value of at
 least 32 characters. The sample placeholders and local SQLite defaults are intended only for
 injected test applications. `/ready` also verifies that the domain tables exist, so a stale
 `alembic_version` row cannot make an empty database appear healthy. Readiness also requires the
-current migration head (`0016_memory_embeddings`) and the worker/confirmation claim
+current migration head (`0017_voice_call_authorizations`) and the worker/confirmation claim
 columns, so a partially migrated database is rejected before webhooks are accepted.
 The additive schema-repair migrations also rebuild missing domain tables when a
 database was reset without resetting its Alembic version row.
