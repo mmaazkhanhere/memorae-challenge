@@ -10,7 +10,7 @@ application tables did not.
 
 from alembic import op
 
-from reminder_agent.db.models import Base
+from reminder_agent.infrastructure.database.models import Base
 
 
 revision = "0007_repair_schema_drift"

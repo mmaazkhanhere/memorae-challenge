@@ -1,6 +1,6 @@
-from collections.abc import Iterator
-from datetime import datetime, timezone
 import os
+from collections.abc import Iterator
+from datetime import UTC, datetime
 
 import pytest
 from fastapi.testclient import TestClient
@@ -9,15 +9,17 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from reminder_agent.db.models import Base
-from reminder_agent.main import REQUIRED_SCHEMA_VERSION, create_app
-from reminder_agent.settings import Settings
+from reminder_agent.application.main import REQUIRED_SCHEMA_VERSION, create_app
+from reminder_agent.infrastructure.database.models import Base
+from reminder_agent.infrastructure.config.settings import Settings
 
 
 class FakeTelegramClient:
     def __init__(self) -> None:
         self.messages: list[tuple[int, str]] = []
         self.reply_markups: list[dict | None] = []
+        self.edited_messages: list[tuple[int, int, str, dict | None]] = []
+        self.edited_keyboards: list[tuple[int, int, dict | None]] = []
         self.callback_acknowledgements: list[str] = []
         self.file_paths: dict[str, str] = {}
         self.file_bytes: bytes = b"OggS-test-audio"
@@ -29,6 +31,12 @@ class FakeTelegramClient:
 
     def answer_callback_query(self, callback_query_id: str) -> None:
         self.callback_acknowledgements.append(callback_query_id)
+
+    def edit_message_text(self, chat_id: int, message_id: int, text: str, *, reply_markup=None):
+        self.edited_messages.append((chat_id, message_id, text, reply_markup))
+
+    def edit_message_reply_markup(self, chat_id: int, message_id: int, *, reply_markup=None):
+        self.edited_keyboards.append((chat_id, message_id, reply_markup))
 
     def get_file_path(self, file_id: str) -> str:
         self.downloaded_file_ids.append(file_id)
@@ -42,7 +50,7 @@ class FakeTelegramClient:
 
 @pytest.fixture()
 def fixed_now() -> datetime:
-    return datetime(2026, 10, 30, 12, 0, tzinfo=timezone.utc)
+    return datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
 
 
 @pytest.fixture()
@@ -70,10 +78,7 @@ def session_factory() -> Iterator[sessionmaker[Session]]:
     Base.metadata.create_all(engine)
     with engine.begin() as connection:
         connection.execute(
-            text(
-                "CREATE TABLE IF NOT EXISTS alembic_version "
-                "(version_num VARCHAR(32) NOT NULL)"
-            )
+            text("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL)")
         )
         connection.execute(text("DELETE FROM alembic_version"))
         connection.execute(

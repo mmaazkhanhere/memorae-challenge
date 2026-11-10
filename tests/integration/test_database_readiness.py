@@ -3,8 +3,8 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from reminder_agent.main import create_app
-from reminder_agent.settings import Settings
+from reminder_agent.application.main import create_app
+from reminder_agent.infrastructure.config.settings import Settings
 
 
 def test_ready_rejects_database_with_only_alembic_version() -> None:
