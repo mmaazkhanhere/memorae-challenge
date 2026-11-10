@@ -18,7 +18,7 @@ from reminder_agent.features.reminders.create.validation import (
     recurrence_for_intent,
 )
 from reminder_agent.features.reminders.recurrence_service import materialize_recurring_reminder
-from reminder_agent.infrastructure.db.models import (
+from reminder_agent.infrastructure.database.models import (
     Notification,
     Reminder,
     ReminderOccurrence,

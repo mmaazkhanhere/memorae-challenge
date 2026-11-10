@@ -28,7 +28,7 @@ from reminder_agent.features.reminders.create.reminder_creation_persistence impo
     ExistingReminder,
     persist_creation_graphs,
 )
-from reminder_agent.infrastructure.db.models import ChannelIdentity, ConversationSession, User
+from reminder_agent.infrastructure.database.models import ChannelIdentity, ConversationSession, User
 from reminder_agent.infrastructure.observability import get_logger, log_event
 
 ResponseT = TypeVar("ResponseT")
