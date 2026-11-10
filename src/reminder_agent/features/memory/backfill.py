@@ -5,13 +5,13 @@ from __future__ import annotations
 import logging
 
 from reminder_agent.features.memory.persistence import backfill_memory_embeddings
-from reminder_agent.infrastructure.db.session import SessionLocal
-from reminder_agent.infrastructure.embeddings import (
+from reminder_agent.infrastructure.database.session import SessionLocal
+from reminder_agent.infrastructure.providers.embeddings import (
     EmbeddingPrivacyPolicy,
     create_embedding_provider,
 )
 from reminder_agent.infrastructure.observability import configure_logging, log_event
-from reminder_agent.infrastructure.settings import get_settings
+from reminder_agent.infrastructure.config.settings import get_settings
 
 
 def run() -> None:

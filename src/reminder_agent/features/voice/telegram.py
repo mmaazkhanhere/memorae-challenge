@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-from reminder_agent.features.voice.transcription import (
+from reminder_agent.infrastructure.providers.transcription import (
     AudioTranscriber,
     TranscriptionError,
     is_ogg_voice_note,

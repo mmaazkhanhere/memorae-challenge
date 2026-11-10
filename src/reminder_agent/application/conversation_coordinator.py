@@ -128,8 +128,8 @@ from reminder_agent.features.reminders.snooze.service import (
 from reminder_agent.features.reminders.summary.telegram_adapter import (
     handle_reminder_summary_request,
 )
-from reminder_agent.infrastructure.db.models import ChannelIdentity, User
-from reminder_agent.infrastructure.embeddings import (
+from reminder_agent.infrastructure.database.models import ChannelIdentity, User
+from reminder_agent.infrastructure.providers.embeddings import (
     EmbeddingPrivacyPolicy,
     EmbeddingProvider,
 )

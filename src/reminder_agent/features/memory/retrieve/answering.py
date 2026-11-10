@@ -15,7 +15,7 @@ from reminder_agent.features.memory.retrieve.contracts import (
     MemoryAnswerProposal,
     memory_answer_preserves_exact_values,
 )
-from reminder_agent.infrastructure.llm import (
+from reminder_agent.infrastructure.providers.llm import (
     OpenAICompatibleLLMClient,
     StructuredIntentProvider,
     supports_strict_json_schema,

@@ -25,16 +25,16 @@ from reminder_agent.features.memory.retrieve.answering import (
     OpenAICompatibleMemoryAnswerer,
 )
 from reminder_agent.features.memory.retrieve.contracts import MemoryRetrievalPolicy
-from reminder_agent.infrastructure.db.session import SessionFactory, get_db
-from reminder_agent.infrastructure.embeddings import (
+from reminder_agent.infrastructure.database.session import SessionFactory, get_db
+from reminder_agent.infrastructure.providers.embeddings import (
     EmbeddingPrivacyPolicy,
     EmbeddingProvider,
     create_embedding_provider,
 )
-from reminder_agent.infrastructure.llm import OpenAICompatibleLLMClient
+from reminder_agent.infrastructure.providers.llm import OpenAICompatibleLLMClient
 from reminder_agent.infrastructure.observability import configure_logging, log_event, request_id
-from reminder_agent.infrastructure.settings import Settings, get_settings, validate_runtime_settings
-from reminder_agent.features.voice.transcription import AudioTranscriber, GroqWhisperTranscriber
+from reminder_agent.infrastructure.config.settings import Settings, get_settings, validate_runtime_settings
+from reminder_agent.infrastructure.providers.transcription import AudioTranscriber, GroqWhisperTranscriber
 
 REQUIRED_SCHEMA_TABLES = (
     "users",

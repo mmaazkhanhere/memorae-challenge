@@ -7,12 +7,12 @@ import pytest
 from reminder_agent.features.intent import OpenAICompatibleMemoryAnswerer
 from reminder_agent.features.memory.persistence import save_memory_fact
 from reminder_agent.features.memory.retrieve.persistence import lookup_memory_fact
-from reminder_agent.infrastructure.db.models import User
-from reminder_agent.infrastructure.embeddings import (
+from reminder_agent.infrastructure.database.models import User
+from reminder_agent.infrastructure.providers.embeddings import (
     EmbeddingProviderError,
     GeminiEmbeddingProvider,
 )
-from reminder_agent.infrastructure.settings import Settings
+from reminder_agent.infrastructure.config.settings import Settings
 
 
 def _configured_gemini_key() -> str:
@@ -54,7 +54,7 @@ def test_fake_gemini_response_uses_document_and_query_tasks(monkeypatch) -> None
         # normalization after truncating the MRL prefix to 1536 dimensions.
         return _FakeResponse({"embedding": {"values": [3.0] * 3072}})
 
-    monkeypatch.setattr("reminder_agent.infrastructure.embeddings.httpx.post", fake_post)
+    monkeypatch.setattr("reminder_agent.infrastructure.providers.embeddings.httpx.post", fake_post)
     provider = GeminiEmbeddingProvider(
         base_url="https://generativelanguage.googleapis.com/v1beta",
         api_key="test-key",
@@ -76,7 +76,7 @@ def test_fake_gemini_response_uses_document_and_query_tasks(monkeypatch) -> None
 
 def test_fake_gemini_malformed_response_is_sanitized(monkeypatch) -> None:
     monkeypatch.setattr(
-        "reminder_agent.infrastructure.embeddings.httpx.post",
+        "reminder_agent.infrastructure.providers.embeddings.httpx.post",
         lambda *args, **kwargs: _FakeResponse({"unexpected": []}),
     )
     provider = GeminiEmbeddingProvider(

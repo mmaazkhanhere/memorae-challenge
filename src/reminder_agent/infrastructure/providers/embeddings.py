@@ -9,8 +9,8 @@ from typing import Protocol, runtime_checkable
 
 import httpx
 
-from reminder_agent.infrastructure.db.models import MEMORY_EMBEDDING_DIMENSIONS
-from reminder_agent.infrastructure.settings import Settings
+from reminder_agent.infrastructure.database.models import MEMORY_EMBEDDING_DIMENSIONS
+from reminder_agent.infrastructure.config.settings import Settings
 
 
 class EmbeddingProviderError(RuntimeError):

@@ -18,8 +18,8 @@ from reminder_agent.features.memory.retrieve.contracts import (
 )
 from reminder_agent.features.memory.retrieve.persistence import lookup_memory_fact
 from reminder_agent.features.memory.validation import is_memory_intent_evidence_grounded
-from reminder_agent.infrastructure.db.models import Base, MemoryFact
-from reminder_agent.infrastructure.embeddings import EmbeddingProviderError
+from reminder_agent.infrastructure.database.models import Base, MemoryFact
+from reminder_agent.infrastructure.providers.embeddings import EmbeddingProviderError
 from reminder_agent.shared.memory_contracts import (
     MemoryIntentEvidence,
     PendingMemory,

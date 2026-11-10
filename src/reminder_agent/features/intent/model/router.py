@@ -16,7 +16,7 @@ from reminder_agent.features.intent.contracts import (
     IntentRouteSuggestion,
     PendingReminder,
 )
-from reminder_agent.infrastructure.llm import (
+from reminder_agent.infrastructure.providers.llm import (
     OpenAICompatibleLLMClient,
     StructuredIntentProvider,
 )

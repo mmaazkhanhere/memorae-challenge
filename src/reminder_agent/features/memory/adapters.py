@@ -33,8 +33,8 @@ from reminder_agent.features.memory.retrieve.contracts import (
 from reminder_agent.features.memory.retrieve.persistence import lookup_memory_fact
 from reminder_agent.features.memory.retrieve.workflow import run_memory_lookup_workflow
 from reminder_agent.features.memory.saving import run_memory_save_workflow, save_memory_for_request
-from reminder_agent.infrastructure.db.models import ChannelIdentity, User
-from reminder_agent.infrastructure.embeddings import (
+from reminder_agent.infrastructure.database.models import ChannelIdentity, User
+from reminder_agent.infrastructure.providers.embeddings import (
     EmbeddingPrivacyPolicy,
     EmbeddingProvider,
     contains_sensitive_memory,

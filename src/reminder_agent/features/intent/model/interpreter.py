@@ -32,7 +32,7 @@ from reminder_agent.features.intent.model.response import (
 )
 from reminder_agent.features.intent.pending import reminder_creation as _pending_reminders
 from reminder_agent.features.memory.messages import lookup_memory_message, save_memory_message
-from reminder_agent.infrastructure.llm import (
+from reminder_agent.infrastructure.providers.llm import (
     OpenAICompatibleLLMClient,
     StructuredIntentProvider,
     supports_strict_json_schema,

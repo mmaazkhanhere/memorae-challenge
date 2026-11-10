@@ -33,8 +33,8 @@ from reminder_agent.features.onboarding.responses import (
 from reminder_agent.features.onboarding.responses import (
     store_result as _store_result,
 )
-from reminder_agent.infrastructure.db.models import User
-from reminder_agent.infrastructure.embeddings import EmbeddingPrivacyPolicy, EmbeddingProvider
+from reminder_agent.infrastructure.database.models import User
+from reminder_agent.infrastructure.providers.embeddings import EmbeddingPrivacyPolicy, EmbeddingProvider
 
 ACTIVE = "ACTIVE"
 

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from sqlalchemy import func, select
 
-from reminder_agent.db.models import (
+from reminder_agent.infrastructure.database.models import (
     ConversationSession,
     IdempotencyRecord,
     MemoryFact,
@@ -12,8 +12,7 @@ from reminder_agent.db.models import (
     Reminder,
     ReminderOccurrence,
 )
-from reminder_agent.transcription import TranscriptionError, TranscriptionResult
-
+from reminder_agent.infrastructure.providers.transcription import TranscriptionError, TranscriptionResult
 
 HEADERS = {"X-Telegram-Bot-Api-Secret-Token": "test-secret"}
 

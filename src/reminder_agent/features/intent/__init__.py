@@ -17,7 +17,7 @@ from reminder_agent.features.intent.model import interpreter as _structured_inte
 from reminder_agent.features.intent.model import router as _model_routing
 from reminder_agent.features.intent.pending import reminder_creation as _pending_reminders
 from reminder_agent.features.memory.retrieve import answering as _memory_answering
-from reminder_agent.infrastructure import llm as _llm
+from reminder_agent.infrastructure.providers import llm as _llm
 from reminder_agent.shared import memory_contracts as _memory_contracts
 from reminder_agent.shared import memory_text as _memory_text
 

@@ -31,8 +31,8 @@ from reminder_agent.features.memory.retrieve.persistence import (
     lookup_memory_fact,
     revalidate_owned_memory_candidates,
 )
-from reminder_agent.infrastructure.db.models import User
-from reminder_agent.infrastructure.embeddings import (
+from reminder_agent.infrastructure.database.models import User
+from reminder_agent.infrastructure.providers.embeddings import (
     EmbeddingPrivacyPolicy,
     EmbeddingProvider,
     contains_sensitive_memory,

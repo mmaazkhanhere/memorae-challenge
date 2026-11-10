@@ -15,8 +15,8 @@ from statistics import mean, median
 import pytest
 
 from reminder_agent.shared.memory_contracts import _lookup_tokens
-from reminder_agent.infrastructure.embeddings import GeminiEmbeddingProvider
-from reminder_agent.infrastructure.settings import Settings
+from reminder_agent.infrastructure.providers.embeddings import GeminiEmbeddingProvider
+from reminder_agent.infrastructure.config.settings import Settings
 
 DOCUMENTS = {
     "parking_b17": "my parking slot is B17",

@@ -27,7 +27,7 @@ from reminder_agent.application.identity.context import ACTIVE, authorized_user_
 from reminder_agent.features.memory.messages import save_memory_message
 from reminder_agent.features.memory.persistence import index_memory_fact_for_owner, save_memory_fact
 from reminder_agent.features.memory.validation import is_memory_content_grounded
-from reminder_agent.infrastructure.embeddings import EmbeddingPrivacyPolicy, EmbeddingProvider
+from reminder_agent.infrastructure.providers.embeddings import EmbeddingPrivacyPolicy, EmbeddingProvider
 from reminder_agent.infrastructure.observability import get_logger, log_event
 from reminder_agent.shared.memory_contracts import PendingMemory, SaveMemoryFact
 from reminder_agent.shared.memory_text import extract_memory_content

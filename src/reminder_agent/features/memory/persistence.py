@@ -10,8 +10,8 @@ from uuid import UUID
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from reminder_agent.infrastructure.db.models import MEMORY_EMBEDDING_DIMENSIONS, MemoryFact
-from reminder_agent.infrastructure.embeddings import (
+from reminder_agent.infrastructure.database.models import MEMORY_EMBEDDING_DIMENSIONS, MemoryFact
+from reminder_agent.infrastructure.providers.embeddings import (
     EmbeddingPrivacyPolicy,
     EmbeddingProvider,
     EmbeddingProviderError,
