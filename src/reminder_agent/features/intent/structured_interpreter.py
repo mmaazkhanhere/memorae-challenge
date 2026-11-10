@@ -37,6 +37,7 @@ from reminder_agent.infrastructure.llm import (
     supports_strict_json_schema,
 )
 from reminder_agent.infrastructure.observability import exception_details, get_logger, log_event
+from reminder_agent.features.memory.create.messages import memory_message
 
 logger = get_logger()
 
@@ -249,7 +250,7 @@ class OpenAICompatibleIntentInterpreter:
             )
             if route is IntentRoute.SAVE_MEMORY:
                 return Interpretation(
-                    response_text="What information should I remember?",
+                    response_text=memory_message("memory_clarification"),
                     fallback_allowed=False,
                 )
             if route is IntentRoute.RETRIEVE_MEMORY:
@@ -273,7 +274,7 @@ class OpenAICompatibleIntentInterpreter:
             )
             if route is IntentRoute.SAVE_MEMORY:
                 return Interpretation(
-                    response_text="What information should I remember?",
+                    response_text=memory_message("memory_clarification"),
                     fallback_allowed=False,
                 )
             if route is IntentRoute.RETRIEVE_MEMORY:
