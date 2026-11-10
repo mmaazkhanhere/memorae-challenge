@@ -2,31 +2,39 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import AsyncIterator, Awaitable, Callable, Generator
+from collections.abc import Callable as TypingCallable
 from contextlib import asynccontextmanager
-from collections.abc import Callable, Generator
-from datetime import datetime, timezone
-from typing import Awaitable, Callable as TypingCallable
+from datetime import UTC, datetime
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 
-from reminder_agent.api.telegram import router as telegram_router
-from reminder_agent.db.session import get_db
-from reminder_agent.embeddings import EmbeddingPrivacyPolicy, create_embedding_provider
-from reminder_agent.intent import (
-    OpenAICompatibleIntentInterpreter,
+from reminder_agent.channels.telegram.provider import TelegramClient
+from reminder_agent.channels.telegram.webhook import router as telegram_router
+from reminder_agent.features.intent.model.interpreter import OpenAICompatibleIntentInterpreter
+from reminder_agent.features.intent.model.router import (
+    IntentRouter,
     OpenAICompatibleIntentRouter,
-    OpenAICompatibleLLMClient,
-    OpenAICompatibleMemoryAnswerer,
-    ReminderIntentInterpreter,
 )
-from reminder_agent.memories import MemoryRetrievalPolicy
-from reminder_agent.observability import configure_logging, log_event, request_id
-from reminder_agent.settings import Settings, get_settings, validate_runtime_settings
-from reminder_agent.telegram import TelegramClient
-from reminder_agent.transcription import AudioTranscriber, GroqWhisperTranscriber
+from reminder_agent.features.intent.pipeline import ReminderIntentInterpreter
+from reminder_agent.features.memory.retrieve.answering import (
+    MemoryAnswerer,
+    OpenAICompatibleMemoryAnswerer,
+)
+from reminder_agent.features.memory.retrieve.contracts import MemoryRetrievalPolicy
+from reminder_agent.infrastructure.db.session import SessionFactory, get_db
+from reminder_agent.infrastructure.embeddings import (
+    EmbeddingPrivacyPolicy,
+    EmbeddingProvider,
+    create_embedding_provider,
+)
+from reminder_agent.infrastructure.llm import OpenAICompatibleLLMClient
+from reminder_agent.infrastructure.observability import configure_logging, log_event, request_id
+from reminder_agent.infrastructure.settings import Settings, get_settings, validate_runtime_settings
+from reminder_agent.infrastructure.transcription import AudioTranscriber, GroqWhisperTranscriber
 
 REQUIRED_SCHEMA_TABLES = (
     "users",
@@ -85,11 +93,11 @@ def create_app(
     settings: Settings | None = None,
     *,
     telegram_client: TelegramClient | None = None,
-    session_factory: Callable[[], Session] | None = None,
-    reminder_interpreter=None,
-    intent_router=None,
-    memory_answerer=None,
-    embedding_provider=None,
+    session_factory: SessionFactory | None = None,
+    reminder_interpreter: ReminderIntentInterpreter | None = None,
+    intent_router: IntentRouter | None = None,
+    memory_answerer: MemoryAnswerer | None = None,
+    embedding_provider: EmbeddingProvider | None = None,
     transcriber: AudioTranscriber | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> FastAPI:
@@ -102,7 +110,7 @@ def create_app(
     )
 
     @asynccontextmanager
-    async def lifespan(_app: FastAPI):
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         validate_runtime_settings(
             runtime_settings,
             allow_local_database=session_factory is not None,
@@ -158,10 +166,8 @@ def create_app(
         model_interpreter
     )
     app.state.memory_answerer = memory_answerer or configured_memory_answerer
-    app.state.clock = clock or (lambda: datetime.now(timezone.utc))
-    app.state.embedding_provider = embedding_provider or create_embedding_provider(
-        runtime_settings
-    )
+    app.state.clock = clock or (lambda: datetime.now(UTC))
+    app.state.embedding_provider = embedding_provider or create_embedding_provider(runtime_settings)
     app.state.embedding_privacy_policy = EmbeddingPrivacyPolicy(
         allow_sensitive_external=runtime_settings.embedding_allow_sensitive_external
     )
@@ -173,7 +179,9 @@ def create_app(
     )
 
     @app.middleware("http")
-    async def request_logging(request: Request, call_next: TypingCallable[[Request], Awaitable[Response]]):
+    async def request_logging(
+        request: Request, call_next: TypingCallable[[Request], Awaitable[Response]]
+    ) -> Response:
         correlation_id = request.headers.get("X-Request-ID") or request_id()
         request.state.request_id = correlation_id
         started = time.perf_counter()
@@ -213,6 +221,7 @@ def create_app(
         return response
 
     if session_factory is not None:
+
         def override_db() -> Generator[Session, None, None]:
             db = session_factory()
             try:
@@ -227,7 +236,7 @@ def create_app(
         return {"status": "ok"}
 
     @app.get("/ready")
-    def ready(db: Session = Depends(get_db)) -> dict[str, str]:
+    def ready(db: Session = Depends(get_db)) -> dict[str, str]:  # noqa: B008
         try:
             db.execute(text("SELECT 1"))
             inspector = inspect(db.get_bind())
@@ -288,4 +297,4 @@ app = create_app()
 
 
 def run() -> None:
-    uvicorn.run("reminder_agent.main:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("reminder_agent.application.main:app", host="0.0.0.0", port=8000, reload=False)
