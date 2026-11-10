@@ -43,6 +43,14 @@ from reminder_agent.application.identity.resolve import (
 from reminder_agent.application.identity.resolve import (
     resolve_linked_identity,
 )
+from reminder_agent.application.voice_call_authorization import (
+    VoiceCallAuthorizationResult,
+    authorize_incoming_vapi_call,
+    authorize_vapi_call,
+    end_vapi_call,
+    resolve_vapi_authorization,
+    resolve_vapi_call_context,
+)
 from reminder_agent.features.memory.saving import save_memory_for_request
 from reminder_agent.features.onboarding.phone_linking_service import (
     PhoneLinkDecision,
@@ -117,4 +125,10 @@ __all__ = [
     "classify_onboarding_text",
     "resolve_linked_identity",
     "save_memory_for_request",
+    "VoiceCallAuthorizationResult",
+    "authorize_incoming_vapi_call",
+    "authorize_vapi_call",
+    "end_vapi_call",
+    "resolve_vapi_authorization",
+    "resolve_vapi_call_context",
 ]
