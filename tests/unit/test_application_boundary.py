@@ -34,7 +34,7 @@ from reminder_agent.features.intent.deterministic.routing import ConversationRou
 from reminder_agent.features.memory import adapters as memory_adapters
 from reminder_agent.features.reminders.cancel.decisions import CancellationScope
 from reminder_agent.features.reminders.cancel.messages import REMINDER_CANCEL_MESSAGES
-from reminder_agent.infrastructure.db.models import (
+from reminder_agent.infrastructure.database.models import (
     ChannelIdentity,
     IdempotencyRecord,
     MemoryFact,
@@ -120,7 +120,7 @@ def test_application_boundary_is_independent_of_telegram_payloads_and_clients() 
     )
     telegram_imports = []
     for path in application_paths:
-        if path.name in {"bootstrap.py", "conversation_coordinator.py"}:
+        if path.name in {"main.py", "conversation_coordinator.py"}:
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
         telegram_imports.extend(
