@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from reminder_agent.application import conversation_coordinator as reminders
 from reminder_agent.channels.telegram.provider import TelegramUpdate
-from reminder_agent.infrastructure.db.models import ChannelIdentity, IdempotencyRecord, User
+from reminder_agent.infrastructure.database.models import ChannelIdentity, IdempotencyRecord, User
 
 
 def _active_identity(db, *, telegram_user_id: int = 1001, chat_id: int = 2001):

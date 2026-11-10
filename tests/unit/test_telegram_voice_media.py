@@ -3,7 +3,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from reminder_agent.telegram import HttpTelegramClient, TelegramAPIError
+from reminder_agent.channels.telegram.provider import HttpTelegramClient, TelegramAPIError
 
 
 class _Response:
@@ -53,4 +53,3 @@ def test_file_download_streams_and_enforces_limit(monkeypatch) -> None:
     with pytest.raises(TelegramAPIError) as exc_info:
         HttpTelegramClient("token").download_file("voice/a.ogg", max_bytes=4)
     assert exc_info.value.failure_kind == "too_large"
-
