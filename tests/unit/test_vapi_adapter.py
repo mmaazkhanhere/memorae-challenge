@@ -10,6 +10,9 @@ from reminder_agent.application.voice_call_authorization import resolve_vapi_cal
 from reminder_agent.infrastructure.config.settings import Settings, validate_runtime_settings
 from reminder_agent.infrastructure.database.models import (
     ChannelIdentity,
+    ConversationSession,
+    Notification,
+    Reminder,
     User,
     VoiceCallAuthorization,
 )
@@ -74,6 +77,48 @@ def _customer_payload(call_id: str = "call-customer-1", phone: str = PHONE) -> d
     }
 
 
+def _tool_payload(
+    *,
+    call_id: str = "call-test-1",
+    tool_call_id: str = "tool-test-1",
+    utterance: str = "Remind me in five minutes to call the bank",
+) -> dict:
+    return {
+        "message": {
+            "type": "tool-calls",
+            "call": {"id": call_id},
+            "toolCallList": [
+                {
+                    "id": tool_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "submit_reminder_utterance",
+                        "arguments": {"utterance": utterance},
+                    },
+                }
+            ],
+        }
+    }
+
+
+def _seed_linked_user_with_telegram(session_factory, *, phone: str = PHONE):
+    user, phone_identity = _seed_linked_user(session_factory, phone=phone)
+    db = session_factory()
+    try:
+        telegram_identity = ChannelIdentity(
+            user_id=user.id,
+            channel_type="TELEGRAM",
+            external_id="1001",
+            telegram_chat_id=2001,
+            status="LINKED",
+        )
+        db.add(telegram_identity)
+        db.commit()
+        return user, phone_identity, telegram_identity
+    finally:
+        db.close()
+
+
 def test_authorized_assistant_request_creates_one_server_side_binding(
     session_factory, fixed_now
 ) -> None:
@@ -95,6 +140,9 @@ def test_authorized_assistant_request_creates_one_server_side_binding(
     body = response.json()
     assert body["assistant"]["name"] == "Memorae"
     assert "server" not in body["assistant"]
+    assert body["assistant"]["model"]["tools"][0]["function"]["name"] == (
+        "submit_reminder_utterance"
+    )
     rendered = response.text
     assert PHONE not in rendered
     db = session_factory()
@@ -222,6 +270,187 @@ def test_disabled_vapi_endpoint_does_not_authorize(session_factory, fixed_now) -
             headers={"Authorization": f"Bearer {TOKEN}"},
         )
     assert response.status_code == 404
+
+
+def test_tool_call_creates_telegram_reminder_for_authorized_call(
+    session_factory, fixed_now
+) -> None:
+    _seed_linked_user_with_telegram(session_factory)
+    app = create_app(_settings(), session_factory=session_factory, clock=lambda: fixed_now)
+
+    with TestClient(app) as client:
+        authorized = client.post(
+            "/webhook/vapi",
+            json=_payload(),
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+        assert authorized.status_code == 200
+        tool_response = client.post(
+            "/webhook/vapi",
+            json=_tool_payload(),
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+
+    assert tool_response.status_code == 200
+    body = tool_response.json()
+    assert body["results"][0]["toolCallId"] == "tool-test-1"
+    assert "call the bank" in body["results"][0]["result"]
+    assert "Telegram" in body["results"][0]["result"]
+    db = session_factory()
+    try:
+        reminder = db.scalar(select(Reminder))
+        notification = db.scalar(select(Notification))
+        assert reminder is not None and reminder.task == "call the bank"
+        assert notification is not None
+        telegram = db.scalar(
+            select(ChannelIdentity).where(ChannelIdentity.channel_type == "TELEGRAM")
+        )
+        assert telegram is not None and notification.destination_identity_id == telegram.id
+    finally:
+        db.close()
+
+
+def test_replayed_tool_call_returns_committed_confirmation_without_duplicate(
+    session_factory, fixed_now
+) -> None:
+    _seed_linked_user_with_telegram(session_factory)
+    app = create_app(_settings(), session_factory=session_factory, clock=lambda: fixed_now)
+    with TestClient(app) as client:
+        headers = {"Authorization": f"Bearer {TOKEN}"}
+        client.post("/webhook/vapi", json=_payload(), headers=headers)
+        first = client.post("/webhook/vapi", json=_tool_payload(), headers=headers)
+        second = client.post("/webhook/vapi", json=_tool_payload(), headers=headers)
+
+    assert first.json() == second.json()
+    db = session_factory()
+    try:
+        assert db.scalar(select(func.count()).select_from(Reminder)) == 1
+        assert db.scalar(select(func.count()).select_from(Notification)) == 1
+    finally:
+        db.close()
+
+
+def test_reused_tool_call_id_with_different_request_is_rejected(
+    session_factory, fixed_now
+) -> None:
+    _seed_linked_user_with_telegram(session_factory)
+    app = create_app(_settings(), session_factory=session_factory, clock=lambda: fixed_now)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    with TestClient(app) as client:
+        client.post("/webhook/vapi", json=_payload(), headers=headers)
+        first = client.post("/webhook/vapi", json=_tool_payload(), headers=headers)
+        second = client.post(
+            "/webhook/vapi",
+            json=_tool_payload(utterance="Remind me in ten minutes to walk the dog"),
+            headers=headers,
+        )
+
+    assert "already used" not in first.json()["results"][0].get("error", "")
+    assert "already used" in second.json()["results"][0]["error"]
+    db = session_factory()
+    try:
+        assert db.scalar(select(func.count()).select_from(Reminder)) == 1
+    finally:
+        db.close()
+
+
+def test_distinct_tool_calls_in_one_call_create_distinct_reminders(
+    session_factory, fixed_now
+) -> None:
+    _seed_linked_user_with_telegram(session_factory)
+    app = create_app(_settings(), session_factory=session_factory, clock=lambda: fixed_now)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    with TestClient(app) as client:
+        client.post("/webhook/vapi", json=_payload(), headers=headers)
+        first = client.post(
+            "/webhook/vapi",
+            json=_tool_payload(tool_call_id="tool-distinct-1"),
+            headers=headers,
+        )
+        second = client.post(
+            "/webhook/vapi",
+            json=_tool_payload(
+                tool_call_id="tool-distinct-2",
+                utterance="Remind me in ten minutes to walk the dog",
+            ),
+            headers=headers,
+        )
+
+    assert "call the bank" in first.json()["results"][0]["result"]
+    assert "walk the dog" in second.json()["results"][0]["result"]
+    db = session_factory()
+    try:
+        assert db.scalar(select(func.count()).select_from(Reminder)) == 2
+    finally:
+        db.close()
+
+
+def test_tool_call_rejects_action_arguments_instead_of_trusting_llm_fields(
+    session_factory, fixed_now
+) -> None:
+    _seed_linked_user_with_telegram(session_factory)
+    app = create_app(_settings(), session_factory=session_factory, clock=lambda: fixed_now)
+    payload = _tool_payload()
+    payload["message"]["toolCallList"][0]["function"]["arguments"] = {
+        "utterance": "Remind me in five minutes to call the bank",
+        "user_id": "another-user",
+    }
+    with TestClient(app) as client:
+        client.post(
+            "/webhook/vapi",
+            json=_payload(),
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+        response = client.post(
+            "/webhook/vapi",
+            json=payload,
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+
+    assert response.status_code == 200
+    assert "understand" in response.json()["results"][0]["error"]
+    db = session_factory()
+    try:
+        assert db.scalar(select(func.count()).select_from(Reminder)) == 0
+    finally:
+        db.close()
+
+
+def test_voice_clarification_follow_up_completes_the_same_call_draft(
+    session_factory, fixed_now
+) -> None:
+    _seed_linked_user_with_telegram(session_factory)
+    app = create_app(_settings(), session_factory=session_factory, clock=lambda: fixed_now)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    with TestClient(app) as client:
+        client.post("/webhook/vapi", json=_payload(), headers=headers)
+        first = client.post(
+            "/webhook/vapi",
+            json=_tool_payload(
+                tool_call_id="tool-clarify-1",
+                utterance="Remind me to call the bank",
+            ),
+            headers=headers,
+        )
+        second = client.post(
+            "/webhook/vapi",
+            json=_tool_payload(
+                tool_call_id="tool-clarify-2",
+                utterance="tomorrow at 9 AM",
+            ),
+            headers=headers,
+        )
+
+    assert "What should" in first.json()["results"][0]["result"]
+    assert "call the bank" in second.json()["results"][0]["result"]
+    db = session_factory()
+    try:
+        assert db.scalar(select(func.count()).select_from(Reminder)) == 1
+        assert db.scalar(select(func.count()).select_from(ConversationSession)) == 1
+        session = db.scalar(select(ConversationSession))
+        assert session is not None and session.pending_clarification is None
+    finally:
+        db.close()
 
 
 def test_enabled_vapi_requires_a_strong_webhook_credential() -> None:
