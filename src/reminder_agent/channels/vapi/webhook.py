@@ -1,4 +1,4 @@
-"""Vapi server webhook adapter for inbound authorization and VS-17 tools."""
+"""Vapi server webhook adapter for call authorization and application tools."""
 
 from __future__ import annotations
 
@@ -12,6 +12,10 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
+from reminder_agent.application.vapi_memory_workflow import (
+    process_vapi_memory_lookup_tool,
+    process_vapi_memory_save_tool,
+)
 from reminder_agent.application.voice_call_authorization import (
     authorize_incoming_vapi_call,
     end_vapi_call,
@@ -29,6 +33,8 @@ ASSISTANT_REQUEST = "assistant-request"
 END_OF_CALL_REPORT = "end-of-call-report"
 TOOL_CALLS = "tool-calls"
 REMINDER_TOOL_NAME = "submit_reminder_utterance"
+SAVE_MEMORY_TOOL_NAME = "submit_memory_save_utterance"
+LOOKUP_MEMORY_TOOL_NAME = "submit_memory_lookup_utterance"
 GENERIC_REJECTION = "We could not verify this call. Please link this number in Telegram."
 TOOL_ARGUMENT_ERROR = "I couldn't understand that reminder request."
 
@@ -54,10 +60,14 @@ def _assistant_response(settings: Any) -> dict[str, Any]:
     """Return a user-independent transient assistant configuration."""
 
     tool_instructions = (
-        "Use submit_reminder_utterance for every request to create a reminder. "
+        "Use the matching server tool for every reminder or memory request. "
+        "Use submit_reminder_utterance for reminders, submit_memory_save_utterance "
+        "when the caller asks you to remember/save a fact, and "
+        "submit_memory_lookup_utterance when the caller asks about a saved fact, "
+        "including personal date or time questions. "
         "Pass the caller's complete request as utterance without extracting or changing "
-        "the task, date, time, recurrence, or channel. Wait for the tool result before "
-        "claiming success, and repeat the returned confirmation exactly."
+        "its content. Wait for the tool result before claiming success, and repeat the "
+        "returned response exactly. Never invent a saved fact or confirmation."
     )
     return {
         "assistant": {
@@ -78,7 +88,10 @@ def _assistant_response(settings: Any) -> dict[str, Any]:
                         "type": "function",
                         "function": {
                             "name": REMINDER_TOOL_NAME,
-                            "description": "Submit a caller's complete reminder request.",
+                            "description": (
+                                "Submit a caller's complete request to create or manage a "
+                                "reminder. Do not use for questions about saved personal facts."
+                            ),
                             "parameters": {
                                 "type": "object",
                                 "properties": {
@@ -91,7 +104,46 @@ def _assistant_response(settings: Any) -> dict[str, Any]:
                                 "additionalProperties": False,
                             },
                         },
-                    }
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": SAVE_MEMORY_TOOL_NAME,
+                            "description": "Submit a caller's complete memory-save request.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "utterance": {
+                                        "type": "string",
+                                        "description": "The caller's complete memory request verbatim.",
+                                    }
+                                },
+                                "required": ["utterance"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": LOOKUP_MEMORY_TOOL_NAME,
+                            "description": (
+                                "Submit a caller's complete question about a saved personal "
+                                "fact, including indirect date or time questions."
+                            ),
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "utterance": {
+                                        "type": "string",
+                                        "description": "The caller's complete memory lookup request verbatim.",
+                                    }
+                                },
+                                "required": ["utterance"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    },
                 ],
             },
             "voice": {
@@ -131,22 +183,44 @@ def _tool_call_response(
 
     if call_id is None:
         return {"toolCallId": tool_call.id, "error": "I couldn't verify this call."}
-    if tool_call.type != "function" or tool_call.function.name != REMINDER_TOOL_NAME:
+    if tool_call.type != "function" or tool_call.function.name not in {
+        REMINDER_TOOL_NAME,
+        SAVE_MEMORY_TOOL_NAME,
+        LOOKUP_MEMORY_TOOL_NAME,
+    }:
         return {"toolCallId": tool_call.id, "error": "That voice action is not supported yet."}
     utterance = _tool_utterance(tool_call)
     if utterance is None:
         return {"toolCallId": tool_call.id, "error": TOOL_ARGUMENT_ERROR}
     try:
-        outcome = process_vapi_reminder_tool(
-            db,
-            call_id=call_id,
-            tool_call_id=tool_call.id,
-            utterance=utterance,
-            interpreter=request.app.state.reminder_interpreter,
-            intent_router=request.app.state.intent_router,
-            now=request.app.state.clock(),
-            session_ttl_seconds=request.app.state.settings.conversation_session_ttl_seconds,
-        )
+        common = {
+            "db": db,
+            "call_id": call_id,
+            "tool_call_id": tool_call.id,
+            "utterance": utterance,
+            "interpreter": request.app.state.reminder_interpreter,
+            "intent_router": request.app.state.intent_router,
+            "now": request.app.state.clock(),
+            "session_ttl_seconds": request.app.state.settings.conversation_session_ttl_seconds,
+        }
+        if tool_call.function.name == REMINDER_TOOL_NAME:
+            outcome = process_vapi_reminder_tool(**common)
+        elif tool_call.function.name == SAVE_MEMORY_TOOL_NAME:
+            outcome = process_vapi_memory_save_tool(
+                **common,
+                embedding_provider=request.app.state.embedding_provider,
+                embedding_privacy_policy=request.app.state.embedding_privacy_policy,
+                memory_retrieval_policy=request.app.state.memory_retrieval_policy,
+                memory_answerer=request.app.state.memory_answerer,
+            )
+        else:
+            outcome = process_vapi_memory_lookup_tool(
+                **common,
+                embedding_provider=request.app.state.embedding_provider,
+                embedding_privacy_policy=request.app.state.embedding_privacy_policy,
+                memory_retrieval_policy=request.app.state.memory_retrieval_policy,
+                memory_answerer=request.app.state.memory_answerer,
+            )
     except IdempotencyConflict:
         return {
             "toolCallId": tool_call.id,
@@ -161,7 +235,7 @@ def _tool_call_response(
             tool_call_id=tool_call.id,
             exc_info=True,
         )
-        return {"toolCallId": tool_call.id, "error": "I couldn't create that reminder."}
+        return {"toolCallId": tool_call.id, "error": "I couldn't complete that request."}
     if outcome.error is not None:
         return {"toolCallId": tool_call.id, "error": outcome.error}
     assert outcome.response is not None

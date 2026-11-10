@@ -7,10 +7,20 @@ from sqlalchemy import func, select
 
 from reminder_agent.application.main import create_app
 from reminder_agent.application.voice_call_authorization import resolve_vapi_call_context
+from reminder_agent.features.intent import (
+    IntentRoute,
+    IntentRouteSuggestion,
+    Interpretation,
+    RetrieveMemoryQuery,
+    RuleBasedIntentInterpreter,
+)
+from reminder_agent.features.memory.messages import MEMORY_SAVE_MESSAGES
 from reminder_agent.infrastructure.config.settings import Settings, validate_runtime_settings
 from reminder_agent.infrastructure.database.models import (
     ChannelIdentity,
     ConversationSession,
+    IdempotencyRecord,
+    MemoryFact,
     Notification,
     Reminder,
     User,
@@ -19,6 +29,37 @@ from reminder_agent.infrastructure.database.models import (
 
 PHONE = "+923001234567"
 TOKEN = "vapi-test-token-" + "x" * 32
+
+
+class _ExternalEmbeddingProvider:
+    model = "fake-external-v1"
+    dimensions = 1536
+    is_external = True
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def embed(self, text: str) -> list[float]:
+        self.calls.append(text)
+        return [1.0, *([0.0] * 1535)]
+
+
+class _MemoryLookupFallbackHarness:
+    """Stand in for the configured model branches in this Vapi regression."""
+
+    def __init__(self) -> None:
+        self._deterministic = RuleBasedIntentInterpreter()
+
+    def classify(self, *_args, **_kwargs) -> IntentRouteSuggestion:
+        return IntentRouteSuggestion(operation=IntentRoute.RETRIEVE_MEMORY)
+
+    def interpret(self, text: str, *, selected_route: IntentRoute, **kwargs) -> Interpretation:
+        if selected_route is IntentRoute.RETRIEVE_MEMORY:
+            return Interpretation(
+                memory_query=RetrieveMemoryQuery(query="birthday"),
+                fallback_allowed=False,
+            )
+        return self._deterministic.interpret(text, selected_route=selected_route, **kwargs)
 
 
 def _settings(*, enabled: bool = True) -> Settings:
@@ -117,6 +158,22 @@ def _seed_linked_user_with_telegram(session_factory, *, phone: str = PHONE):
         return user, phone_identity, telegram_identity
     finally:
         db.close()
+
+
+def _memory_tool_payload(
+    *,
+    name: str,
+    utterance: str,
+    call_id: str = "call-test-1",
+    tool_call_id: str = "memory-tool-1",
+) -> dict:
+    payload = _tool_payload(
+        call_id=call_id,
+        tool_call_id=tool_call_id,
+        utterance=utterance,
+    )
+    payload["message"]["toolCallList"][0]["function"]["name"] = name
+    return payload
 
 
 def test_authorized_assistant_request_creates_one_server_side_binding(
@@ -412,6 +469,214 @@ def test_tool_call_rejects_action_arguments_instead_of_trusting_llm_fields(
     db = session_factory()
     try:
         assert db.scalar(select(func.count()).select_from(Reminder)) == 0
+    finally:
+        db.close()
+
+
+def test_vapi_memory_save_creates_a_fact_without_a_reminder(
+    session_factory, fixed_now
+) -> None:
+    _seed_linked_user_with_telegram(session_factory)
+    app = create_app(_settings(), session_factory=session_factory, clock=lambda: fixed_now)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    payload = _memory_tool_payload(
+        name="submit_memory_save_utterance",
+        utterance="Remember the Wi-Fi password is Andorra2026",
+    )
+    with TestClient(app) as client:
+        client.post("/webhook/vapi", json=_payload(), headers=headers)
+        response = client.post("/webhook/vapi", json=payload, headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["results"][0]["result"] in MEMORY_SAVE_MESSAGES["confirmation"]
+    db = session_factory()
+    try:
+        fact = db.scalar(select(MemoryFact))
+        assert fact is not None
+        assert fact.content == "the Wi-Fi password is Andorra2026"
+        assert db.scalar(select(func.count()).select_from(Reminder)) == 0
+        record = db.scalar(
+            select(IdempotencyRecord).where(
+                IdempotencyRecord.source == "VAPI",
+                IdempotencyRecord.idempotency_key == "call-test-1:memory-tool-1",
+            )
+        )
+        assert record is not None
+        assert "Andorra2026" not in str(record.response)
+    finally:
+        db.close()
+
+
+def test_replayed_vapi_memory_save_does_not_duplicate_the_fact(
+    session_factory, fixed_now
+) -> None:
+    _seed_linked_user_with_telegram(session_factory)
+    app = create_app(_settings(), session_factory=session_factory, clock=lambda: fixed_now)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    payload = _memory_tool_payload(
+        name="submit_memory_save_utterance",
+        utterance="Remember my favorite color is blue",
+    )
+    with TestClient(app) as client:
+        client.post("/webhook/vapi", json=_payload(), headers=headers)
+        first = client.post("/webhook/vapi", json=payload, headers=headers)
+        second = client.post("/webhook/vapi", json=payload, headers=headers)
+
+    assert first.json() == second.json()
+    db = session_factory()
+    try:
+        assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
+    finally:
+        db.close()
+
+
+def test_vapi_memory_lookup_returns_owner_scoped_fact(
+    session_factory, fixed_now
+) -> None:
+    _seed_linked_user_with_telegram(session_factory)
+    app = create_app(_settings(), session_factory=session_factory, clock=lambda: fixed_now)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    with TestClient(app) as client:
+        client.post("/webhook/vapi", json=_payload(), headers=headers)
+        saved = client.post(
+            "/webhook/vapi",
+            json=_memory_tool_payload(
+                name="submit_memory_save_utterance",
+                utterance="Remember my favorite color is blue",
+                tool_call_id="memory-save-1",
+            ),
+            headers=headers,
+        )
+        looked_up = client.post(
+            "/webhook/vapi",
+            json=_memory_tool_payload(
+                name="submit_memory_lookup_utterance",
+                utterance="What's my favorite color?",
+                tool_call_id="memory-lookup-1",
+            ),
+            headers=headers,
+        )
+
+    assert saved.json()["results"][0]["result"] in MEMORY_SAVE_MESSAGES["confirmation"]
+    assert "blue" in looked_up.json()["results"][0]["result"]
+
+
+def test_vapi_memory_lookup_returns_birthday_fact(
+    session_factory, fixed_now
+) -> None:
+    _seed_linked_user_with_telegram(session_factory)
+    harness = _MemoryLookupFallbackHarness()
+    app = create_app(
+        _settings(),
+        session_factory=session_factory,
+        reminder_interpreter=harness,
+        intent_router=harness,
+        clock=lambda: fixed_now,
+    )
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    with TestClient(app) as client:
+        client.post("/webhook/vapi", json=_payload(), headers=headers)
+        client.post(
+            "/webhook/vapi",
+            json=_memory_tool_payload(
+                name="submit_memory_save_utterance",
+                utterance="Remember that my birthday is January 10",
+                tool_call_id="birthday-save-1",
+            ),
+            headers=headers,
+        )
+        response = client.post(
+            "/webhook/vapi",
+            json=_memory_tool_payload(
+                name="submit_memory_lookup_utterance",
+                utterance="When is my birthday?",
+                tool_call_id="birthday-lookup-1",
+            ),
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    assert "January 10" in response.json()["results"][0]["result"]
+
+
+def test_vapi_memory_lookup_speaks_sensitive_facts(
+    session_factory, fixed_now
+) -> None:
+    _seed_linked_user_with_telegram(session_factory)
+    provider = _ExternalEmbeddingProvider()
+    app = create_app(
+        _settings(),
+        session_factory=session_factory,
+        embedding_provider=provider,
+        clock=lambda: fixed_now,
+    )
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    with TestClient(app) as client:
+        client.post("/webhook/vapi", json=_payload(), headers=headers)
+        client.post(
+            "/webhook/vapi",
+            json=_memory_tool_payload(
+                name="submit_memory_save_utterance",
+                utterance="Remember the Wi-Fi password is Andorra2026",
+                tool_call_id="memory-save-sensitive",
+            ),
+            headers=headers,
+        )
+        response = client.post(
+            "/webhook/vapi",
+            json=_memory_tool_payload(
+                name="submit_memory_lookup_utterance",
+                utterance="What's my Wi-Fi password?",
+                tool_call_id="memory-lookup-sensitive",
+            ),
+            headers=headers,
+        )
+
+    result = response.json()["results"][0]["result"]
+    assert "Andorra2026" in result
+    db = session_factory()
+    try:
+        fact = db.scalar(select(MemoryFact))
+        assert fact is not None and fact.embedding_status == "INDEXED"
+        assert provider.calls == ["the Wi-Fi password is Andorra2026"]
+    finally:
+        db.close()
+
+
+def test_vapi_memory_clarification_follow_up_saves_original_operation(
+    session_factory, fixed_now
+) -> None:
+    _seed_linked_user_with_telegram(session_factory)
+    app = create_app(_settings(), session_factory=session_factory, clock=lambda: fixed_now)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    with TestClient(app) as client:
+        client.post("/webhook/vapi", json=_payload(), headers=headers)
+        first = client.post(
+            "/webhook/vapi",
+            json=_memory_tool_payload(
+                name="submit_memory_save_utterance",
+                utterance="Remember the Wi-Fi password",
+                tool_call_id="memory-clarify-1",
+            ),
+            headers=headers,
+        )
+        second = client.post(
+            "/webhook/vapi",
+            json=_memory_tool_payload(
+                name="submit_memory_save_utterance",
+                utterance="Andorra2026",
+                tool_call_id="memory-clarify-2",
+            ),
+            headers=headers,
+        )
+
+    assert "What information" in first.json()["results"][0]["result"]
+    assert second.json()["results"][0]["result"] in MEMORY_SAVE_MESSAGES["confirmation"]
+    db = session_factory()
+    try:
+        assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
+        fact = db.scalar(select(MemoryFact))
+        assert fact is not None and fact.content == "Andorra2026"
     finally:
         db.close()
 
