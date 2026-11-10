@@ -54,18 +54,7 @@ from reminder_agent.features.intent.contracts import (
     Interpretation,
     ReminderSummaryIntent,  # noqa: F401 - adapter compatibility export
 )
-from reminder_agent.features.intent.conversation_routing import (
-    route_and_interpret as feature_route_and_interpret,
-)
-from reminder_agent.features.intent.model_routing import IntentRouter
-from reminder_agent.features.intent.pending_updates import restrict_to_explicit_field_updates
-from reminder_agent.features.intent.pipeline import ReminderIntentInterpreter
-from reminder_agent.features.intent.request_policy import (
-    OUT_OF_SCOPE_RESPONSE,
-    assess_request,
-    is_supported_operation,
-)
-from reminder_agent.features.intent.routing import (
+from reminder_agent.features.intent.deterministic.routing import (
     ConversationRoute,
     is_completion_command,
     is_list_request_command,
@@ -73,16 +62,28 @@ from reminder_agent.features.intent.routing import (
     is_reminder_status_question,
     is_summary_request_command,
 )
+from reminder_agent.features.intent.model.router import IntentRouter
+from reminder_agent.features.intent.pending.reminder_creation import (
+    restrict_to_explicit_field_updates,
+)
+from reminder_agent.features.intent.pipeline import ReminderIntentInterpreter
+from reminder_agent.features.intent.policy import (
+    OUT_OF_SCOPE_RESPONSE,
+    assess_request,
+    is_supported_operation,
+)
+from reminder_agent.features.intent.routing import (
+    route_and_interpret as feature_route_and_interpret,
+)
 from reminder_agent.features.memory.adapters import (
     _handle_memory_lookup_text,
     _handle_memory_text,
 )
-from reminder_agent.features.memory.memories import (
-    MemoryRetrievalPolicy,
-)
-from reminder_agent.features.memory.memory_answering import (
+from reminder_agent.features.memory.create.messages import memory_message
+from reminder_agent.features.memory.retrieve.answering import (
     MemoryAnswerer,
 )
+from reminder_agent.features.memory.retrieve.domain import MemoryRetrievalPolicy
 from reminder_agent.features.reminders.cancel.decisions import (
     is_cancel_command,
 )
@@ -148,7 +149,7 @@ logger = get_logger()
 def _route_and_interpret(*args: Any, **kwargs: Any):
     """Preserve the old patch seam while delegating routing to the feature."""
 
-    import reminder_agent.features.intent.conversation_routing as routing
+    import reminder_agent.features.intent.routing as routing
 
     compatibility_restrict = restrict_to_explicit_field_updates
     try:
@@ -360,7 +361,7 @@ def _legacy_routing_tail() -> None:
                 source=("llm_classifier" if classifier_selected else "deterministic_router"),
             )
             return ConversationRoute.UNRELATED, Interpretation(
-                response_text="What information would you like me to remember?",
+                response_text=memory_message("memory_clarification"),
                 fallback_allowed=False,
             )
         interpretation = interpret_for_route(
@@ -843,12 +844,12 @@ def handle_reminder_text(
             user=user,
             now=now,
             session_ttl_seconds=session_ttl_seconds,
-            response_text="That memory request expired. Please send the complete request again.",
+            response_text=memory_message("memory_clarification_expired"),
             response_kind="memory_clarification_expired",
             operation="SAVE_MEMORY",
         ) or ReminderReply(
             update.message.chat.id,
-            "That memory request expired. Please send the complete request again.",
+            memory_message("memory_clarification_expired"),
         )
 
     # A pending memory accepts a plain fact as its answer. Explicit commands
@@ -868,10 +869,10 @@ def handle_reminder_text(
                 user=user,
                 now=now,
                 session_ttl_seconds=session_ttl_seconds,
-                response_text="Okay, I won't save anything.",
+                response_text=memory_message("memory_canceled"),
                 response_kind="memory_canceled",
                 operation="SAVE_MEMORY",
-            ) or ReminderReply(update.message.chat.id, "Okay, I won't save anything.")
+            ) or ReminderReply(update.message.chat.id, memory_message("memory_canceled"))
 
         if deterministic_route in {
             ConversationRoute.NEW_REQUEST,
@@ -1106,9 +1107,9 @@ def handle_reminder_text(
                 db,
                 update,
                 user_id=user.id,
+                user=user,
                 identity_id=identity.id,
                 telegram_user_id=telegram_user_id,
-                user=user,
                 pending=pending_reschedule,
                 now=now,
                 session_ttl_seconds=session_ttl_seconds,

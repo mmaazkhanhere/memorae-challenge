@@ -1,8 +1,8 @@
 from datetime import UTC, datetime
 
 from reminder_agent.features.intent.contracts import IntentRoute
-from reminder_agent.features.intent.deterministic_interpreter import RuleBasedIntentInterpreter
-from reminder_agent.features.intent.routing import ConversationRoute, route_message
+from reminder_agent.features.intent.deterministic.interpreter import RuleBasedIntentInterpreter
+from reminder_agent.features.intent.deterministic.routing import ConversationRoute, route_message
 
 
 def test_quoted_pending_summary_routes_deterministically() -> None:

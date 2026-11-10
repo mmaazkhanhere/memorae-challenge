@@ -2,7 +2,7 @@ from enum import StrEnum
 
 import pytest
 
-from reminder_agent.request_policy import (
+from reminder_agent.features.intent.policy import (
     OUT_OF_SCOPE_RESPONSE,
     RequestDisposition,
     assess_request,

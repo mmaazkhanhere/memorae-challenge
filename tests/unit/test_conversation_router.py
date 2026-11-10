@@ -3,7 +3,7 @@ from datetime import date
 import pytest
 
 from reminder_agent.features.intent import PendingReminder
-from reminder_agent.features.intent.routing import (
+from reminder_agent.features.intent.deterministic.routing import (
     ConversationRoute,
     is_completion_command,
     is_list_request_command,

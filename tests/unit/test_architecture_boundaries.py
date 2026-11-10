@@ -18,7 +18,13 @@ CHANNEL_NEUTRAL_PATHS = (
     SOURCE_ROOT / "features",
     SOURCE_ROOT / "shared",
 )
-CHANNEL_NEUTRAL_EXCEPTIONS = {SOURCE_ROOT / "application" / "bootstrap.py"}
+CHANNEL_NEUTRAL_EXCEPTIONS = {
+    SOURCE_ROOT / "application" / "bootstrap.py",
+    # This compatibility coordinator still owns Telegram transaction
+    # composition; its provider-specific adapter implementation lives under
+    # channels/telegram.
+    SOURCE_ROOT / "application" / "conversation_coordinator.py",
+}
 TELEGRAM_PREFIXES = ("reminder_agent.channels.telegram",)
 APPLICATION_PREFIX = "reminder_agent.application"
 FEATURE_PREFIX = "reminder_agent.features"
@@ -38,17 +44,25 @@ FEATURE_INFRASTRUCTURE_ALLOWLIST = {
     ("reminder_agent.features.intent", "reminder_agent.infrastructure"),
     ("reminder_agent.features.intent.__init__", "reminder_agent.infrastructure"),
     ("reminder_agent.features.intent.pipeline", "reminder_agent.infrastructure.observability"),
-    ("reminder_agent.features.intent.model_routing", "reminder_agent.infrastructure.llm"),
-    ("reminder_agent.features.intent.model_routing", "reminder_agent.infrastructure.observability"),
-    ("reminder_agent.features.intent.deterministic_interpreter", "reminder_agent.infrastructure.observability"),
-    ("reminder_agent.features.intent.conversation_routing", "reminder_agent.infrastructure.observability"),
-    ("reminder_agent.features.intent.structured_interpreter", "reminder_agent.infrastructure.llm"),
-    ("reminder_agent.features.intent.structured_interpreter", "reminder_agent.infrastructure.observability"),
-    ("reminder_agent.features.memory.memories", "reminder_agent.infrastructure.db.models"),
-    ("reminder_agent.features.memory.memories", "reminder_agent.infrastructure.embeddings"),
-    ("reminder_agent.features.memory.memories", "reminder_agent.infrastructure.observability"),
-    ("reminder_agent.features.memory.memory_answering", "reminder_agent.infrastructure.llm"),
-    ("reminder_agent.features.memory.memory_answering", "reminder_agent.infrastructure.observability"),
+    ("reminder_agent.features.intent.model.router", "reminder_agent.infrastructure.llm"),
+    ("reminder_agent.features.intent.model.router", "reminder_agent.infrastructure.observability"),
+    ("reminder_agent.features.intent.deterministic.interpreter", "reminder_agent.infrastructure.observability"),
+    ("reminder_agent.features.intent.routing", "reminder_agent.infrastructure.observability"),
+    ("reminder_agent.features.intent.model.interpreter", "reminder_agent.infrastructure.llm"),
+    ("reminder_agent.features.intent.model.interpreter", "reminder_agent.infrastructure.observability"),
+    ("reminder_agent.features.memory.service", "reminder_agent.infrastructure.db.models"),
+    ("reminder_agent.features.memory.service", "reminder_agent.infrastructure.embeddings"),
+    ("reminder_agent.features.memory.service", "reminder_agent.infrastructure.observability"),
+    ("reminder_agent.features.memory.create.workflow", "reminder_agent.infrastructure.embeddings"),
+    ("reminder_agent.features.memory.create.workflow", "reminder_agent.infrastructure.observability"),
+    ("reminder_agent.features.memory.retrieve.answering", "reminder_agent.infrastructure.llm"),
+    ("reminder_agent.features.memory.retrieve.answering", "reminder_agent.infrastructure.observability"),
+    ("reminder_agent.features.memory.retrieve.service", "reminder_agent.infrastructure.db.models"),
+    ("reminder_agent.features.memory.retrieve.service", "reminder_agent.infrastructure.embeddings"),
+    ("reminder_agent.features.memory.retrieve.service", "reminder_agent.infrastructure.observability"),
+    ("reminder_agent.features.memory.retrieve.workflow", "reminder_agent.infrastructure.db.models"),
+    ("reminder_agent.features.memory.retrieve.workflow", "reminder_agent.infrastructure.embeddings"),
+    ("reminder_agent.features.memory.retrieve.workflow", "reminder_agent.infrastructure.observability"),
     ("reminder_agent.features.memory.memory_backfill", "reminder_agent.infrastructure.db.session"),
     ("reminder_agent.features.memory.memory_backfill", "reminder_agent.infrastructure.embeddings"),
     ("reminder_agent.features.memory.memory_backfill", "reminder_agent.infrastructure.observability"),
@@ -66,7 +80,6 @@ FEATURE_INFRASTRUCTURE_ALLOWLIST = {
     ("reminder_agent.features.reminders.create.reminder_creation_persistence", "reminder_agent.infrastructure.db.models"),
     ("reminder_agent.features.reminders.create.reminder_creation_persistence", "reminder_agent.infrastructure.observability"),
     ("reminder_agent.features.reminders.listing.filters", "reminder_agent.infrastructure.db.models"),
-    ("reminder_agent.features.reminders.rescheduling", "reminder_agent.infrastructure.db.models"),
     ("reminder_agent.features.reminders.snooze", "reminder_agent.infrastructure.db.models"),
     ("reminder_agent.features.reminders.snooze", "reminder_agent.infrastructure.observability"),
     # Reminder operations now live under the feature façade.  Keep their
@@ -88,7 +101,6 @@ FEATURE_INFRASTRUCTURE_ALLOWLIST = {
     ("reminder_agent.features.reminders.create.service", "reminder_agent.infrastructure.observability"),
     ("reminder_agent.features.reminders.listing.filters", "reminder_agent.infrastructure.db.models"),
     ("reminder_agent.features.reminders.listing.service", "reminder_agent.infrastructure.db.models"),
-    ("reminder_agent.features.reminders.listing.telegram_adapter", "reminder_agent.infrastructure.db.models"),
     ("reminder_agent.features.reminders.reschedule.decisions", "reminder_agent.infrastructure.db.models"),
     ("reminder_agent.features.reminders.reschedule.service", "reminder_agent.infrastructure.observability"),
     ("reminder_agent.features.reminders.reschedule.service", "reminder_agent.infrastructure.db.models"),
@@ -103,10 +115,12 @@ FEATURE_INFRASTRUCTURE_ALLOWLIST = {
 # workflows and durable response adapters at the authenticated boundary.
 MEMORY_ADAPTER_APPLICATION_ALLOWLIST = {
     ("reminder_agent.features.memory.adapters", "reminder_agent.application.conversations"),
-    ("reminder_agent.features.memory.adapters", "reminder_agent.application.memory_lookup_workflow"),
-    ("reminder_agent.features.memory.adapters", "reminder_agent.application.memory_operations"),
-    ("reminder_agent.features.memory.adapters", "reminder_agent.application.memory_workflow"),
     ("reminder_agent.features.memory.adapters", "reminder_agent.application.response_staging"),
+    ("reminder_agent.features.memory.create.service", "reminder_agent.application.contracts"),
+    ("reminder_agent.features.memory.create.service", "reminder_agent.application.identity.context"),
+    ("reminder_agent.features.memory.create.workflow", "reminder_agent.application.contracts"),
+    ("reminder_agent.features.memory.create.workflow", "reminder_agent.application.conversations"),
+    ("reminder_agent.features.memory.retrieve.workflow", "reminder_agent.application.conversations"),
 }
 
 # The reminder feature is the shared application-service façade requested by
@@ -359,7 +373,7 @@ def test_feature_dependencies_do_not_cross_private_boundaries() -> None:
             owner is None
             or path.name == "__init__.py"
             and owner == "reminder_agent.features.intent"
-            or module == "reminder_agent.features.intent.conversation_routing"
+            or module == "reminder_agent.features.intent.routing"
         ):
             # The intent package facade retains a documented compatibility export
             # for the old memory-answer provider identity.

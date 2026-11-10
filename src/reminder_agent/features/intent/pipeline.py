@@ -10,8 +10,6 @@ from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
-from reminder_agent.features.intent import deterministic_interpreter as _deterministic_interpreter
-from reminder_agent.features.intent import structured_interpreter as _structured_interpreter
 from reminder_agent.features.intent.contracts import (
     IntentInterpreter,
     IntentRoute,
@@ -19,6 +17,8 @@ from reminder_agent.features.intent.contracts import (
     NeedsClarification,
     PendingReminder,
 )
+from reminder_agent.features.intent.deterministic import interpreter as _deterministic_interpreter
+from reminder_agent.features.intent.model import interpreter as _structured_interpreter
 from reminder_agent.features.reminders.reschedule.models import RescheduleClarification
 from reminder_agent.infrastructure.observability import get_logger, log_event
 

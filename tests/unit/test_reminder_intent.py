@@ -23,15 +23,17 @@ from reminder_agent.features.intent import (
     resolve_pending_due_at,
     restrict_to_explicit_field_updates,
 )
-from reminder_agent.features.intent.request_policy import OUT_OF_SCOPE_RESPONSE
-from reminder_agent.features.intent.routing import ConversationRoute
-from reminder_agent.features.memory.memories import MemoryAnswerProposal, SaveMemoryFact
+from reminder_agent.features.intent.deterministic.routing import ConversationRoute
+from reminder_agent.features.intent.policy import OUT_OF_SCOPE_RESPONSE
+from reminder_agent.features.memory.retrieve.contract import MemoryAnswerProposal
+from reminder_agent.features.memory.retrieve.messages import MEMORY_RETRIEVAL_MESSAGES
 from reminder_agent.features.reminders.reschedule.decisions import (
     RescheduleRequest,
     RescheduleScope,
 )
 from reminder_agent.features.reminders.reschedule.models import RescheduleClarification
 from reminder_agent.infrastructure.settings import Settings
+from reminder_agent.shared.memory_contracts import SaveMemoryFact
 
 NOW = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
 
@@ -520,7 +522,7 @@ def test_malformed_memory_lookup_extraction_is_clarification_only(
     )
 
     assert result.memory_query is None
-    assert result.response_text == "Which saved information should I look up?"
+    assert result.response_text in MEMORY_RETRIEVAL_MESSAGES["missing_subject"]
 
 
 def test_memory_classifier_and_extractor_logs_redact_fact_content(monkeypatch) -> None:

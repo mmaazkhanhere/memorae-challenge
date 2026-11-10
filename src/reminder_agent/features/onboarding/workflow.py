@@ -9,10 +9,10 @@ from sqlalchemy.orm import Session
 
 from reminder_agent.application.contracts import ApplicationRequest
 from reminder_agent.application.voice_transcription import transcribe_telegram_voice
-from reminder_agent.features.intent.model_routing import IntentRouter
+from reminder_agent.features.intent.model.router import IntentRouter
 from reminder_agent.features.intent.pipeline import ReminderIntentInterpreter
-from reminder_agent.features.memory.memories import MemoryRetrievalPolicy
-from reminder_agent.features.memory.memory_answering import MemoryAnswerer
+from reminder_agent.features.memory.retrieve.answering import MemoryAnswerer
+from reminder_agent.features.memory.retrieve.domain import MemoryRetrievalPolicy
 from reminder_agent.features.onboarding.handlers import (
     _is_link_phone,
     _is_skip_phone,

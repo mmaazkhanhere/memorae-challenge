@@ -30,7 +30,7 @@ from reminder_agent.application import (
 from reminder_agent.application import conversation_coordinator as reminders
 from reminder_agent.channels.telegram.provider import TelegramUpdate
 from reminder_agent.features.intent import ReminderIntentInterpreter
-from reminder_agent.features.intent.routing import ConversationRoute
+from reminder_agent.features.intent.deterministic.routing import ConversationRoute
 from reminder_agent.features.memory import adapters as memory_adapters
 from reminder_agent.features.reminders.cancel.decisions import CancellationScope
 from reminder_agent.features.reminders.cancel.messages import REMINDER_CANCEL_MESSAGES
@@ -209,7 +209,7 @@ def test_list_application_service_rechecks_context_and_keeps_reads_non_idempoten
         )
 
         assert result.response_kind == "REMINDER_LIST"
-        assert result.content == "You have no upcoming active reminders."
+        assert result.content == "You're all caught up! No upcoming reminders for now."
         assert forged.response_kind == "AUTHORIZATION_FAILURE"
         assert db.scalar(select(func.count()).select_from(IdempotencyRecord)) == 0
 
