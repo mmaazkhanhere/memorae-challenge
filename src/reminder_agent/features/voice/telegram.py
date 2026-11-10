@@ -6,13 +6,13 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-from reminder_agent.infrastructure.observability import get_logger, log_event
-from reminder_agent.infrastructure.transcription import (
+from reminder_agent.features.voice.transcription import (
     AudioTranscriber,
     TranscriptionError,
     is_ogg_voice_note,
     log_transcription_failure,
 )
+from reminder_agent.infrastructure.observability import get_logger, log_event
 
 logger = get_logger()
 

@@ -8,11 +8,12 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from reminder_agent.application.contracts import ApplicationRequest
-from reminder_agent.application.voice_transcription import transcribe_telegram_voice
 from reminder_agent.features.intent.model.router import IntentRouter
 from reminder_agent.features.intent.pipeline import ReminderIntentInterpreter
 from reminder_agent.features.memory.retrieve.answering import MemoryAnswerer
 from reminder_agent.features.memory.retrieve.contracts import MemoryRetrievalPolicy
+from reminder_agent.features.voice.telegram import transcribe_telegram_voice
+from reminder_agent.features.voice.transcription import AudioTranscriber
 from reminder_agent.features.onboarding.handlers import (
     _is_link_phone,
     _is_skip_phone,
@@ -72,7 +73,6 @@ from reminder_agent.features.reminders.complete.service import handle_completion
 from reminder_agent.infrastructure.db.models import User
 from reminder_agent.infrastructure.embeddings import EmbeddingPrivacyPolicy, EmbeddingProvider
 from reminder_agent.infrastructure.observability import get_logger, log_event
-from reminder_agent.infrastructure.transcription import AudioTranscriber
 from reminder_agent.shared.idempotency import IdempotencyConflict as _IdempotencyConflict
 
 ACTIVE = "ACTIVE"

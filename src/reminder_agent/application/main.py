@@ -34,7 +34,7 @@ from reminder_agent.infrastructure.embeddings import (
 from reminder_agent.infrastructure.llm import OpenAICompatibleLLMClient
 from reminder_agent.infrastructure.observability import configure_logging, log_event, request_id
 from reminder_agent.infrastructure.settings import Settings, get_settings, validate_runtime_settings
-from reminder_agent.infrastructure.transcription import AudioTranscriber, GroqWhisperTranscriber
+from reminder_agent.features.voice.transcription import AudioTranscriber, GroqWhisperTranscriber
 
 REQUIRED_SCHEMA_TABLES = (
     "users",
