@@ -19,6 +19,10 @@ or {"operation":"NEEDS_CLARIFICATION","question":"<focused question>"}.
 Preserve the user's meaning and exact values. Do not invent, summarize away, or add facts.
 The route has already been authorized as an intentional memory-save request; this prompt does
 not authorize saving. If no fact content was provided, ask what information to remember.
+Treat a subject-only request as missing content: "Remember my parking spot", "Remember my
+locker number", and "Remember my gate code" do not contain values. Return NEEDS_CLARIFICATION
+for these requests rather than returning the subject as a saved fact. Only return SAVE_MEMORY
+when the requested fact includes its value, such as "my parking spot is B17".
 Never create a reminder, schedule, user ID, fact ID, or other operation.
 """
 MEMORY_RETRIEVAL_EXTRACTION_PROMPT = """
