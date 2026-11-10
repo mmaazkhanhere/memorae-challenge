@@ -7,7 +7,7 @@ from reminder_agent.channels.telegram.provider import TelegramUpdate
 from reminder_agent.features.onboarding.workflow import (
     IdempotencyConflict as PublicIdempotencyConflict,
 )
-from reminder_agent.infrastructure.db.models import IdempotencyRecord
+from reminder_agent.infrastructure.database.models import IdempotencyRecord
 from reminder_agent.shared.idempotency import IdempotencyConflict as SharedIdempotencyConflict
 from reminder_agent.shared.idempotency import request_hash
 
