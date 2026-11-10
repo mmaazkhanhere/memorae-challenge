@@ -7,9 +7,9 @@ import random
 ONBOARDING_MESSAGES: dict[str, list[str]] = {
     "welcome": [
         "Hey {name}! 👋 I'm here to help keep the little things off your mind. First things first, what city or time zone are you in? (e.g. Asia/Karachi)",
-        "Hi {name}! Nice to meet you. I'll help you keep track of things so you don't have to remember everything yourself. What city or time zone should I use? (e.g. Europe/Madrid)",
-        "Hey {name}, welcome aboard! 👋 Think of me as your extra memory. Before we get started, what city or time zone should I use (e.g. America/Chicago)?",
-        "Hi {name}! 👋 Got a lot to remember? That's what I'm here for. Let's start with your city or time zone.(e.g. Europe/London)",
+        "Hi {name}! Nice to meet you. I'll help you keep track of things so you don't have to remember everything yourself. What city or time zone should I use? (e.g. Asia/Karachi)",
+        "Hey {name}, welcome aboard! 👋 Think of me as your extra memory. Before we get started, what city or time zone should I use (e.g. Asia/Karachi)?",
+        "Hi {name}! 👋 Got a lot to remember? That's what I'm here for. Let's start with your city or time zone.(e.g. Asia/Karachi)",
     ],
     "welcome_back": [
         "Hey {name}, welcome back! 👋 We were just getting you set up. What city or time zone should I use? (e.g. Europe/London)",

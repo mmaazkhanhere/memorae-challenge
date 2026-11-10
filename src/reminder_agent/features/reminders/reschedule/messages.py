@@ -6,10 +6,7 @@ import random
 
 REMINDER_RESCHEDULE_MESSAGES: dict[str, list[str]] = {
     "one_time_rescheduled": [
-        "All set! I've moved '{task}' to {when} on Telegram.",
-        "Got it! I'll now remind you to {task} {when} on Telegram.",
-        "Of course! Your reminder to {task} has been moved to {when} on Telegram.",
-        "Done! I've updated '{task}' to {when} on Telegram.",
+        "Moved '{task}' to {when} via Telegram.",
     ],
     "recurring_series_rescheduled": [
         "All set! I've updated all future '{task}' reminders to {cadence} at {time} {timezone} on Telegram. Your next reminder is {next_occurrence}.",

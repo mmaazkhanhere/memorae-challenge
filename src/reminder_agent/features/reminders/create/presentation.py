@@ -17,10 +17,7 @@ ResponseT = TypeVar("ResponseT")
 
 REMINDER_MESSAGES: dict[str, list[str]] = {
     "one_time_created": [
-        "Got it! I'll make sure to remind you to {task} {when} on Telegram.",
-        "Of course! I'll give you a heads-up to {task} {when} on Telegram.",
-        "You got it! I'll remind you to {task} {when} right here on Telegram.",
-        "Consider it taken care of! I'll send you a reminder to {task} {when} on Telegram.",
+        "I'll remind you to {task} {when} on Telegram.",
     ],
     "recurring_created": [
         "Got it! I'll remind you to {task} {cadence} at {time} {timezone} on Telegram. Your next reminder is {next_occurrence}.",
