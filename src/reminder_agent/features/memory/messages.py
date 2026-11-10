@@ -4,6 +4,23 @@ from __future__ import annotations
 
 import random
 
+MEMORY_MESSAGES: dict[str, list[str]] = {
+    "memory_confirmation": [
+        "Got it! I'll keep that in mind.",
+        "Noted! I'll remember that for you.",
+        "Of course! I've got that saved.",
+        "I've made a note of that for you.",
+        "Got it, that's saved!",
+    ],
+    "fact_found": [
+        'You mentioned: "{saved_fact}"',
+        'Here\'s what I have noted: "{saved_fact}"',
+        'I\'ve got this saved: "{saved_fact}"',
+        'I remember you telling me: "{saved_fact}"',
+        'Found it! "{saved_fact}"',
+    ],
+}
+
 MEMORY_SAVE_MESSAGES: dict[str, list[str]] = {
     "clarification": [
         "What information should I remember?",
@@ -15,10 +32,10 @@ MEMORY_SAVE_MESSAGES: dict[str, list[str]] = {
         "Okay, I won't save anything.",
     ],
     "confirmation": [
-        "I saved that information.",
+        *MEMORY_MESSAGES["memory_confirmation"],
     ],
     "confirmation_generic": [
-        "I saved that information.",
+        *MEMORY_MESSAGES["memory_confirmation"],
     ],
     "idempotency_error": [
         "I couldn't process that just now. Could you try again?",
@@ -56,13 +73,16 @@ MEMORY_LOOKUP_MESSAGES: dict[str, list[str]] = {
         "I wasn't able to confirm your identity, so I couldn't check your memories.",
     ],
     "fact_found": [
-        'You told me: "{fact_clause}"',
+        *MEMORY_MESSAGES["fact_found"],
     ],
     "ambiguous_matches": [
         "I found more than one saved fact that could match. Please be more specific.",
     ],
     "unknown_fact": [
         "I don't know that yet.",
+    ],
+    "sensitive_fact_protected": [
+        "For privacy, please check that saved information in your linked Telegram chat.",
     ],
     "retrieval_failed": [
         "I'm having trouble checking your saved memories right now. Could you try again?",
@@ -83,6 +103,5 @@ def lookup_memory_message(key: str, *, fact: str | None = None) -> str:
         if fact is None:
             raise ValueError("fact_found messages require fact content")
         fact_clause = fact.rstrip(".!?")
-        fact_sentence = fact if fact.endswith((".", "!", "?")) else f"{fact}."
-        return template.format(fact_clause=fact_clause, fact_sentence=fact_sentence)
+        return template.format(saved_fact=fact_clause)
     return template

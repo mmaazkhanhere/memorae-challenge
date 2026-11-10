@@ -41,12 +41,30 @@ text. Audio and transcripts are not retained or written to logs; voice replies
 are Telegram text messages. Failed or inaudible notes never mutate reminders
 or memories.
 
+### VS-16 Vapi inbound authorization
+
+Set `VAPI_ENABLED=true`, configure a unique `VAPI_WEBHOOK_BEARER_TOKEN`, and
+run `uv run alembic upgrade head`. In Vapi, attach the HTTPS Server URL
+`POST /webhook/vapi` and the matching saved Bearer credential to the inbound
+phone-number or organization server configuration. Leave the phone number
+without a fixed assistant so the `assistant-request` decision can reject
+unknown callers before a conversation starts. Link the caller's E.164 number
+through Telegram first. The transient assistant exposes server tools for
+reminder creation and full reminder management (list, move, cancel, complete,
+and snooze), plus memory save/lookup. Each tool accepts only the caller's
+complete utterance and uses the shared deterministic-first application
+pipeline; caller-supplied user IDs, fact IDs, reminder IDs, and reminder
+fields are never trusted. Reminder changes made on a call use the linked
+Telegram destination, and committed results are returned to Vapi before the
+assistant speaks. Unknown or ambiguous requests receive clarification without
+mutation.
+
 Production startup fails fast unless `DATABASE_URL` uses PostgreSQL,
 `TELEGRAM_BOT_TOKEN` is configured, and `TELEGRAM_WEBHOOK_SECRET` is a unique value of at
 least 32 characters. The sample placeholders and local SQLite defaults are intended only for
 injected test applications. `/ready` also verifies that the domain tables exist, so a stale
 `alembic_version` row cannot make an empty database appear healthy. Readiness also requires the
-current migration head (`0016_memory_embeddings`) and the worker/confirmation claim
+current migration head (`0017_voice_call_authorizations`) and the worker/confirmation claim
 columns, so a partially migrated database is rejected before webhooks are accepted.
 The additive schema-repair migrations also rebuild missing domain tables when a
 database was reset without resetting its Alembic version row.
@@ -151,20 +169,25 @@ batch at a time with:
 uv run memory-embedding-backfill
 ```
 
-External embedding calls exclude detected passwords, PINs, access codes, keys,
-tokens, and recovery secrets unless the deployment explicitly approves
-`EMBEDDING_ALLOW_SENSITIVE_EXTERNAL=true`. Original memory text remains the
-source of truth; failed or disabled indexing never deletes a fact and lexical
-retrieval continues to work.
+Telegram's default memory indexing excludes detected passwords, PINs, access
+codes, keys, tokens, and recovery secrets from external embedding unless the
+deployment explicitly approves `EMBEDDING_ALLOW_SENSITIVE_EXTERNAL=true`.
+Authenticated Vapi memory calls are the explicit voice-channel exception: they
+may embed and speak sensitive facts. Original memory text remains the source of
+truth; failed or disabled indexing never deletes a fact and lexical retrieval
+continues to work. Existing rows previously marked `SKIPPED_SENSITIVE` need the
+backfill command run with `EMBEDDING_ALLOW_SENSITIVE_EXTERNAL=true` before
+semantic Vapi lookup can use them.
 
 Memory retrieval remains deterministic-first. A single exact lexical match is
 returned without Gemini or GPT-OSS. Otherwise Gemini/pgvector ranks at most the
 authenticated user's top three non-sensitive candidates; similarity does not
 reject them before the dedicated 120B answer prompt returns a validated
 `ANSWER`, `AMBIGUOUS`, or `UNKNOWN` decision. Candidate indices and ownership are
-rechecked, exact values must remain unchanged, and sensitive memory content is
-never sent to the answer model. Provider failure falls back to the deterministic
-unknown or clarification result.
+rechecked, and exact values must remain unchanged. Telegram keeps sensitive
+candidate filtering; authenticated Vapi retrieval explicitly allows sensitive
+facts so the committed answer can be spoken to the caller. Provider failure
+falls back to the deterministic unknown or clarification result.
 
 Gemini's free tier is available for eligible projects, but Google does not
 publish one universal embedding RPM/TPM/RPD value: quotas are project- and

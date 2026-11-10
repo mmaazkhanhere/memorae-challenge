@@ -139,6 +139,37 @@ class ChannelIdentity(Base):
     )
 
 
+class VoiceCallAuthorization(Base):
+    """Server-side binding between one Vapi call and a linked phone identity."""
+
+    __tablename__ = "voice_call_authorizations"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('ACTIVE', 'ENDED', 'EXPIRED')",
+            name="ck_voice_call_authorizations_status",
+        ),
+        Index("ix_voice_call_authorizations_status_expiry", "status", "expires_at"),
+        Index("ix_voice_call_authorizations_user_id", "user_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    provider_call_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    user_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    phone_identity_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("channel_identities.id", ondelete="RESTRICT"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="ACTIVE", server_default="ACTIVE"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class Reminder(Base):
     __tablename__ = "reminders"
     __table_args__ = (

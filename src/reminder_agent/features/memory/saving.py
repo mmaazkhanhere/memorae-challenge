@@ -27,8 +27,11 @@ from reminder_agent.application.identity.context import ACTIVE, authorized_user_
 from reminder_agent.features.memory.messages import save_memory_message
 from reminder_agent.features.memory.persistence import index_memory_fact_for_owner, save_memory_fact
 from reminder_agent.features.memory.validation import is_memory_content_grounded
-from reminder_agent.infrastructure.providers.embeddings import EmbeddingPrivacyPolicy, EmbeddingProvider
 from reminder_agent.infrastructure.observability import get_logger, log_event
+from reminder_agent.infrastructure.providers.embeddings import (
+    EmbeddingPrivacyPolicy,
+    EmbeddingProvider,
+)
 from reminder_agent.shared.memory_contracts import PendingMemory, SaveMemoryFact
 from reminder_agent.shared.memory_text import extract_memory_content
 
@@ -150,6 +153,7 @@ def _clarification_response[ResponseT_co](
     clarification_text: str | None,
     responses: MemoryWorkflowResponses[ResponseT_co],
     upsert_clarification_session: Callable[..., object],
+    conversation_channel_type: str,
 ) -> ResponseT_co:
     db.rollback()
     with db.begin():
@@ -163,8 +167,12 @@ def _clarification_response[ResponseT_co](
             now=now,
             ttl_seconds=session_ttl_seconds,
             for_update=True,
-            channel_type=request.context.verified_identity.channel_type,
+            channel_type=conversation_channel_type,
         )
+        if pending is None and locked_session is not None:
+            # A new memory request supersedes any older pending operation. Do
+            # not leave stale clarification state active after it commits.
+            end_session(locked_session, now=now)
         if pending is not None and pending_memory_from_session(locked_session) is None:
             return responses.stage(
                 user_id=user_id,
@@ -178,7 +186,7 @@ def _clarification_response[ResponseT_co](
             external_session_id=request.context.external_session_id,
             pending=PendingMemory(),
             now=now,
-            channel_type=request.context.verified_identity.channel_type,
+            channel_type=conversation_channel_type,
         )
         return responses.stage(
             user_id=user_id,
@@ -201,6 +209,7 @@ def _save_transaction[ResponseT_co](
     save_memory_operation: Callable[..., ApplicationResult],
     log_event_fn: Callable[..., object],
     event_context: Mapping[str, object],
+    conversation_channel_type: str,
 ) -> tuple[ResponseT_co, UUID | None, bool]:
     db.rollback()
     with db.begin():
@@ -223,8 +232,10 @@ def _save_transaction[ResponseT_co](
             now=now,
             ttl_seconds=session_ttl_seconds,
             for_update=True,
-            channel_type=request.context.verified_identity.channel_type,
+            channel_type=conversation_channel_type,
         )
+        if pending is None and locked_session is not None:
+            end_session(locked_session, now=now)
         if pending is not None and pending_memory_from_session(locked_session) is None:
             return (
                 responses.stage(
@@ -334,10 +345,14 @@ def run_memory_save_workflow[ResponseT_co](
     embedding_privacy_policy: EmbeddingPrivacyPolicy = DEFAULT_EMBEDDING_PRIVACY_POLICY,
     log_event_fn: Callable[..., object] = log_event,
     event_context: Mapping[str, object] | None = None,
+    conversation_channel_type: str | None = None,
 ) -> ResponseT_co:
     """Save a memory or persist its clarification using owned transactions."""
 
     event_context = event_context or {}
+    conversation_channel_type = (
+        conversation_channel_type or request.context.verified_identity.channel_type
+    )
     content = validated_memory_content(
         text=text,
         pending=pending,
@@ -355,6 +370,7 @@ def run_memory_save_workflow[ResponseT_co](
             clarification_text=clarification_text,
             responses=responses,
             upsert_clarification_session=upsert_clarification_session,
+            conversation_channel_type=conversation_channel_type,
         )
     try:
         response, fact_id, should_index = _save_transaction(
@@ -369,6 +385,7 @@ def run_memory_save_workflow[ResponseT_co](
             save_memory_operation=save_memory_operation,
             log_event_fn=log_event_fn,
             event_context=event_context,
+            conversation_channel_type=conversation_channel_type,
         )
         if should_index and embedding_provider is not None:
             assert fact_id is not None

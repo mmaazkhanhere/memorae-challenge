@@ -1224,6 +1224,7 @@ The current SQLAlchemy schema and Alembic migrations provide these implemented t
 - `notifications`: a due Telegram delivery linked to an occurrence and destination identity, with sequence, status, attempts, provider result, and lease fields.
 - `conversation_sessions`: typed pending clarification payloads, channel/session identity, status, optional active reminder reference, version, and update time.
 - `idempotency_records`: a unique `(source, idempotency_key)` record with request hash, durable response, business outcome, and confirmation-delivery state.
+- `voice_call_authorizations`: an opaque Vapi provider call ID bound to the linked phone identity and canonical user, with active/ended/expired lifecycle and a short expiry. It stores no copied caller number; future Vapi tools must reload and revalidate this binding before constructing an authenticated request context.
 - `memory_facts`: authoritative non-empty user-owned fact content, nullable
   `vector(1536)` semantic data, model/content-hash/versioning metadata, indexing
   status and attempts, timestamps, and owner/date plus owner/index-status indexes.

@@ -52,7 +52,7 @@ _SCHEDULE_LIST_REQUEST = re.compile(
     re.IGNORECASE,
 )
 _TASK_LIST_REQUEST = re.compile(
-    r"^\s*(?:when\s+(?:are|is)\s+(?:my\s+)?\S+|when\s+do\s+i\s+have\s+to\s+\S+|"
+    r"^\s*(?:when\s+are\s+(?:my\s+)?\S+|when\s+do\s+i\s+have\s+to\s+\S+|"
     r"(?:show|list)\s+(?:my\s+)?\S.+\s+reminders?|"
     r"(?:do\s+i\s+have|are\s+there)\s+(?:any\s+)?\S.+\s+reminders?)\b",
     re.IGNORECASE,

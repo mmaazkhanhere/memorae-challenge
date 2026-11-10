@@ -32,12 +32,12 @@ from reminder_agent.features.memory.retrieve.persistence import (
     revalidate_owned_memory_candidates,
 )
 from reminder_agent.infrastructure.database.models import User
+from reminder_agent.infrastructure.observability import get_logger, log_event
 from reminder_agent.infrastructure.providers.embeddings import (
     EmbeddingPrivacyPolicy,
     EmbeddingProvider,
     contains_sensitive_memory,
 )
-from reminder_agent.infrastructure.observability import get_logger, log_event
 from reminder_agent.shared.memory_contracts import PendingMemoryLookup, RetrieveMemoryQuery
 
 ResponseT_co = TypeVar("ResponseT_co", covariant=True)
@@ -75,6 +75,8 @@ def run_memory_lookup_workflow[ResponseT_co](
     lookup_memory_operation: Callable[..., MemoryLookupResult] = lookup_memory_fact,
     contains_sensitive_memory_fn: Callable[[str], bool] = contains_sensitive_memory,
     answer_preserves_exact_values_fn: Callable[..., bool] = memory_answer_preserves_exact_values,
+    allow_fact_disclosure_fn: Callable[[object], bool] | None = None,
+    allow_sensitive_facts: bool = False,
     log_event_fn: Callable[..., object] = log_event,
     event_context: Mapping[str, object] | None = None,
 ) -> ResponseT_co:
@@ -121,6 +123,19 @@ def run_memory_lookup_workflow[ResponseT_co](
             ):
                 return responses.direct(lookup_memory_message("authorization_failed"))
 
+            if pending is None:
+                prior_session = load_session(
+                    db,
+                    user_id=locked_user.id,
+                    external_session_id=external_session_id,
+                    now=now,
+                    ttl_seconds=session_ttl_seconds,
+                    for_update=True,
+                    channel_type=channel_type,
+                )
+                if prior_session is not None:
+                    end_session(prior_session, now=now)
+
             result = lookup_memory_operation(
                 db,
                 user_id=locked_user.id,
@@ -130,6 +145,7 @@ def run_memory_lookup_workflow[ResponseT_co](
                 embedding_provider=embedding_provider,
                 privacy_policy=embedding_privacy_policy,
                 retrieval_policy=memory_retrieval_policy,
+                allow_sensitive_facts=allow_sensitive_facts,
             )
             log_event_fn(
                 logger,
@@ -146,7 +162,7 @@ def run_memory_lookup_workflow[ResponseT_co](
                     fact
                     for fact in result.candidates
                     if fact.user_id == locked_user.id
-                    and not contains_sensitive_memory_fn(fact.content)
+                    and (allow_sensitive_facts or not contains_sensitive_memory_fn(fact.content))
                 )
                 proposal = None
                 if memory_answerer is not None and safe_candidates:
@@ -250,6 +266,27 @@ def run_memory_lookup_workflow[ResponseT_co](
                 else:
                     result = MemoryLookupResult(status="UNKNOWN")
             if result.status == "FOUND" and result.fact is not None:
+                if allow_fact_disclosure_fn is not None and not allow_fact_disclosure_fn(
+                    result.fact
+                ):
+                    if pending is not None:
+                        session = load_session(
+                            db,
+                            user_id=locked_user.id,
+                            external_session_id=external_session_id,
+                            now=now,
+                            ttl_seconds=session_ttl_seconds,
+                            for_update=True,
+                            channel_type=channel_type,
+                        )
+                        if (
+                            session is not None
+                            and pending_memory_lookup_from_session(session) is not None
+                        ):
+                            end_session(session, now=now)
+                    return responses.direct(
+                        lookup_memory_message("sensitive_fact_protected")
+                    )
                 if pending is not None:
                     session = load_session(
                         db,

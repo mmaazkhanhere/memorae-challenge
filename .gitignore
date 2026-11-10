@@ -74,6 +74,10 @@ instance/
 # Sphinx documentation
 docs/_build/
 
+# Local challenge planning/reference artifacts
+/docs/IMPLEMENTATION_PLAN.md
+/docs/maaz-voice-agent-challenge.html
+
 # PyBuilder
 .pybuilder/
 target/

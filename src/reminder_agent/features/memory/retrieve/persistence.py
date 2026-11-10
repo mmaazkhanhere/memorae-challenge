@@ -15,6 +15,7 @@ from reminder_agent.features.memory.retrieve.contracts import (
     cosine_similarity,
 )
 from reminder_agent.infrastructure.database.models import MEMORY_EMBEDDING_DIMENSIONS, MemoryFact
+from reminder_agent.infrastructure.observability import get_logger, log_event
 from reminder_agent.infrastructure.providers.embeddings import (
     EmbeddingPrivacyPolicy,
     EmbeddingProvider,
@@ -23,7 +24,6 @@ from reminder_agent.infrastructure.providers.embeddings import (
     embed_query,
     validate_embedding,
 )
-from reminder_agent.infrastructure.observability import get_logger, log_event
 from reminder_agent.shared.memory_contracts import _lookup_tokens
 
 logger = get_logger()
@@ -68,6 +68,7 @@ def lookup_memory_fact(
     embedding_provider: EmbeddingProvider | None = None,
     privacy_policy: EmbeddingPrivacyPolicy = DEFAULT_EMBEDDING_PRIVACY_POLICY,
     retrieval_policy: MemoryRetrievalPolicy = DEFAULT_MEMORY_RETRIEVAL_POLICY,
+    allow_sensitive_facts: bool = False,
 ) -> MemoryLookupResult:
     """Find one owner-scoped fact, using lexical evidence before semantics."""
 
@@ -134,6 +135,7 @@ def lookup_memory_fact(
         embedding_provider=embedding_provider,
         privacy_policy=privacy_policy,
         retrieval_policy=retrieval_policy,
+        allow_sensitive_facts=allow_sensitive_facts,
         fallback=fallback,
     )
 
@@ -148,6 +150,7 @@ def _semantic_lookup(
     embedding_provider: EmbeddingProvider | None,
     privacy_policy: EmbeddingPrivacyPolicy,
     retrieval_policy: MemoryRetrievalPolicy,
+    allow_sensitive_facts: bool,
     fallback: MemoryLookupResult,
 ) -> MemoryLookupResult:
     query_text = " ".join((semantic_query or query).split()).strip()
@@ -244,7 +247,9 @@ def _semantic_lookup(
         similarity_scores=[round(score, 6) for _, score in scored],
     )
     safe_candidates = tuple(
-        fact for fact, _score in scored if not contains_sensitive_memory(fact.content)
+        fact
+        for fact, _score in scored
+        if allow_sensitive_facts or not contains_sensitive_memory(fact.content)
     )[:answer_candidate_limit]
     if not safe_candidates:
         log_event(

@@ -16,11 +16,11 @@ from reminder_agent.features.intent.contracts import (
     IntentRouteSuggestion,
     PendingReminder,
 )
+from reminder_agent.infrastructure.observability import exception_details, get_logger, log_event
 from reminder_agent.infrastructure.providers.llm import (
     OpenAICompatibleLLMClient,
     StructuredIntentProvider,
 )
-from reminder_agent.infrastructure.observability import exception_details, get_logger, log_event
 
 logger = get_logger()
 
@@ -125,15 +125,17 @@ class OpenAICompatibleIntentRouter:
                 6. "Remember to call Ahmed tomorrow" ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ NEW_REQUEST.
                 7. "Remember my emergency contact is Ahmed" ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ SAVE_MEMORY.
                 8. Missing memory facts are handled by retrieval, not classification.
-                9. Classify the operation independently of target resolution. If the latest message clearly
+                9. Personal date/time questions about a saved personal fact are RETRIEVE_MEMORY;
+                   do not classify them as LIST_REQUEST merely because they use "when".
+                10. Classify the operation independently of target resolution. If the latest message clearly
                    asks to move, reschedule, shift, delay, or change an existing reminder, classify it as
                    RESCHEDULE_REQUEST even when the target is an indirect reference such as "it", "that",
                    or "the previous one", and even when the new time is incomplete. Target resolution and
                    parameter extraction happen in a later validated stage.
-                10. Use pending and delivered-reminder context only to distinguish conversational intent;
+                11. Use pending and delivered-reminder context only to distinguish conversational intent;
                     missing or ambiguous target details must not turn an otherwise clear operation into UNCERTAIN.
-                11. Use UNCERTAIN only when no supported operation can be inferred from the message.
-                12. Never extract parameters, answer questions, or execute actions.
+                12. Use UNCERTAIN only when no supported operation can be inferred from the message.
+                13. Never extract parameters, answer questions, or execute actions.
 
                 For SAVE_MEMORY, provide `memory_intent_evidence` with `kind: "EXPLICIT_SAVE_REQUEST"`, `confidence: "CLEAR"`, and an exact source span
                 in `evidence_text`. For every other operation, set it to null.
