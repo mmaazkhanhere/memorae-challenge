@@ -115,21 +115,28 @@ def _remove_completion_keyboard(
         message = update.message.reply_to_message
     else:
         message = None
+    if message is None and getattr(reply, "cleanup_provider_message_id", None) is None:
+        return
+    if not hasattr(client, "edit_message_reply_markup"):
+        return
     cleanup_message_id = getattr(reply, "cleanup_provider_message_id", None)
-    if message is None and cleanup_message_id is None:
-        return
-    if not hasattr(client, "edit_message_reply_markup") and message is None:
-        return
+    if message is None:
+        try:
+            message_id = int(cleanup_message_id)
+        except (TypeError, ValueError):
+            return
+        chat_id = reply.chat_id
+        message_text = "Reminder"
+    else:
+        message_id = message.message_id
+        chat_id = message.chat.id
+        message_text = message.text or "Reminder"
     try:
         remove_inline_keyboard(
             client,
-            chat_id=message.chat.id if message is not None else reply.chat_id,
-            message_id=(
-                message.message_id
-                if message is not None
-                else int(cleanup_message_id)
-            ),
-            text=message.text if message is not None else "Reminder",
+            chat_id=chat_id,
+            message_id=message_id,
+            text=message_text,
         )
     except TelegramAPIError as exc:
         # Completion has already committed; keyboard cleanup is best effort.
