@@ -14,7 +14,7 @@ from reminder_agent.features.reminders.snooze import (
     snooze_occurrence,
     snooze_target_text,
 )
-from reminder_agent.infrastructure.db.models import (
+from reminder_agent.infrastructure.database.models import (
     ChannelIdentity,
     Notification,
     Reminder,

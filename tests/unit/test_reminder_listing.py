@@ -11,7 +11,7 @@ from reminder_agent.features.reminders.listing.filters import (
     list_reminders_in_range,
     summarize_reminders,
 )
-from reminder_agent.infrastructure.db.models import (
+from reminder_agent.infrastructure.database.models import (
     Reminder,
     ReminderOccurrence,
     ReminderRecurrenceException,

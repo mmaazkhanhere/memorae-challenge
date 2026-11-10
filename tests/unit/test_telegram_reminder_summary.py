@@ -12,7 +12,7 @@ from reminder_agent.features.intent import (
 from reminder_agent.features.reminders.summary.telegram_adapter import (
     handle_reminder_summary_request,
 )
-from reminder_agent.infrastructure.db.models import User
+from reminder_agent.infrastructure.database.models import User
 
 
 def _update() -> TelegramUpdate:

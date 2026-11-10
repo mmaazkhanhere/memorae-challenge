@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 
 from reminder_agent.channels.telegram.callbacks import callback_data, parse_callback_data
 from reminder_agent.features.reminders.complete.operations import complete_occurrence
-from reminder_agent.infrastructure.db.models import (
+from reminder_agent.infrastructure.database.models import (
     ChannelIdentity,
     Notification,
     Reminder,

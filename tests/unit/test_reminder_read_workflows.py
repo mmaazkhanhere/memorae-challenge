@@ -5,7 +5,7 @@ from uuid import uuid4
 from sqlalchemy.orm import Session
 
 from reminder_agent.application.contracts import ApplicationRequest, ApplicationResult
-from reminder_agent.application.reminder_read_workflows import (
+from reminder_agent.features.reminders.listing.service import (
     list_reminders_from_interpretation,
     summarize_reminders_from_interpretation,
 )
@@ -14,7 +14,7 @@ from reminder_agent.features.intent.contracts import (
     ListRemindersIntent,
     ReminderSummaryIntent,
 )
-from reminder_agent.infrastructure.db.models import User
+from reminder_agent.infrastructure.database.models import User
 
 NOW = datetime(2026, 11, 8, 12, tzinfo=UTC)
 

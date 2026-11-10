@@ -8,7 +8,7 @@ from reminder_agent.application.conversations import save_pending_clarification_
 from reminder_agent.application.pending_contracts import PendingCompletion, PendingSnooze
 from reminder_agent.features.reminders.complete.pending import prepare_pending_completion
 from reminder_agent.features.reminders.snooze.service import handle_snooze_clarification
-from reminder_agent.infrastructure.db.models import ConversationSession, User
+from reminder_agent.infrastructure.database.models import ConversationSession, User
 
 NOW = datetime(2026, 11, 3, 12, tzinfo=UTC)
 
