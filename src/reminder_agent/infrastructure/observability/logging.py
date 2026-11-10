@@ -3,12 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
-from uuid import uuid4
 
-from colorama import Fore, Style, just_fix_windows_console
-
+from colorama import Fore, Style, just_fix_windows_console  # type: ignore[import-untyped]
 
 LOGGER_NAME = "reminder_agent"
 
@@ -22,7 +20,7 @@ class JsonFormatter(logging.Formatter):
         event = getattr(record, "event_name", record.getMessage())
         context = getattr(record, "context", {})
         payload: dict[str, Any] = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "event": event,
@@ -31,7 +29,9 @@ class JsonFormatter(logging.Formatter):
         if context:
             payload["context"] = context
         if record.exc_info:
-            payload["exception_type"] = record.exc_info[0].__name__
+            exception_type = record.exc_info[0]
+            if exception_type is not None:
+                payload["exception_type"] = exception_type.__name__
             payload["exception_message"] = str(record.exc_info[1])
             if self.include_traceback:
                 payload["exception_traceback"] = self.formatException(record.exc_info)
@@ -55,15 +55,15 @@ class ReadableFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         event = getattr(record, "event_name", record.getMessage())
         context = getattr(record, "context", {})
-        fields = " ".join(
-            f"{key}={value!r}" for key, value in context.items() if value is not None
-        )
+        fields = " ".join(f"{key}={value!r}" for key, value in context.items() if value is not None)
         suffix = f" {fields}" if fields else ""
         if record.exc_info:
-            suffix += f" error={record.exc_info[0].__name__}: {record.exc_info[1]}"
+            exception_type = record.exc_info[0]
+            exception_name = exception_type.__name__ if exception_type is not None else "unknown"
+            suffix += f" error={exception_name}: {record.exc_info[1]}"
             if self.include_traceback:
                 suffix += f"\n{self.formatException(record.exc_info)}"
-        timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        timestamp = datetime.now(UTC).isoformat(timespec="milliseconds")
         message = event.replace("_", " ")
         if not self.use_color:
             return f"{timestamp} {record.levelname:<8} {message}{suffix}"
@@ -99,64 +99,12 @@ def configure_logging(
             include_traceback=include_traceback,
         )
     if not logger.handlers:
-        handler = logging.StreamHandler(sys.stdout)
-        logger.addHandler(handler)
-    for handler in logger.handlers:
-        handler.setFormatter(formatter)
+        stream_handler = logging.StreamHandler(sys.stdout)
+        logger.addHandler(stream_handler)
+    for logger_handler in logger.handlers:
+        logger_handler.setFormatter(formatter)
     return logger
 
 
 def get_logger() -> logging.Logger:
     return logging.getLogger(LOGGER_NAME)
-
-
-def log_event(
-    logger: logging.Logger,
-    level: int,
-    event: str,
-    *,
-    exc_info: bool = False,
-    **context: Any,
-) -> None:
-    logger.log(
-        level,
-        event,
-        exc_info=exc_info,
-        extra={"event_name": event, "context": context},
-    )
-
-
-def exception_details(exc: BaseException) -> dict[str, Any]:
-    """Return useful provider/schema diagnostics without logging raw payloads."""
-
-    details: dict[str, Any] = {"exception_type": type(exc).__name__}
-    response = getattr(exc, "response", None)
-    if response is not None:
-        status_code = getattr(response, "status_code", None)
-        reason_phrase = getattr(response, "reason_phrase", None)
-        if status_code is not None:
-            details["status_code"] = status_code
-        if reason_phrase:
-            details["reason_phrase"] = reason_phrase
-    request = getattr(exc, "request", None)
-    if request is not None:
-        method = getattr(request, "method", None)
-        url = getattr(request, "url", None)
-        host = getattr(url, "host", None) if url is not None else None
-        if method:
-            details["request_method"] = method
-        if host:
-            details["request_host"] = host
-    errors = getattr(exc, "errors", None)
-    if callable(errors):
-        try:
-            details["validation_error_types"] = [
-                item.get("type") for item in errors(include_url=False)
-            ]
-        except Exception:
-            details["validation_error_types"] = ["unavailable"]
-    return details
-
-
-def request_id() -> str:
-    return uuid4().hex

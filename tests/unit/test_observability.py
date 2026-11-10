@@ -2,7 +2,7 @@ import logging
 
 from colorama import Fore
 
-from reminder_agent.observability import (
+from reminder_agent.infrastructure.observability import (
     JsonFormatter,
     ReadableFormatter,
     exception_details,
