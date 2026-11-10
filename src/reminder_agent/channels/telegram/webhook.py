@@ -11,11 +11,9 @@ from sqlalchemy.orm import Session
 
 from reminder_agent.application.contracts import OutboundResponse, RequestSource
 from reminder_agent.application.delivery import SqlAlchemyResponseDelivery
-from reminder_agent.channels.telegram.completion_callbacks import parse_completion_callback
-from reminder_agent.channels.telegram.identity import resolve_identity
-from reminder_agent.channels.telegram.inbound import message_input, to_application_request
-from reminder_agent.channels.telegram.onboarding import to_onboarding_request
 from reminder_agent.channels.telegram.outbound import (
+    PHONE_KEYBOARD,
+    REMOVE_KEYBOARD,
     TELEGRAM_MAX_MESSAGE_LENGTH,
     acknowledge_callback,
     is_retryable,
@@ -23,15 +21,17 @@ from reminder_agent.channels.telegram.outbound import (
     send_text,
     split_text,
 )
-from reminder_agent.channels.telegram.presentation.keyboards import (
-    PHONE_KEYBOARD,
-    REMOVE_KEYBOARD,
-)
-from reminder_agent.channels.telegram.presentation.onboarding import onboarding_text
 from reminder_agent.channels.telegram.provider import (
     HttpTelegramClient,
     TelegramAPIError,
     TelegramUpdate,
+)
+from reminder_agent.channels.telegram.updates import (
+    message_input,
+    parse_completion_callback,
+    resolve_identity,
+    to_application_request,
+    to_onboarding_request,
 )
 from reminder_agent.features.onboarding.service import handle_onboarding_request
 from reminder_agent.features.onboarding.workflow import handle_update

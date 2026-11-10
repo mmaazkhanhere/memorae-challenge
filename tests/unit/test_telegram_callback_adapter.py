@@ -1,8 +1,8 @@
 from uuid import uuid4
 
 from reminder_agent.channels.telegram.callbacks import callback_data
-from reminder_agent.channels.telegram.completion_callbacks import parse_completion_callback
 from reminder_agent.channels.telegram.provider import TelegramUpdate
+from reminder_agent.channels.telegram.updates import parse_completion_callback
 
 
 def _update(data: str, *, chat_type: str = "private") -> TelegramUpdate:

@@ -2,8 +2,8 @@
 from sqlalchemy import select
 
 from reminder_agent.application.contracts import RequestSource
-from reminder_agent.channels.telegram.onboarding import to_onboarding_request
 from reminder_agent.channels.telegram.provider import TelegramUpdate
+from reminder_agent.channels.telegram.updates import to_onboarding_request
 from reminder_agent.features.onboarding.request_contracts import (
     OnboardingAction,
     OnboardingIdentityContext,

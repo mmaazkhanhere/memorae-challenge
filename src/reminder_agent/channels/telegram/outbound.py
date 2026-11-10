@@ -14,6 +14,22 @@ from reminder_agent.channels.telegram.provider import TelegramAPIError, Telegram
 
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 
+PHONE_KEYBOARD = {
+    "keyboard": [
+        [{"text": "Share my phone number", "request_contact": True}],
+        [{"text": "Skip for now"}],
+    ],
+    "resize_keyboard": True,
+    "one_time_keyboard": True,
+}
+REMOVE_KEYBOARD = {"remove_keyboard": True}
+
+
+def done_keyboard(callback_data: str) -> dict:
+    """Build Telegram's inline completion action."""
+
+    return {"inline_keyboard": [[{"text": "Done", "callback_data": callback_data}]]}
+
 
 def split_text(text: str, *, max_length: int = TELEGRAM_MAX_MESSAGE_LENGTH) -> list[str]:
     """Split text into Telegram-safe chunks without changing its content."""
