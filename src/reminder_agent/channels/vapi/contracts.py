@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 
@@ -53,6 +55,10 @@ class VapiMessage(BaseModel):
 
     type: str = Field(min_length=1, max_length=100)
     call: VapiCall | None = None
+    tool_call_list: list[VapiToolCall] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("toolCallList", "tool_call_list"),
+    )
 
     @field_validator("type")
     @classmethod
@@ -69,4 +75,46 @@ class VapiServerRequest(BaseModel):
     message: VapiMessage
 
 
-__all__ = ["VapiCall", "VapiCaller", "VapiMessage", "VapiServerRequest"]
+class VapiFunctionCall(BaseModel):
+    """Untrusted function-call data supplied by Vapi."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    name: str = Field(min_length=1, max_length=100)
+    arguments: Any = Field(default_factory=dict)
+
+    @field_validator("name")
+    @classmethod
+    def _strip_name(cls, value: str) -> str:
+        candidate = value.strip()
+        if not candidate:
+            raise ValueError("function name must not be blank")
+        return candidate
+
+
+class VapiToolCall(BaseModel):
+    """One Vapi function invocation awaiting an application result."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    id: str = Field(min_length=1, max_length=255)
+    type: str = Field(default="function", min_length=1, max_length=50)
+    function: VapiFunctionCall
+
+    @field_validator("id")
+    @classmethod
+    def _strip_id(cls, value: str) -> str:
+        candidate = value.strip()
+        if not candidate:
+            raise ValueError("tool call id must not be blank")
+        return candidate
+
+
+__all__ = [
+    "VapiCall",
+    "VapiCaller",
+    "VapiFunctionCall",
+    "VapiMessage",
+    "VapiServerRequest",
+    "VapiToolCall",
+]
