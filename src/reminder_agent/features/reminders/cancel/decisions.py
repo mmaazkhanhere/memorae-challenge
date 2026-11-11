@@ -38,6 +38,7 @@ ONE_TIME = "ONE_TIME"
 class CancellationScope(StrEnum):
     OCCURRENCE = "OCCURRENCE"
     SERIES = "SERIES"
+    ALL_OCCURRENCES = "ALL_OCCURRENCES"
 
 
 class CancellationResolution(StrEnum):
@@ -147,6 +148,11 @@ _RECURRING_TARGET_SUFFIX = re.compile(
 _DATE_PREFIX = re.compile(
     r"^(?P<qualifier>only\s+|just\s+)?(?P<day>today|tomorrow|monday|tuesday|"
     r"wednesday|thursday|friday|saturday|sunday)'?s\s+",
+    re.IGNORECASE,
+)
+_ALL_DATE_TARGET = re.compile(
+    r"^(?:all\s+)?(?:my\s+)?reminders?\s+(?:for|on)\s+"
+    r"(?P<day>today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s*$",
     re.IGNORECASE,
 )
 _ORDINAL = re.compile(
@@ -374,6 +380,17 @@ def parse_cancellation_request(
         return cancel_message("missing_target")
     scope: CancellationScope | None = None
     occurrence_date: date | None = None
+
+    all_date_match = _ALL_DATE_TARGET.fullmatch(target)
+    if all_date_match is not None:
+        occurrence_date = _resolve_date(
+            all_date_match.group("day"), now=now, timezone_name=timezone_name
+        )
+        return CancellationRequest(
+            "all reminders",
+            CancellationScope.ALL_OCCURRENCES,
+            occurrence_date,
+        )
 
     if re.search(r"\b(?:all\s+future|entire|whole)\s+", target, re.IGNORECASE):
         scope = CancellationScope.SERIES
@@ -747,20 +764,31 @@ def decide_cancellation(
     candidates = find_candidates(
         db,
         user_id=user_id,
-        target_text=parsed.target_text,
+        target_text=(
+            None
+            if parsed.scope is CancellationScope.ALL_OCCURRENCES
+            else parsed.target_text
+        ),
         occurrence_date=parsed.occurrence_date,
         timezone_name=timezone_name,
         include_empty_series=(parsed.scope is not CancellationScope.OCCURRENCE),
     )
     if (
         not candidates
-        and parsed.scope is CancellationScope.OCCURRENCE
+        and parsed.scope in {
+            CancellationScope.OCCURRENCE,
+            CancellationScope.ALL_OCCURRENCES,
+        }
         and parsed.occurrence_date is not None
     ):
         candidates = find_unmaterialized_occurrence_candidates(
             db,
             user_id=user_id,
-            target_text=parsed.target_text,
+            target_text=(
+                None
+                if parsed.scope is CancellationScope.ALL_OCCURRENCES
+                else parsed.target_text
+            ),
             occurrence_date=parsed.occurrence_date,
             timezone_name=timezone_name,
             now=now,
@@ -770,6 +798,14 @@ def decide_cancellation(
             "RESPONSE", cancel_message("no_match")
         )
     if len(candidates) > 1:
+        if parsed.scope is CancellationScope.ALL_OCCURRENCES:
+            return CancellationDecision(
+                "MUTATE",
+                "",
+                request=parsed,
+                candidate_ids=tuple(candidate.reminder_id for candidate in candidates),
+                scope=parsed.scope,
+            )
         return CancellationDecision(
             "CLARIFY",
             cancel_message("multiple_matches")

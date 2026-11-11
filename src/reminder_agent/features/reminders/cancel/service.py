@@ -70,6 +70,29 @@ def cancel_reminder_for_request(
             response_kind="AUTHORIZATION_FAILURE",
         )
 
+    if command.scope is CancellationScope.ALL_OCCURRENCES:
+        reminder_ids = command.reminder_ids or (command.reminder_id,)
+        reminders = []
+        occurrence_count = 0
+        for reminder_id in reminder_ids:
+            reminder, count = apply_cancellation(
+                db,
+                user_id=user.id,
+                reminder_id=reminder_id,
+                occurrence_id=None,
+                scope=CancellationScope.OCCURRENCE,
+                now=now,
+                occurrence_date=command.occurrence_date,
+            )
+            reminders.append(reminder)
+            occurrence_count += count
+        return ApplicationResult(
+            content=f"All set! I've cancelled {len(reminders)} reminder(s) scheduled for that date.",
+            response_kind="CANCELLATION_BULK_OCCURRENCES",
+            resource_id=reminders[0].id if reminders else None,
+            affected_count=occurrence_count,
+        )
+
     reminder, occurrence_count = apply_cancellation(
         db,
         user_id=user.id,
@@ -116,6 +139,16 @@ def cancellation_command_for_decision(
 ) -> CancelReminderCommand | None:
     """Build the channel-neutral mutation command for one resolved target."""
 
+    if decision.scope is CancellationScope.ALL_OCCURRENCES:
+        if not decision.candidate_ids or decision.request is None:
+            return None
+        return CancelReminderCommand(
+            reminder_id=decision.candidate_ids[0],
+            occurrence_id=None,
+            scope=decision.scope,
+            occurrence_date=decision.request.occurrence_date,
+            reminder_ids=decision.candidate_ids,
+        )
     if len(decision.candidate_ids) != 1 or decision.scope is None:
         return None
     return CancelReminderCommand(

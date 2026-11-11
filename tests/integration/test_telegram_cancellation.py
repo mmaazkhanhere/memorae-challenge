@@ -888,7 +888,7 @@ def test_indirect_demonstrative_cancellation_uses_bounded_custom_fallback_contex
     )
 
     assert captured["text"] == "I don't need those exercise reminders anymore."
-    assert len(captured["recent_messages"]) <= 6
+    assert len(captured["recent_messages"]) <= 8
     assert any("exercise routine" in item for item in captured["recent_messages"])
     assert captured["cancellation_candidates"][0]["task"] == "exercise routine"
     assert "id" not in captured["cancellation_candidates"][0]

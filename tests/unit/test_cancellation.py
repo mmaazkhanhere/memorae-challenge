@@ -80,6 +80,17 @@ def test_series_and_next_occurrence_scopes_are_explicit():
     assert occurrence.scope is CancellationScope.OCCURRENCE
 
 
+def test_all_reminders_for_date_is_parsed_as_bulk_occurrence_scope():
+    request = parse_cancellation_request(
+        "Cancel all my reminders for tomorrow", timezone_name="UTC", now=NOW
+    )
+
+    assert not isinstance(request, str)
+    assert request.target_text == "all reminders"
+    assert request.scope is CancellationScope.ALL_OCCURRENCES
+    assert request.occurrence_date == date(2026, 10, 31)
+
+
 def test_missing_cancellation_target_requests_clarification():
     result = parse_cancellation_request("Cancel", timezone_name="UTC", now=NOW)
 
