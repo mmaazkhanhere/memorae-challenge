@@ -1854,28 +1854,26 @@ def test_multiple_people_in_one_task_are_not_split_into_multiple_reminders() -> 
     assert result.intent.task == "call Alice and Bob"
 
 
-def test_multiple_tasks_with_one_schedule_are_one_reminder() -> None:
+def test_multiple_tasks_with_one_schedule_request_clarification() -> None:
     result = RuleBasedIntentInterpreter().interpret(
         "Remind me to call Alice and email Bob tomorrow at 9 AM",
         timezone_name="UTC",
         now=NOW,
     )
 
-    assert result.clarification is None
-    assert result.intent is not None
-    assert result.intent.task == "call Alice and email Bob"
+    assert result.intent is None
+    assert result.clarification is not None
 
 
-def test_multiple_tasks_with_one_schedule_inherit_the_same_time() -> None:
+def test_multiple_tasks_with_one_schedule_are_not_merged() -> None:
     result = RuleBasedIntentInterpreter().interpret(
         "Remind me to call Ali tomorrow at 9 AM and to pay the bill",
         timezone_name="UTC",
         now=NOW,
     )
 
-    assert result.intent is not None
-    assert result.intent.task == "call Ali and to pay the bill"
-    assert result.intent.due_at == datetime(2026, 10, 31, 9, 0, tzinfo=UTC)
+    assert result.intent is None
+    assert result.clarification is not None
 
 
 def test_explicit_multiple_reminder_requests_are_parsed_independently() -> None:
@@ -1947,7 +1945,7 @@ def test_compound_single_prefix_uses_model_fallback() -> None:
     assert [intent.task for intent in result.resolved_intents] == ["call Alice", "email Bob"]
 
 
-def test_complete_single_command_supersedes_multi_target_clarification() -> None:
+def test_single_schedule_multi_target_command_is_clarified() -> None:
     interpreter = RuleBasedIntentInterpreter()
     initial = interpreter.interpret(
         "Remind me to call Alice and email Bob tomorrow at 9 AM",
@@ -1955,9 +1953,8 @@ def test_complete_single_command_supersedes_multi_target_clarification() -> None
         now=NOW,
     )
 
-    assert initial.clarification is None
-    assert initial.intent is not None
-    assert initial.intent.task == "call Alice and email Bob"
+    assert initial.clarification is not None
+    assert initial.intent is None
 
 
 def test_follow_up_accepts_minute_and_day_phrasing() -> None:

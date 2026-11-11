@@ -16,6 +16,9 @@ from reminder_agent.features.intent.contracts import (
     PendingReminder,
     ReminderSummaryIntent,
 )
+from reminder_agent.features.intent.deterministic.patterns import (
+    contains_multiple_tasks as _contains_multiple_tasks,
+)
 from reminder_agent.features.intent.deterministic.support import (
     CalendarFrequency,
     SummaryMetric,
@@ -28,6 +31,12 @@ from reminder_agent.features.intent.deterministic.support import (
 )
 from reminder_agent.features.intent.deterministic.support import (
     ordinal_suffix as _ordinal_suffix,
+)
+from reminder_agent.features.intent.deterministic.support import (
+    strip_repeated_calendar_cadence as _strip_repeated_calendar_cadence,
+)
+from reminder_agent.features.intent.deterministic.support import (
+    strip_repeated_weekly_cadence as _strip_repeated_weekly_cadence,
 )
 from reminder_agent.features.intent.deterministic.support import (
     task_from_remainder as _task_from_remainder,
@@ -118,7 +127,12 @@ class RecurrenceIntentMixin:
         hour = int(hour_value) if hour_value is not None else None
         minute = int(match.group("minute") or 0)
         meridiem = _normalise_meridiem(match.group("meridiem"))
-        task = _task_from_remainder(f"{match.group('before') or ''} {match.group('after') or ''}")
+        task = _strip_repeated_calendar_cadence(
+            _task_from_remainder(f"{match.group('before') or ''} {match.group('after') or ''}"),
+            frequency,
+        )
+        if _contains_multiple_tasks(task):
+            return self._multiple_target_clarification(timezone_name)
         if hour is None:
             local_now = now.astimezone(ZoneInfo(timezone_name))
             return Interpretation(
@@ -227,9 +241,13 @@ class RecurrenceIntentMixin:
                 )
             )
         )
-        task = _task_from_remainder(match.group("task"))
+        task = _strip_repeated_weekly_cadence(
+            _task_from_remainder(match.group("task")), raw_days
+        )
         if not task or not weekdays:
             return None
+        if _contains_multiple_tasks(task):
+            return self._multiple_target_clarification(timezone_name)
         local_today = now.astimezone(ZoneInfo(timezone_name)).date()
         pending = PendingReminder(
             task=task,
@@ -268,13 +286,17 @@ class RecurrenceIntentMixin:
             return self._invalid_time()
         if meridiem is not None:
             hour = _clock_to_24(hour, meridiem)
-        task = _task_from_remainder(match.group("task"))
+        task = _strip_repeated_weekly_cadence(
+            _task_from_remainder(match.group("task")), raw_day_text
+        )
         if not task:
             question = "What should I remind you about every week?"
             return Interpretation(
                 response_text=question,
                 fallback_allowed=False,
             )
+        if _contains_multiple_tasks(task):
+            return self._multiple_target_clarification(timezone_name)
         if meridiem is None and hour <= 12:
             pending = PendingReminder(
                 task=task,

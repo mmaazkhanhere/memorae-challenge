@@ -43,7 +43,7 @@ def test_listing_extraction_preserves_task_filter_and_rejects_generic_words() ->
     assert extract_listing_task_query("When are my doctor's appointments?") == (
         "doctor's appointments"
     )
-    assert extract_listing_task_query("Show me all reminders") == "me all"
+    assert extract_listing_task_query("Show me all reminders") is None
     assert extract_listing_task_query("Show all reminders") is None
     assert extract_listing_task_query("show my scheduled reminders") is None
 
@@ -74,6 +74,86 @@ def test_simple_relative_request_is_deterministic() -> None:
     assert result.intent.task == "call the bank"
     assert result.intent.due_at == datetime(2026, 10, 30, 12, 5, tzinfo=UTC)
     assert result.fallback_allowed is True
+
+
+def test_iso_date_creation_uses_the_explicit_date_and_excludes_it_from_task() -> None:
+    result = RuleBasedIntentInterpreter().interpret(
+        "Remind me on 2026-11-12 at 1:15 PM to pay the invoice",
+        timezone_name="UTC",
+        now=datetime(2026, 11, 11, 12, tzinfo=UTC),
+    )
+
+    assert isinstance(result.intent, CreateOneTimeReminderIntent)
+    assert result.intent.task == "pay the invoice"
+    assert result.intent.due_at == datetime(2026, 11, 12, 13, 15, tzinfo=UTC)
+
+
+def test_invalid_iso_date_is_rejected_without_raising() -> None:
+    result = RuleBasedIntentInterpreter().interpret(
+        "Remind me on 2026-02-30 at 1 PM to pay the invoice",
+        timezone_name="UTC",
+        now=datetime(2026, 11, 11, 12, tzinfo=UTC),
+    )
+
+    assert result.intent is None
+    assert result.fallback_allowed is False
+
+
+def test_date_qualified_open_listing_bound_does_not_become_exact_date() -> None:
+    result = RuleBasedIntentInterpreter().interpret(
+        "List reminders after 2026-11-12",
+        selected_route=IntentRoute.LIST_REQUEST,
+        timezone_name="UTC",
+        now=datetime(2026, 11, 11, 12, tzinfo=UTC),
+    )
+
+    assert result.intent is None
+    assert result.fallback_allowed is True
+
+
+def test_reversed_iso_listing_range_is_rejected() -> None:
+    result = RuleBasedIntentInterpreter().interpret(
+        "List reminders from 2026-11-12 to 2026-11-10",
+        selected_route=IntentRoute.LIST_REQUEST,
+        timezone_name="UTC",
+        now=datetime(2026, 11, 11, 12, tzinfo=UTC),
+    )
+
+    assert result.intent is None
+    assert result.fallback_allowed is False
+
+
+def test_single_schedule_with_multiple_tasks_requests_clarification() -> None:
+    result = RuleBasedIntentInterpreter().interpret(
+        "Remind me to call Alice and email Bob tomorrow at 9 AM",
+        timezone_name="UTC",
+        now=datetime(2026, 11, 11, 12, tzinfo=UTC),
+    )
+
+    assert result.intent is None
+    assert result.clarification is not None
+
+
+def test_repeated_weekly_cadence_is_not_part_of_the_task() -> None:
+    result = RuleBasedIntentInterpreter().interpret(
+        "Remind me every Monday at 8 PM to review the budget every Monday",
+        timezone_name="UTC",
+        now=datetime(2026, 11, 11, 12, tzinfo=UTC),
+    )
+
+    assert isinstance(result.intent, CreateRecurringReminderIntent)
+    assert result.intent.task == "review the budget"
+
+
+def test_repeated_one_time_date_is_not_part_of_the_task() -> None:
+    result = RuleBasedIntentInterpreter().interpret(
+        "Remind me tomorrow at 9 AM to call the bank tomorrow",
+        timezone_name="UTC",
+        now=datetime(2026, 11, 11, 12, tzinfo=UTC),
+    )
+
+    assert isinstance(result.intent, CreateOneTimeReminderIntent)
+    assert result.intent.task == "call the bank"
 
 
 def test_ambiguous_clock_is_a_clarification_without_an_intent() -> None:

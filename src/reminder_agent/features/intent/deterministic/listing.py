@@ -21,6 +21,10 @@ _TIME_FILTER = re.compile(
     r"(?::(?P<minute>\d{2}))?\s*(?P<meridiem>a\.m\.|p\.m\.|am|pm)?\b",
     re.IGNORECASE,
 )
+_DATE_BOUND_FILTER = re.compile(
+    r"\b(?P<operator>after|before)\s+(?P<date>\d{4}-\d{1,2}-\d{1,2})\b",
+    re.IGNORECASE,
+)
 
 
 def _parse_filter_time(match: re.Match[str]) -> time | None:
@@ -117,6 +121,15 @@ class ListingIntentMixin:
                 fallback_allowed=False,
             )
 
+        date_bound_match = _DATE_BOUND_FILTER.search(normalized)
+        if date_bound_match is not None:
+            # ListRemindersIntent represents closed date ranges only. Do not
+            # silently turn an open-ended date bound into an exact-date query.
+            return Interpretation(
+                response_text="Please provide a complete reminder date range.",
+                fallback_allowed=True,
+            )
+
         if re.search(r"\bweekends?\b", normalized):
             return Interpretation(
                 intent=list_intent(weekdays=(5, 6)),
@@ -158,7 +171,10 @@ class ListingIntentMixin:
                 start = resolve(match.group("start").lower())
                 end = resolve(match.group("end").lower())
                 if end < start:
-                    end += timedelta(days=7)
+                    return Interpretation(
+                        response_text="Please provide a reminder date range in chronological order.",
+                        fallback_allowed=False,
+                    )
                 return Interpretation(
                     intent=list_intent(start, end),
                     fallback_allowed=False,

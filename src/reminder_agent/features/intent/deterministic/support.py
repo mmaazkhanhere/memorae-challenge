@@ -64,6 +64,41 @@ def task_from_remainder(remainder: str) -> str:
     return " ".join(task.split())
 
 
+def strip_repeated_weekly_cadence(task: str, raw_days: str) -> str:
+    """Remove a trailing copy of the weekly cadence already parsed from input."""
+
+    cadence = re.escape(" ".join(raw_days.split()))
+    return re.sub(
+        rf"\s+(?:every|each)\s+{cadence}\s*$",
+        "",
+        task,
+        flags=re.IGNORECASE,
+    ).strip()
+
+
+def strip_repeated_calendar_cadence(task: str, frequency: CalendarFrequency) -> str:
+    """Remove a trailing copy of a parsed monthly/yearly cadence."""
+
+    cadence = "month" if frequency == "MONTHLY" else "year"
+    return re.sub(
+        rf"\s+(?:(?:every|each)\s+{cadence}|{cadence}ly)\s*$",
+        "",
+        task,
+        flags=re.IGNORECASE,
+    ).strip()
+
+
+def strip_repeated_temporal_token(task: str, token: str) -> str:
+    """Remove a trailing copy of a date token already parsed from the request."""
+
+    return re.sub(
+        rf"\s+(?:on\s+)?{re.escape(token)}\s*$",
+        "",
+        task,
+        flags=re.IGNORECASE,
+    ).strip()
+
+
 def number(value: str) -> int | None:
     try:
         return int(value)
@@ -189,6 +224,8 @@ def date_from_day(match, local_now: datetime) -> date:
         return local_now.date()
     if value == "tomorrow":
         return local_now.date() + timedelta(days=1)
+    if re.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}", value):
+        return date.fromisoformat(value)
     target = WEEKDAYS[value]
     days_ahead = (target - local_now.weekday()) % 7
     return local_now.date() + timedelta(days=days_ahead)

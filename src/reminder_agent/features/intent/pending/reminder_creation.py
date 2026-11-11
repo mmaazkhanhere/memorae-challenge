@@ -24,6 +24,9 @@ from reminder_agent.features.intent.deterministic.patterns import (
 from reminder_agent.features.intent.deterministic.patterns import (
     CANCEL_FOLLOW_UPS as _CANCEL_FOLLOW_UPS,
 )
+from reminder_agent.features.intent.deterministic.patterns import (
+    contains_multiple_tasks as _contains_multiple_tasks,
+)
 from reminder_agent.features.intent.deterministic.support import (
     Meridiem,
     resolve_pending_due_at,
@@ -234,6 +237,9 @@ class PendingIntentMixin:
                 fallback_allowed=fallback_allowed,
             )
 
+        if _contains_multiple_tasks(pending.task or ""):
+            return self._multiple_target_clarification(pending.timezone_name)
+
         if pending.recurrence_weekdays is not None:
             assert pending.date_local is not None and pending.hour is not None
             recurrence_hour = (
@@ -425,8 +431,9 @@ class PendingIntentMixin:
             response_text=question,
         )
 
-    @staticmethod
-    def _build(task: str, due_at: datetime, timezone_name: str) -> Interpretation:
+    def _build(self, task: str, due_at: datetime, timezone_name: str) -> Interpretation:
+        if _contains_multiple_tasks(task):
+            return self._multiple_target_clarification(timezone_name)
         if not task:
             # The parser has already resolved a complete, user-supplied
             # schedule.  Keep it in the draft while asking only for the task;

@@ -69,7 +69,8 @@ FOLLOW_UP_CLOCK = re.compile(
     re.IGNORECASE,
 )
 DAY = re.compile(
-    r"\b(?P<day>today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    r"\b(?P<day>today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    r"\d{4}-\d{1,2}-\d{1,2})\b",
     re.IGNORECASE,
 )
 DAY_PART = re.compile(
@@ -180,7 +181,7 @@ LIST_TASK_PATTERNS = (
     ),
     re.compile(r"^\s*when\s+do\s+i\s+have\s+to\s+(?P<task>.+?)\s*[?!.]*\s*$", re.IGNORECASE),
     re.compile(
-        r"^\s*(?:show|list)\s+(?:my\s+)?(?P<task>.+?)\s+reminders?(?:\s+(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday))?\s*[?!.]*\s*$",
+        r"^\s*(?:show|list)\s+(?:(?:my|me)\s+)?(?P<task>.+?)\s+reminders?(?:\s+(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday))?\s*[?!.]*\s*$",
         re.IGNORECASE,
     ),
     re.compile(

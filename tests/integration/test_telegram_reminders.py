@@ -9,11 +9,11 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from reminder_agent.application import conversation_workflow as reminder_service
-from reminder_agent.application.main import create_app
 from reminder_agent.application.conversation_coordinator import (
     handle_reminder_text,
     list_owned_reminders,
 )
+from reminder_agent.application.main import create_app
 from reminder_agent.channels.telegram.provider import TelegramUpdate
 from reminder_agent.features.intent import (
     CreateOneTimeReminderIntent,
@@ -24,6 +24,7 @@ from reminder_agent.features.intent import (
     PendingReminderFieldUpdate,
 )
 from reminder_agent.features.intent.policy import OUT_OF_SCOPE_RESPONSE
+from reminder_agent.infrastructure.config.settings import Settings
 from reminder_agent.infrastructure.database.models import (
     ChannelIdentity,
     ConversationSession,
@@ -33,7 +34,6 @@ from reminder_agent.infrastructure.database.models import (
     ReminderOccurrence,
     User,
 )
-from reminder_agent.infrastructure.config.settings import Settings
 
 HEADERS = {"X-Telegram-Bot-Api-Secret-Token": "test-secret"}
 
@@ -1372,7 +1372,7 @@ def test_multiple_people_in_one_task_create_one_reminder(
     assert "call Alice and Bob" in telegram_client.messages[-1][1]
 
 
-def test_multiple_tasks_with_one_schedule_create_one_reminder(
+def test_multiple_tasks_with_one_schedule_require_clarification(
     api_client, telegram_client, db, update_factory
 ) -> None:
     onboard(api_client, update_factory)
@@ -1381,8 +1381,8 @@ def test_multiple_tasks_with_one_schedule_create_one_reminder(
         update_factory(132, text="Remind me to call Alice and email Bob tomorrow at 9 AM"),
     )
 
-    assert db.scalar(select(func.count()).select_from(Reminder)) == 1
-    assert "call Alice and email Bob" in telegram_client.messages[-1][1]
+    assert db.scalar(select(func.count()).select_from(Reminder)) == 0
+    assert "more than one reminder task" in telegram_client.messages[-1][1].lower()
 
 
 def test_explicit_multiple_reminder_requests_create_two_reminders(

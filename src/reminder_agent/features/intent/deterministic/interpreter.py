@@ -80,6 +80,9 @@ from reminder_agent.features.intent.deterministic.support import (
     number as _number,
 )
 from reminder_agent.features.intent.deterministic.support import (
+    strip_repeated_temporal_token as _strip_repeated_temporal_token,
+)
+from reminder_agent.features.intent.deterministic.support import (
     task_from_remainder as _task_from_remainder,
 )
 from reminder_agent.features.intent.deterministic.support import (
@@ -393,6 +396,7 @@ class RuleBasedIntentInterpreter(
                 if before_time.strip()
                 else after_time
             )
+            task = _strip_repeated_temporal_token(task, "tomorrow")
             if meridiem is None:
                 return self._pending_result(
                     PendingReminder(
@@ -424,13 +428,19 @@ class RuleBasedIntentInterpreter(
                     fallback_allowed=True,
                 )
             local_now = reference.astimezone(zone)
-            date_local = (
-                _date_from_day(day, local_now)
-                if day
-                else local_now.date()
-                if clock is not None
-                else None
-            )
+            try:
+                date_local = (
+                    _date_from_day(day, local_now)
+                    if day
+                    else local_now.date()
+                    if clock is not None
+                    else None
+                )
+            except ValueError:
+                return Interpretation(
+                    response_text="Please provide a valid future reminder date.",
+                    fallback_allowed=False,
+                )
             date_explicit = day is not None
             clock_hour: int | None = int(clock.group("hour")) if clock else None
             minute = int(clock.group("minute") or 0) if clock else 0
@@ -449,6 +459,8 @@ class RuleBasedIntentInterpreter(
             if clock is not None:
                 task_source = task_source.replace(clock.group(0), "", 1)
             task = _task_from_remainder(task_source)
+            if day is not None:
+                task = _strip_repeated_temporal_token(task, day.group("day"))
             pending = PendingReminder(
                 task=task or None,
                 date_local=date_local,
