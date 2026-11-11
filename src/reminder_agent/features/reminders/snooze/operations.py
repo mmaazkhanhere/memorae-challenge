@@ -53,7 +53,7 @@ _SNOOZE_PREFIX = re.compile(
     re.IGNORECASE,
 )
 _SNOOZE_DURATION = re.compile(
-    r"(?P<value>\d+)\s*(?:(?:more)\s+)?(?P<unit>seconds?|secs?|minutes?|mins?|hours?|days?)"
+    r"(?<![-+])(?P<value>\d+)\s*(?:(?:more)\s+)?(?P<unit>seconds?|secs?|minutes?|mins?|hours?|days?)"
     r"\s*[.!?]*\s*$",
     re.IGNORECASE,
 )

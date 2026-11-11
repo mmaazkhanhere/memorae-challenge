@@ -81,6 +81,7 @@ def test_parse_snooze_duration_accepts_explicit_positive_relative_durations():
 def test_parse_snooze_duration_rejects_non_positive_or_ambiguous_values():
     assert parse_snooze_duration("0 minutes") is None
     assert parse_snooze_duration("-10 minutes") is None
+    assert parse_snooze_duration("snooze -5 minutes") is None
     assert parse_snooze_duration("snooze") is None
     assert parse_snooze_duration("tomorrow at 10") is None
 
