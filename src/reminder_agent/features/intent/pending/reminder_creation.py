@@ -15,6 +15,7 @@ from reminder_agent.features.intent.contracts import (
     Interpretation,
     NeedsClarification,
     PendingReminder,
+    PendingReminderBatch,
     PendingReminderFieldUpdate,
     merge_pending_reminder_updates,
 )
@@ -45,6 +46,9 @@ from reminder_agent.features.intent.deterministic.support import (
 )
 from reminder_agent.features.intent.deterministic.support import (
     normalise_meridiem as _normalise_meridiem,
+)
+from reminder_agent.features.intent.deterministic.support import (
+    meridiem_from_day_part as _meridiem_from_day_part,
 )
 from reminder_agent.features.intent.deterministic.support import (
     normalise_now as _normalise_now,
@@ -83,6 +87,9 @@ class PendingIntentMixin:
             hour = int(clock.group("hour"))
             minute = int(clock.group("minute") or 0)
             meridiem = cast(Meridiem | None, _normalise_meridiem(clock.group("meridiem")))
+            meridiem = meridiem or _meridiem_from_day_part(
+                clock.groupdict().get("day_part")
+            )
             if not _valid_clock(hour, minute, meridiem):
                 return self._invalid_time()
             if not context.date_explicit and meridiem and date_local is not None:
@@ -379,6 +386,89 @@ class PendingIntentMixin:
         clocks = list(self._clock.finditer(body))
         if len(clocks) < 2:
             return None
+
+        if len(clocks) == 2:
+            between_clocks = body[clocks[0].end() : clocks[1].start()]
+            if re.search(
+                r"\band\s+(?:to\s+)?(?:buy|call|complete|email|finish|pay|renew|review|send|submit|text|write)\b",
+                between_clocks,
+                re.IGNORECASE,
+            ):
+                first_clause = body[: clocks[0].end()].strip(" ,;:")
+                second_clause = body[clocks[0].end() :].strip(" ,;:")
+                second_clause = re.sub(r"^and\s+", "", second_clause, flags=re.IGNORECASE)
+                if not re.match(r"(?:to|remind\s+me)\b", second_clause, re.IGNORECASE):
+                    second_clause = "to " + second_clause
+                parsed = [
+                    self.interpret(
+                        f"Remind me {clause}",
+                        timezone_name=timezone_name,
+                        now=now,
+                    )
+                    for clause in (first_clause, second_clause)
+                ]
+                drafts: list[PendingReminder] = []
+                clarification_index: int | None = None
+                clarification_question: str | None = None
+                for index, item in enumerate(parsed):
+                    if item.intent is not None and isinstance(
+                        item.intent, CreateOneTimeReminderIntent
+                    ):
+                        local_due = item.intent.due_at.astimezone(ZoneInfo(timezone_name))
+                        drafts.append(
+                            PendingReminder(
+                                task=item.intent.task,
+                                date_local=local_due.date(),
+                                hour=local_due.hour % 12 or 12,
+                                minute=local_due.minute,
+                                meridiem=("am" if local_due.hour < 12 else "pm"),
+                                date_explicit=True,
+                                timezone_name=timezone_name,
+                            )
+                        )
+                    elif item.clarification is not None and isinstance(
+                        item.clarification.pending, PendingReminder
+                    ):
+                        draft = item.clarification.pending
+                        if draft.task:
+                            draft = draft.model_copy(
+                                update={
+                                    "task": re.sub(
+                                        r"\s+(?:on|at|for)$",
+                                        "",
+                                        draft.task,
+                                        flags=re.IGNORECASE,
+                                    ).strip()
+                                }
+                            )
+                        drafts.append(draft)
+                        if clarification_index is None:
+                            clarification_index = index
+                            clarification_question = item.clarification.question
+                    else:
+                        return Interpretation(
+                            response_text=(
+                                "I found multiple reminder times. Please provide a complete "
+                                "task and time for each."
+                            ),
+                            fallback_allowed=True,
+                        )
+                if clarification_index is not None and clarification_question is not None:
+                    return Interpretation(
+                        clarification=NeedsClarification(
+                            pending=PendingReminderBatch(
+                                reminders=tuple(drafts),
+                                clarification_index=clarification_index,
+                            ),
+                            question=clarification_question,
+                        ),
+                        response_text=clarification_question,
+                        fallback_allowed=False,
+                    )
+                # Preserve the existing model fallback for fully complete
+                # compound requests; this branch exists to retain drafts when
+                # clarification is required for one or more clauses.
+                return None
 
         shared = body[: clocks[0].start()].strip(" ,;:")
         shared_day = self._day.search(shared)
