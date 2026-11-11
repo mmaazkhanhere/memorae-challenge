@@ -234,6 +234,22 @@ def test_inline_callback_is_acknowledged(telegram_client, api_client, db, update
     assert telegram_client.callback_acknowledgements == ["callback-ack", "callback-ack"]
     assert len(telegram_client.messages) == first_reply_count
 
+    second_click = {
+        **payload,
+        "update_id": 303,
+        "callback_query": {
+            **payload["callback_query"],
+            "id": "callback-ack-2",
+        },
+    }
+    assert _post(api_client, second_click).status_code == 200
+    assert telegram_client.callback_acknowledgements == [
+        "callback-ack",
+        "callback-ack",
+        "callback-ack-2",
+    ]
+    assert len(telegram_client.messages) == first_reply_count
+
 
 def test_forged_callback_does_not_mutate(telegram_client, api_client, db, update_factory):
     identity = _onboard(api_client, db, update_factory, 400)
@@ -282,7 +298,7 @@ def test_callback_from_another_telegram_user_does_not_mutate(
     assert _post(api_client, payload).status_code == 200
     db.refresh(occurrence)
     assert occurrence.status == "NOTIFIED"
-    assert telegram_client.callback_acknowledgements == []
+    assert telegram_client.callback_acknowledgements == ["callback-other-user"]
 
 
 def test_bare_done_requires_one_unambiguous_delivered_occurrence(

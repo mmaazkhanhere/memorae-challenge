@@ -114,6 +114,22 @@ def handle_completion_callback(
         provider_message_id=callback.provider_message_id,
         now=now,
     )
+    if result.outcome == "ALREADY_COMPLETED":
+        db.rollback()
+        log_event(
+            logger,
+            logging.INFO,
+            "completion_callback_noop",
+            update_id=update.update_id,
+            occurrence_id=str(callback.occurrence_id),
+            outcome=result.outcome,
+        )
+        return ReminderReply(
+            chat_id=callback.chat_id,
+            text=result.text,
+            should_send=False,
+            response_kind="completion_noop",
+        )
     reply = _store_response(
         db,
         update=update,
