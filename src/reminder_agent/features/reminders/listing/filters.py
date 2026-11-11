@@ -228,6 +228,9 @@ def list_reminders_in_range(
     time_after: time | None = None,
     time_before: time | None = None,
     weekdays: tuple[int, ...] | None = None,
+    recurrence_only: bool = False,
+    recurrence_series_only: bool = False,
+    recurrence_frequency: str | None = None,
     limit: int | None = None,
     now: datetime | None = None,
     occurrence_statuses: tuple[str, ...] = (PENDING,),
@@ -276,6 +279,23 @@ def list_reminders_in_range(
         .where(Reminder.user_id == user_id, Reminder.status == ACTIVE)
         .order_by(Reminder.id)
     ).all()
+    if recurrence_only or recurrence_frequency is not None:
+        if recurrence_frequency is not None and recurrence_frequency not in {
+            "WEEKLY",
+            "MONTHLY",
+            "YEARLY",
+        }:
+            raise ValueError("recurrence_frequency must be a supported calendar frequency")
+        recurring: list[Reminder] = []
+        for reminder in reminders:
+            if reminder.schedule_type != RECURRING:
+                continue
+            recurrence_rule = (reminder.recurrence_rule or "").upper()
+            if recurrence_frequency is None or recurrence_rule.startswith(
+                f"FREQ={recurrence_frequency}"
+            ):
+                recurring.append(reminder)
+        reminders = recurring
     if task_query is not None:
         reminders = [
             reminder for reminder in reminders if _matches_task_query(reminder.task, task_query)
@@ -347,6 +367,14 @@ def list_reminders_in_range(
             results.append(ListedReminder(reminder.id, reminder.task, due_at))
 
     ordered = sorted(results, key=lambda item: (item.due_at, str(item.reminder_id), item.task))
+    if recurrence_series_only:
+        series: list[ListedReminder] = []
+        seen_reminders: set[UUID] = set()
+        for item in ordered:
+            if item.reminder_id not in seen_reminders:
+                seen_reminders.add(item.reminder_id)
+                series.append(item)
+        ordered = series
     return ordered[:limit] if limit is not None else ordered
 
 

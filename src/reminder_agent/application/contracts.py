@@ -91,6 +91,9 @@ class ListRemindersCommand:
     time_after: time | None = None
     time_before: time | None = None
     weekdays: tuple[int, ...] | None = None
+    recurrence_only: bool = False
+    recurrence_series_only: bool = False
+    recurrence_frequency: str | None = None
     limit: int | None = None
 
 
@@ -109,6 +112,7 @@ class CancelReminderCommand:
     occurrence_id: UUID | None
     scope: CancellationScope
     occurrence_date: date | None = None
+    reminder_ids: tuple[UUID, ...] = ()
 
 
 @dataclass(frozen=True)

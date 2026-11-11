@@ -1,5 +1,6 @@
 import json
 from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -45,6 +46,26 @@ def test_rule_interpreter_parses_date_range_and_all_reminders():
     assert isinstance(all_reminders.intent, ListRemindersIntent)
     assert all_reminders.intent.start_date is None
     assert all_reminders.intent.end_date is None
+
+
+@pytest.mark.parametrize(
+    "text", ["What recurring reminders have I got?", "What weekly reminders do I have?"]
+)
+def test_rule_interpreter_extracts_recurring_listing_without_model(text: str) -> None:
+    result = RuleBasedIntentInterpreter().interpret(
+        text,
+        selected_route=IntentRoute.LIST_REQUEST,
+        timezone_name="UTC",
+        now=datetime(2026, 10, 30, 12, tzinfo=UTC),
+    )
+
+    assert isinstance(result.intent, ListRemindersIntent)
+    assert result.intent.recurrence_only is True
+    assert result.intent.recurrence_series_only is True
+    assert result.intent.recurrence_frequency == (
+        "WEEKLY" if "weekly" in text.lower() else None
+    )
+    assert result.fallback_allowed is False
 
 
 @pytest.mark.parametrize(
@@ -102,6 +123,86 @@ def test_rule_interpreter_combines_listing_task_and_tomorrow():
     assert isinstance(result.intent, ListRemindersIntent)
     assert result.intent.task_query == "doctor's appointments"
     assert result.intent.start_date.isoformat() == "2026-10-31"
+
+
+@pytest.mark.parametrize(
+    ("text", "task_query"),
+    [("Show me all my callreminders", "call")],
+)
+def test_rule_interpreter_preserves_a_compound_word_task_filter(text, task_query):
+    result = RuleBasedIntentInterpreter().interpret(
+        text,
+        selected_route=IntentRoute.LIST_REQUEST,
+        timezone_name="UTC",
+        now=datetime(2026, 10, 30, 12, tzinfo=UTC),
+    )
+
+    assert isinstance(result.intent, ListRemindersIntent)
+    assert result.intent.task_query == task_query
+
+
+@pytest.mark.parametrize(
+    ("text", "start_date", "end_date"),
+    [
+        ("Hey, what is on my reminder list for tomorrow?", "2026-10-31", "2026-10-31"),
+        ("and on Firday?", "2026-10-30", "2026-10-30"),
+    ],
+)
+def test_rule_interpreter_handles_conversational_date_list_follow_ups(
+    text, start_date, end_date
+):
+    result = RuleBasedIntentInterpreter().interpret(
+        text,
+        selected_route=IntentRoute.LIST_REQUEST,
+        timezone_name="UTC",
+        now=datetime(2026, 10, 30, 12, tzinfo=UTC),
+    )
+
+    assert isinstance(result.intent, ListRemindersIntent)
+    assert result.intent.start_date.isoformat() == start_date
+    assert result.intent.end_date.isoformat() == end_date
+    assert result.intent.task_query is None
+
+
+def test_rule_interpreter_scopes_weekend_agenda_to_the_next_weekend():
+    result = RuleBasedIntentInterpreter().interpret(
+        "What's on my agenda for the weekend?",
+        selected_route=IntentRoute.LIST_REQUEST,
+        timezone_name="UTC",
+        now=datetime(2026, 11, 11, 12, tzinfo=UTC),
+    )
+
+    assert isinstance(result.intent, ListRemindersIntent)
+    assert result.intent.start_date.isoformat() == "2026-11-14"
+    assert result.intent.end_date.isoformat() == "2026-11-15"
+    assert result.intent.weekdays is None
+
+
+def test_rule_interpreter_maps_explicit_day_parts_to_meridiem():
+    interpreter = RuleBasedIntentInterpreter()
+    weekly = interpreter.interpret(
+        "Every Monday at 8 in the morning, remind me about the team standup.",
+        timezone_name="Asia/Karachi",
+        now=datetime(2026, 11, 11, 12, tzinfo=UTC),
+    )
+    follow_up = interpreter.interpret(
+        "Around 2 in the afternoon.",
+        selected_route=IntentRoute.UPDATE_PENDING,
+        timezone_name="Asia/Karachi",
+        now=datetime(2026, 11, 11, 12, tzinfo=UTC),
+        context=PendingReminder(
+            task="team standup",
+            date_local=datetime(2026, 11, 16).date(),
+            hour=8,
+            timezone_name="Asia/Karachi",
+            date_explicit=True,
+        ),
+    )
+
+    assert weekly.intent is not None
+    assert weekly.intent.hour == 8
+    assert follow_up.intent is not None
+    assert follow_up.intent.due_at.astimezone(ZoneInfo("Asia/Karachi")).hour == 14
 
 
 @pytest.mark.parametrize(
@@ -302,7 +403,7 @@ def test_model_interpreter_rejects_missing_or_malformed_explicit_task_filter(
     assert result.intent is None
 
 
-def test_model_interpreter_normalizes_single_date_and_ignores_model_reminders(monkeypatch):
+def test_model_interpreter_rejects_reminder_records_in_a_list_response(monkeypatch):
     class Response:
         def raise_for_status(self):
             return None
@@ -339,9 +440,7 @@ def test_model_interpreter_normalizes_single_date_and_ignores_model_reminders(mo
         now=datetime(2026, 11, 2, 16, 59, tzinfo=UTC),
     )
 
-    assert isinstance(result.intent, ListRemindersIntent)
-    assert result.intent.start_date.isoformat() == "2026-11-03"
-    assert result.intent.end_date == result.intent.start_date
+    assert result.intent is None
 
 
 def test_model_interpreter_normalizes_nested_date_range(monkeypatch):

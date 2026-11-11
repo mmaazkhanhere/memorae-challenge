@@ -174,6 +174,9 @@ class ListRemindersIntent(BaseModel):
     time_after: time | None = None
     time_before: time | None = None
     weekdays: tuple[int, ...] | None = None
+    recurrence_only: bool = False
+    recurrence_series_only: bool = False
+    recurrence_frequency: Literal["WEEKLY", "MONTHLY", "YEARLY"] | None = None
     limit: int | None = Field(default=None, ge=1, le=100)
     timezone_name: str = Field(min_length=1, max_length=150)
 
@@ -317,6 +320,26 @@ class PendingReminder(BaseModel):
         return value
 
 
+class PendingReminderBatch(BaseModel):
+    """Several reminder drafts sharing one clarification conversation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    operation: Literal["CREATE_ONE_TIME_REMINDERS"] = "CREATE_ONE_TIME_REMINDERS"
+    reminders: tuple[PendingReminder, ...] = Field(min_length=1)
+    clarification_index: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def clarification_index_must_exist(self) -> PendingReminderBatch:
+        if self.clarification_index >= len(self.reminders):
+            raise ValueError("clarification_index must identify a reminder draft")
+        return self
+
+    @property
+    def active(self) -> PendingReminder:
+        return self.reminders[self.clarification_index]
+
+
 class PendingReminderFieldUpdate(BaseModel):
     """Only fields explicitly supplied by a reminder clarification reply."""
 
@@ -384,7 +407,7 @@ class NeedsClarification(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     operation: Literal["CREATE_ONE_TIME_REMINDER"] = "CREATE_ONE_TIME_REMINDER"
-    pending: PendingReminder
+    pending: PendingReminder | PendingReminderBatch
     question: str = Field(min_length=1, max_length=500)
 
 

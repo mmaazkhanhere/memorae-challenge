@@ -25,6 +25,10 @@ _DATE_BOUND_FILTER = re.compile(
     r"\b(?P<operator>after|before)\s+(?P<date>\d{4}-\d{1,2}-\d{1,2})\b",
     re.IGNORECASE,
 )
+_RECURRING_LIST_REQUEST = re.compile(
+    r"\b(?:recurring|weekly)\s+reminders?\b",
+    re.IGNORECASE,
+)
 
 
 def _parse_filter_time(match: re.Match[str]) -> time | None:
@@ -51,11 +55,15 @@ class ListingIntentMixin:
             self._list_request.match(raw) is None
             and _NEXT_LIST_REQUEST.match(raw) is None
             and extract_listing_task_query(raw) is None
+            # The router recognizes natural forms such as "What recurring
+            # reminders have I got?".  Keep extraction aligned with that
+            # route so they do not unnecessarily fall through to the model.
+            and _RECURRING_LIST_REQUEST.search(raw) is None
         ):
             return None
         zone = ZoneInfo(timezone_name)
         local_today = _normalise_now(now).astimezone(zone).date()
-        normalized = raw.lower()
+        normalized = raw.lower().replace("firday", "friday")
         task_query = extract_listing_task_query(raw)
 
         def list_intent(
@@ -65,6 +73,9 @@ class ListingIntentMixin:
             time_after: time | None = None,
             time_before: time | None = None,
             weekdays: tuple[int, ...] | None = None,
+            recurrence_only: bool = False,
+            recurrence_series_only: bool = False,
+            recurrence_frequency: str | None = None,
             limit: int | None = None,
         ) -> ListRemindersIntent:
             return ListRemindersIntent(
@@ -74,6 +85,9 @@ class ListingIntentMixin:
                 time_after=time_after,
                 time_before=time_before,
                 weekdays=weekdays,
+                recurrence_only=recurrence_only,
+                recurrence_series_only=recurrence_series_only,
+                recurrence_frequency=recurrence_frequency,
                 limit=limit,
                 timezone_name=timezone_name,
             )
@@ -131,6 +145,13 @@ class ListingIntentMixin:
             )
 
         if re.search(r"\bweekends?\b", normalized):
+            if re.search(r"\b(?:the|this)\s+weekend\b", normalized):
+                days_until_saturday = (5 - local_today.weekday()) % 7
+                weekend_start = local_today + timedelta(days=days_until_saturday)
+                return Interpretation(
+                    intent=list_intent(weekend_start, weekend_start + timedelta(days=1)),
+                    fallback_allowed=False,
+                )
             return Interpretation(
                 intent=list_intent(weekdays=(5, 6)),
                 fallback_allowed=False,
@@ -149,21 +170,28 @@ class ListingIntentMixin:
                 fallback_allowed=False,
             )
 
-        # ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œall recurring remindersÃƒÂ¢Ã¢â€šÂ¬Ã‚Â has no single requested date.  Show the
-        # next seven local days, which gives the user a useful projection of
-        # every active recurring series without changing the read-only list
-        # intent shape.
+        # A request for recurring reminders names reminder series, not their
+        # individual projected occurrences. Return one next occurrence per
+        # active series so monthly and yearly reminders are not hidden by an
+        # arbitrary short date window.
+        if ("recurring" in normalized or "weekly" in normalized) and task_query is None:
+            return Interpretation(
+                intent=list_intent(
+                    recurrence_only=True,
+                    recurrence_series_only=True,
+                    recurrence_frequency=(
+                        "WEEKLY" if "weekly" in normalized else None
+                    ),
+                ),
+                fallback_allowed=False,
+            )
+
         if "all" in normalized and task_query is None:
             return Interpretation(
                 intent=list_intent(),
                 fallback_allowed=False,
             )
 
-        if "recurring" in normalized and ("all" in normalized or "every" in normalized):
-            return Interpretation(
-                intent=list_intent(local_today, local_today + timedelta(days=6)),
-                fallback_allowed=False,
-            )
 
         match = self._list_range.search(raw)
         if match is not None:

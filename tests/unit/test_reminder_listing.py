@@ -140,6 +140,95 @@ def test_listing_uses_local_midnight_boundaries_across_dst(session_factory):
     assert result[0].due_at == datetime(2027, 3, 14, 13, tzinfo=UTC)
 
 
+def test_listing_recurring_only_excludes_one_time_reminders(session_factory):
+    with session_factory.begin() as db:
+        user = User(name="Recurring", timezone="UTC", onboarding_status="ACTIVE")
+        db.add(user)
+        db.flush()
+        recurring = Reminder(
+            user_id=user.id,
+            task="weekly standup",
+            schedule_type="RECURRING",
+            start_local="2026-11-09T08:00",
+            timezone="UTC",
+            recurrence_rule="FREQ=WEEKLY;BYDAY=MO;BYHOUR=08;BYMINUTE=00",
+            status="ACTIVE",
+        )
+        one_time = Reminder(
+            user_id=user.id,
+            task="send invoice",
+            schedule_type="ONE_TIME",
+            start_local="2026-11-10T09:00+00:00",
+            timezone="UTC",
+            status="ACTIVE",
+        )
+        db.add_all([recurring, one_time])
+        db.flush()
+        db.add(
+            ReminderOccurrence(
+                reminder_id=one_time.id,
+                scheduled_at=datetime(2026, 11, 10, 9, tzinfo=UTC),
+                next_due_at=datetime(2026, 11, 10, 9, tzinfo=UTC),
+                status="PENDING",
+            )
+        )
+
+    with session_factory() as db:
+        result = list_reminders_in_range(
+            db,
+            user_id=user.id,
+            start_date=date(2026, 11, 9),
+            end_date=date(2026, 11, 15),
+            timezone_name="UTC",
+            recurrence_only=True,
+        )
+
+    assert [item.task for item in result] == ["weekly standup"]
+
+
+def test_listing_recurring_series_returns_one_next_occurrence_per_series(session_factory):
+    with session_factory.begin() as db:
+        user = User(name="Recurring", timezone="UTC", onboarding_status="ACTIVE")
+        db.add(user)
+        db.flush()
+        db.add_all(
+            [
+                Reminder(
+                    user_id=user.id,
+                    task="weekly standup",
+                    schedule_type="RECURRING",
+                    start_local="2026-11-02T08:00",
+                    timezone="UTC",
+                    recurrence_rule="FREQ=WEEKLY;BYDAY=MO;BYHOUR=08;BYMINUTE=00",
+                    status="ACTIVE",
+                ),
+                Reminder(
+                    user_id=user.id,
+                    task="monthly rent review",
+                    schedule_type="RECURRING",
+                    start_local="2026-11-15T09:00",
+                    timezone="UTC",
+                    recurrence_rule="FREQ=MONTHLY;BYMONTHDAY=15;BYHOUR=09;BYMINUTE=00",
+                    status="ACTIVE",
+                ),
+            ]
+        )
+
+    with session_factory() as db:
+        result = list_reminders_in_range(
+            db,
+            user_id=user.id,
+            start_date=None,
+            end_date=None,
+            timezone_name="UTC",
+            recurrence_only=True,
+            recurrence_series_only=True,
+            now=datetime(2026, 11, 1, tzinfo=UTC),
+        )
+
+    assert [item.task for item in result] == ["weekly standup", "monthly rent review"]
+
+
 def test_listing_task_filter_combines_with_date_and_owner_scope(session_factory):
     with session_factory.begin() as db:
         ada = User(name="Ada", timezone="UTC", onboarding_status="ACTIVE")
