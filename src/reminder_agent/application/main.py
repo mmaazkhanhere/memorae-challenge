@@ -1,20 +1,19 @@
 from __future__ import annotations
 
+import importlib
 import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Generator
 from collections.abc import Callable as TypingCallable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from typing import Any
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 
-from reminder_agent.channels.telegram.provider import TelegramClient
-from reminder_agent.channels.telegram.webhook import router as telegram_router
-from reminder_agent.channels.vapi.webhook import router as vapi_router
 from reminder_agent.features.intent.model.interpreter import OpenAICompatibleIntentInterpreter
 from reminder_agent.features.intent.model.router import (
     IntentRouter,
@@ -110,7 +109,7 @@ REQUIRED_SCHEMA_COLUMNS = {
 def create_app(
     settings: Settings | None = None,
     *,
-    telegram_client: TelegramClient | None = None,
+    telegram_client: Any | None = None,
     session_factory: SessionFactory | None = None,
     reminder_interpreter: ReminderIntentInterpreter | None = None,
     intent_router: IntentRouter | None = None,
@@ -119,6 +118,10 @@ def create_app(
     transcriber: AudioTranscriber | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> FastAPI:
+    telegram_module = importlib.import_module("reminder_agent.channels.telegram.webhook")
+    vapi_module = importlib.import_module("reminder_agent.channels.vapi.webhook")
+    telegram_router = telegram_module.router
+    vapi_router = vapi_module.router
     runtime_settings = settings or get_settings()
     logger = configure_logging(
         runtime_settings.log_level,

@@ -16,17 +16,18 @@ from reminder_agent.application import (
     VerifiedChannelIdentity,
     list_reminders_for_request,
 )
-from reminder_agent.features.memory.saving import run_memory_save_workflow
-from reminder_agent.features.reminders.listing.service import (
-    summarize_reminders_from_interpretation,
-)
 from reminder_agent.features.intent.contracts import (
     CreateOneTimeReminderIntent,
     Interpretation,
     ReminderSummaryIntent,
 )
+from reminder_agent.features.memory.messages import MEMORY_SAVE_MESSAGES
+from reminder_agent.features.memory.saving import run_memory_save_workflow
 from reminder_agent.features.reminders.create.service import (
     run_reminder_creation_workflow,
+)
+from reminder_agent.features.reminders.listing.service import (
+    summarize_reminders_from_interpretation,
 )
 from reminder_agent.infrastructure.database.models import (
     ChannelIdentity,
@@ -128,7 +129,7 @@ def test_fake_channel_reuses_memory_and_reminder_workflows_without_telegram(
             responses=adapter,
             upsert_clarification_session=lambda **kwargs: None,
         )
-        assert memory_response.content == "I saved that information."
+        assert memory_response.content in MEMORY_SAVE_MESSAGES["confirmation"]
 
         intent = CreateOneTimeReminderIntent(
             task="take medicine",

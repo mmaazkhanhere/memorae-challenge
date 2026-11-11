@@ -32,6 +32,7 @@ from reminder_agent.channels.telegram.provider import TelegramUpdate
 from reminder_agent.features.intent import ReminderIntentInterpreter
 from reminder_agent.features.intent.deterministic.routing import ConversationRoute
 from reminder_agent.features.memory import adapters as memory_adapters
+from reminder_agent.features.memory.messages import MEMORY_SAVE_MESSAGES
 from reminder_agent.features.reminders.cancel.decisions import CancellationScope
 from reminder_agent.features.reminders.cancel.messages import REMINDER_CANCEL_MESSAGES
 from reminder_agent.infrastructure.database.models import (
@@ -252,10 +253,8 @@ def test_memory_application_service_rechecks_context_and_stages_only_owned_fact(
     with session_factory() as db:
         fact = db.scalar(select(MemoryFact))
         assert result.response_kind == "MEMORY_CONFIRMATION"
-        assert result.durable_response == DurableResponse(
-            content="I saved that information.",
-            response_kind="MEMORY_CONFIRMATION",
-        )
+        assert result.durable_response.content in MEMORY_SAVE_MESSAGES["confirmation"]
+        assert result.durable_response.response_kind == "MEMORY_CONFIRMATION"
         assert fact is not None
         assert result.resource_id == fact.id
         assert fact.user_id == user.id

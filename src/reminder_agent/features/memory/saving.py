@@ -234,8 +234,10 @@ def _save_transaction[ResponseT_co](
             for_update=True,
             channel_type=conversation_channel_type,
         )
+        session_ended = False
         if pending is None and locked_session is not None:
             end_session(locked_session, now=now)
+            session_ended = True
         if pending is not None and pending_memory_from_session(locked_session) is None:
             return (
                 responses.stage(
@@ -247,7 +249,7 @@ def _save_transaction[ResponseT_co](
                 None,
                 False,
             )
-        if locked_session is not None:
+        if locked_session is not None and not session_ended:
             end_session(locked_session, now=now)
         log_event_fn(
             logger,

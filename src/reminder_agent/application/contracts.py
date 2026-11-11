@@ -171,8 +171,6 @@ class OutboundResponse:
     idempotency_key: str | None = None
     should_send: bool = True
     is_duplicate: bool = False
-    selection_context: tuple[dict[str, str], ...] | None = None
-
     @property
     def text(self) -> str:
         """Compatibility spelling for callers that previously consumed text."""
@@ -189,3 +187,5 @@ class OutboundResponse:
 @dataclass(frozen=True)
 class ApplicationResult(OutboundResponse):
     """Backward-compatible name for the canonical outbound response contract."""
+
+    selection_context: tuple[dict[str, str], ...] | None = None
