@@ -29,6 +29,7 @@ from reminder_agent.features.onboarding.phone_linking_service import (
     PhoneLinkDecision,
     process_phone_link,
 )
+from reminder_agent.features.onboarding.request_contracts import is_phone_link_request
 from reminder_agent.features.onboarding.responses import (
     OnboardingReply,
 )
@@ -73,7 +74,8 @@ def _is_start(update: Any) -> bool:
 
 def _is_link_phone(update: Any) -> bool:
     assert update.message is not None
-    return (update.message.text or "").strip().lower() in {"/link_phone", "link phone"}
+    text = (update.message.text or "").strip()
+    return text.lower() in {"/link_phone", "link phone"} or is_phone_link_request(text)
 
 
 def _is_skip_phone(update: Any) -> bool:

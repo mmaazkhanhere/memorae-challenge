@@ -17,6 +17,21 @@ from reminder_agent.infrastructure.database.models import User
 def test_onboarding_command_classifier_is_channel_neutral() -> None:
     assert classify_onboarding_text("/start") == (OnboardingAction.START, None)
     assert classify_onboarding_text("/link_phone") == (OnboardingAction.LINK_PHONE, None)
+    assert classify_onboarding_text("I want to share my phone number") == (
+        OnboardingAction.LINK_PHONE,
+        None,
+    )
+    assert classify_onboarding_text("I'd like to share my number") == (
+        OnboardingAction.LINK_PHONE,
+        None,
+    )
+    for text in (
+        "Can I share my phone number?",
+        "I would like to provide my number to you",
+        "I need to connect my phone",
+        "Please enable phone calls",
+    ):
+        assert classify_onboarding_text(text) == (OnboardingAction.LINK_PHONE, None)
     assert classify_onboarding_text("skip for now") == (OnboardingAction.SKIP_PHONE, None)
     assert classify_onboarding_text("/phone_region PK") == (
         OnboardingAction.PHONE_REGION,
