@@ -1449,7 +1449,9 @@ def test_bare_time_is_not_treated_as_a_new_clarification_command(
     response = post_update(api_client, update_factory(135, text="7 pm"))
 
     assert response.status_code == 200
-    assert "didn't find a reminder request" in telegram_client.messages[-1][1]
+    from reminder_agent.features.intent.messages import GENERAL_MESSAGES
+
+    assert telegram_client.messages[-1][1] in GENERAL_MESSAGES["unrelated"]
     assert db.scalar(select(func.count()).select_from(Reminder)) == 0
     assert db.scalar(select(func.count()).select_from(ConversationSession)) == 0
 

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from reminder_agent.features.intent.contracts import PendingReminder
+from reminder_agent.features.intent.messages import general_message
 from reminder_agent.features.reminders.cancel.decisions import is_cancel_command
 from reminder_agent.features.reminders.snooze.operations import is_snooze_command
 from reminder_agent.shared.creation_routing import (
@@ -30,6 +31,7 @@ class ConversationRoute(StrEnum):
     CLARIFICATION_REPLY = "CLARIFICATION_REPLY"
     CANCELLATION = "CANCELLATION"
     SOCIAL = "SOCIAL"
+    CAPABILITIES = "CAPABILITIES"
     MODEL_FALLBACK = "MODEL_FALLBACK"
     UNRELATED = "UNRELATED"
 
@@ -147,6 +149,14 @@ _GREETINGS = {
 _QUESTION = re.compile(
     r"^(?:what|when|where|who|why|how|can|could|do|does|is|are)\b", re.IGNORECASE
 )
+_CAPABILITIES = re.compile(
+    r"^\s*(?:what\s+(?:do\s+you\s+do|can\s+you\s+do)|"
+    r"what\s+can\s+you\s+help(?:\s+me)?\s+with|"
+    r"how\s+can\s+you\s+help(?:\s+me)?|"
+    r"what\s+are\s+you\s+(?:for|able\s+to\s+do)|"
+    r"tell\s+me\s+what\s+you\s+can\s+do)\s*[?!.]*\s*$",
+    re.IGNORECASE,
+)
 
 
 def is_new_reminder_command(text: str) -> bool:
@@ -243,6 +253,8 @@ def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecisio
         return RouteDecision(ConversationRoute.SAVE_MEMORY_REQUEST)
     if creation_route is ExplicitCreateRoute.NEW_REMINDER:
         return RouteDecision(ConversationRoute.NEW_REQUEST)
+    if _CAPABILITIES.fullmatch(raw):
+        return RouteDecision(ConversationRoute.CAPABILITIES)
     # An acknowledgement is conversational only when there is no active
     # clarification.  With pending context it must be interpreted as an answer
     # to the outstanding question, or preserve that state and ask again.
@@ -282,15 +294,19 @@ def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecisio
 
 
 def social_response(text: str, *, user_name: str | None = None) -> str:
-    """Return a small, deterministic response without invoking the model."""
+    """Return a small conversational response without invoking the model."""
     normalized = re.sub(r"[.!?]+$", "", text.strip().lower()).strip()
-    name = user_name.strip().split(maxsplit=1)[0] if user_name and user_name.strip() else None
     if normalized in _GREETINGS:
-        greeting = f"Hi {name}!" if name else "Hi!"
-        return f"{greeting} What would you like me to remind you about?"
+        if user_name and user_name.strip():
+            first_name = user_name.strip().split(maxsplit=1)[0]
+            return f"Hi {first_name}! What would you like me to remind you about?"
+        response = general_message("greeting")
+        return response
     if normalized in _ACKNOWLEDGEMENTS:
-        return "You're welcome."
-    return "I can help create reminders. Tell me what to remember and when."
+        if user_name and user_name.strip():
+            return "You're welcome."
+        return general_message("thanks")
+    return general_message("capabilities")
 
 
 def unrelated_response(text: str, *, pending: PendingReminder | None) -> str:
@@ -300,4 +316,4 @@ def unrelated_response(text: str, *, pending: PendingReminder | None) -> str:
         return social_response(text)
     if pending is not None:
         return "Your unfinished reminder is still saved for when you're ready."
-    return "I didn't find a reminder request in that message."
+    return general_message("unrelated")

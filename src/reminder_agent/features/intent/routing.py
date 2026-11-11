@@ -21,6 +21,7 @@ from reminder_agent.features.intent.deterministic.routing import (
     social_response,
     unrelated_response,
 )
+from reminder_agent.features.intent.messages import general_message
 from reminder_agent.features.intent.model.router import IntentRouter
 from reminder_agent.features.intent.pending.reminder_creation import (
     restrict_to_explicit_field_updates,
@@ -197,6 +198,8 @@ def route_and_interpret(
             fallback_allowed=False,
             clear_context=True,
         )
+    elif route is ConversationRoute.CAPABILITIES:
+        interpretation = Interpretation(response_text=general_message("capabilities"), fallback_allowed=False)
     elif route is ConversationRoute.SOCIAL:
         interpretation = Interpretation(response_text=social_response(text, user_name=user_name), fallback_allowed=False)
     elif route is ConversationRoute.UNRELATED:

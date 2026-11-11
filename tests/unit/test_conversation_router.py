@@ -14,6 +14,7 @@ from reminder_agent.features.intent.deterministic.routing import (
     route_message,
     social_response,
 )
+from reminder_agent.features.intent.messages import GENERAL_MESSAGES
 
 
 def _pending(*, task: str | None = "call the bank") -> PendingReminder:
@@ -307,3 +308,17 @@ def test_router_keeps_greetings_and_thanks_deterministic_and_personalized() -> N
         "Hi Ada! What would you like me to remind you about?"
     )
     assert social_response("Thanks", user_name="Ada Lovelace") == "You're welcome."
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["What do you do?", "What can you help me with?", "How can you help me?"],
+)
+def test_router_handles_capability_questions_without_model_fallback(text: str) -> None:
+    assert route_message(text, pending=None).route is ConversationRoute.CAPABILITIES
+
+
+def test_general_responses_are_selected_from_the_configured_catalog() -> None:
+    assert social_response("What do you do?") in GENERAL_MESSAGES["capabilities"]
+    assert social_response("Hello") in GENERAL_MESSAGES["greeting"]
+    assert social_response("Thanks") in GENERAL_MESSAGES["thanks"]

@@ -11,7 +11,12 @@ import re
 from dataclasses import dataclass
 from enum import StrEnum
 
-OUT_OF_SCOPE_RESPONSE = "I can only help you create and manage reminders and remember information."
+from reminder_agent.features.intent.messages import GENERAL_MESSAGES
+
+# Keep the policy-level response stable for hard rejections that happen before
+# the conversational router has loaded context. Routed unrelated messages use
+# the broader conversational set in ``messages.py``.
+OUT_OF_SCOPE_RESPONSE = GENERAL_MESSAGES["unrelated"][0]
 
 
 class RequestDisposition(StrEnum):
