@@ -91,6 +91,39 @@ def test_reschedule_updates_existing_reminder_and_replaces_pending_notification(
     assert notifications[1].due_at.replace(tzinfo=UTC) == datetime(2026, 10, 31, 10, 0, tzinfo=UTC)
 
 
+def test_incomplete_reschedule_asks_for_future_time_without_mutating(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory)
+    post_update(
+        api_client,
+        update_factory(904, text="Remind me tomorrow at 9 AM to call Ali"),
+    )
+    occurrence_before = db.scalar(select(ReminderOccurrence))
+    assert occurrence_before is not None
+    due_before = occurrence_before.next_due_at
+
+    response = post_update(
+        api_client,
+        update_factory(905, text="I want you to reschedule Ali call reminder"),
+    )
+
+    assert response.status_code == 200
+    assert "future" in telegram_client.messages[-1][1].lower()
+    occurrence_after = db.scalar(select(ReminderOccurrence))
+    assert occurrence_after is not None
+    assert occurrence_after.next_due_at == due_before
+
+    # A repeated incomplete request must resolve the stored pending session
+    # without attempting to calculate a due time from an empty proposal.
+    response = post_update(
+        api_client,
+        update_factory(906, text="I want you to reschedule Ali call reminder"),
+    )
+    assert response.status_code == 200
+    assert "future" in telegram_client.messages[-1][1].lower()
+
+
 def test_conversational_reschedule_targets_match_and_preserve_notification_graph(
     api_client, telegram_client, db, update_factory
 ) -> None:

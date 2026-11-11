@@ -244,6 +244,23 @@ def decide_reschedule(
                     candidate_ids,
                 )
             return RescheduleDecision("RESPONSE", reschedule_message("reminder_inactive"))
+        if pending.due_at is None and pending.offset_minutes is None:
+            return RescheduleDecision(
+                "CLARIFY",
+                choose_reschedule_message(
+                    "missing_reschedule_time", task=candidate.task
+                ),
+                request=RescheduleRequest(
+                    target_text=pending.target_text,
+                    due_at=None,
+                    date_explicit=pending.date_explicit,
+                    scope=scope,
+                    source_text=pending.source_text,
+                    occurrence_date=pending.occurrence_date,
+                    destination_weekday=pending.destination_weekday,
+                ),
+                candidate_ids=(candidate.reminder_id,),
+            )
         if candidate.schedule_type == RECURRING and scope is None:
             return RescheduleDecision(
                 "CLARIFY",
@@ -318,6 +335,15 @@ def decide_reschedule(
             candidate_ids=tuple(candidate.reminder_id for candidate in candidates),
         )
     candidate = candidates[0]
+    if parsed.due_at is None and parsed.offset_minutes is None:
+        return RescheduleDecision(
+            "CLARIFY",
+            choose_reschedule_message(
+                "missing_reschedule_time", task=candidate.task
+            ),
+            request=parsed,
+            candidate_ids=(candidate.reminder_id,),
+        )
     if candidate.schedule_type == RECURRING and parsed.scope is None:
         return RescheduleDecision(
             "CLARIFY",

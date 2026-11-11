@@ -30,6 +30,11 @@ REMINDER_RESCHEDULE_MESSAGES: dict[str, list[str]] = {
         "Sure thing! What reminder should I move?",
         "Happy to help! Which reminder did you have in mind?",
     ],
+    "missing_reschedule_time": [
+        "What future time should I use for your '{task}' reminder?",
+        "When should I move your '{task}' reminder to?",
+        "What future date and time should I use for '{task}'?",
+    ],
     "ambiguous_pending_selection": [
         "Just to make sure I get the right one, which reminder did you mean?",
         "I want to make sure I'm moving the right reminder. Which one should I update?",

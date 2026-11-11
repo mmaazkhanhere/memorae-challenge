@@ -57,7 +57,16 @@ _STOP_WORDS = {
 
 
 def _tokens(value: str) -> set[str]:
-    return {token for token in re.findall(r"[a-z0-9]+", value.lower()) if token not in _STOP_WORDS}
+    tokens: set[str] = set()
+    for token in re.findall(r"[a-z0-9]+", value.lower()):
+        if token in _STOP_WORDS:
+            continue
+        if token.endswith("ing") and len(token) > 5:
+            token = token[:-3]
+        if token.endswith("s") and not token.endswith(("ss", "us", "is")):
+            token = token[:-1]
+        tokens.add(token)
+    return tokens
 
 
 def _candidate_match(target: str, task: str) -> bool:

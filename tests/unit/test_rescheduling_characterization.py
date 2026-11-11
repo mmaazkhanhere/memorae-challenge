@@ -39,6 +39,31 @@ def test_parse_reschedule_keeps_ambiguous_clock_non_mutating() -> None:
     assert result == "Do you mean 10 AM or 10 PM for the new reminder time?"
 
 
+def test_parse_incomplete_reschedule_preserves_target_for_time_clarification() -> None:
+    result = parse_reschedule_request(
+        "I want you to reschedule Ali call reminder",
+        timezone_name="Asia/Karachi",
+        now=NOW,
+    )
+
+    assert isinstance(result, RescheduleRequest)
+    assert result.target_text == "Ali call"
+    assert result.due_at is None
+    assert result.offset_minutes is None
+
+
+def test_parse_reschedule_removes_the_previous_time_from_the_target() -> None:
+    result = parse_reschedule_request(
+        "Move my dentist reminder from 3 PM to 5 PM",
+        timezone_name="Asia/Karachi",
+        now=NOW,
+    )
+
+    assert isinstance(result, RescheduleRequest)
+    assert result.target_text == "dentist reminder"
+    assert result.due_at == datetime(2026, 10, 31, 12, 0, tzinfo=UTC)
+
+
 def test_series_calendar_cadence_change_is_rejected_before_model_fallback() -> None:
     assert has_unsupported_series_cadence_change(
         "Move the whole series to the 15th at 10 AM"

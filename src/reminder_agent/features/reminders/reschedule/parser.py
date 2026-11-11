@@ -29,10 +29,22 @@ _COMMAND_GREEDY = re.compile(
     r"(?P<separator>to|until|for)\s+(?P<when>.+?)\s*[.!?]*\s*$",
     re.IGNORECASE,
 )
+_INCOMPLETE_COMMAND = re.compile(
+    r"^\s*(?:i\s+(?:want|need)\s+(?:you\s+to\s+)?|can\s+you\s+|could\s+you\s+)?"
+    r"(?:please\s+)?(?:move|reschedule|change|shift|push|postpone|delay)\s+"
+    r"(?:the\s+)?(?P<target>.+?)\s*(?:reminder)?\s*[.!?]*\s*$",
+    re.IGNORECASE,
+)
 _WHEN = re.compile(
     r"^(?:(?P<day>today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
     r"\d{4}-\d{1,2}-\d{1,2})\s+)?(?:at\s+)?(?P<hour>\d{1,2})"
     r"(?::(?P<minute>\d{2}))?\s*(?P<meridiem>a\.?m\.?|p\.?m\.?|am|pm)?$",
+    re.IGNORECASE,
+)
+_OLD_TIME = re.compile(
+    r"\s+from\s+(?:(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|"
+    r"saturday|sunday)\s+)?(?:at\s+)?\d{1,2}(?::\d{2})?\s*"
+    r"(?:a\.?m\.?|p\.?m\.?|am|pm)\b",
     re.IGNORECASE,
 )
 _ORDINALS = {
@@ -161,6 +173,7 @@ def extract_target_and_occurrence(
 ) -> tuple[str, RescheduleScope | None, date | None]:
     """Remove an explicit occurrence selector before matching the task."""
 
+    target = _OLD_TIME.sub(" ", target)
     scope = scope_from_text(target)
     occurrence_date = None
     selector = _OCCURRENCE_SELECTOR.search(target)
@@ -192,7 +205,33 @@ def parse_reschedule_request(
 
     match = _COMMAND.match(text)
     if match is None:
-        return reschedule_message("missing_reminder_target")
+        incomplete = _INCOMPLETE_COMMAND.match(text)
+        if incomplete is None:
+            return reschedule_message("missing_reminder_target")
+        raw_target = " ".join(incomplete.group("target").split())
+        # Leave requests that contain an explicit relative-time expression to
+        # the route-specific extractor.  This branch is only for a grounded
+        # reminder target with no destination time at all.
+        if re.search(
+            r"\b(?:to|until|for|at)\s+(?:today|tomorrow|monday|tuesday|wednesday|"
+            r"thursday|friday|saturday|sunday|\d)|\bback\s+by\b",
+            raw_target,
+            re.IGNORECASE,
+        ):
+            return reschedule_message("missing_reminder_target")
+        target = raw_target
+        target = re.sub(r"\s+reminders?$", "", target, flags=re.IGNORECASE).strip()
+        target, scope, occurrence_date = extract_target_and_occurrence(
+            target, timezone_name=timezone_name, now=now
+        )
+        if not target:
+            return reschedule_message("missing_reminder_target")
+        return RescheduleRequest(
+            target_text=target,
+            scope=scope,
+            occurrence_date=occurrence_date,
+            source_text=text,
+        )
     target = " ".join(match.group("target").split())
     target = re.sub(r"^my\s+", "", target, flags=re.I)
     target = re.sub(r"^(?:my\s+)?(?:a\s+)?reminders?\s+to\s+", "", target, flags=re.I)

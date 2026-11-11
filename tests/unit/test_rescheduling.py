@@ -4,7 +4,7 @@ from uuid import uuid4
 import pytest
 
 from reminder_agent.features.reminders.reschedule.candidates import (
-    find_candidates,
+    _candidate_match,
     select_pending_candidate_ids,
 )
 from reminder_agent.features.reminders.reschedule.decisions import (
@@ -18,6 +18,10 @@ from reminder_agent.features.reminders.reschedule.decisions import (
     apply_pending_reschedule_proposal,
     parse_reschedule_request,
 )
+
+
+def test_reschedule_matching_normalizes_simple_verb_forms() -> None:
+    assert _candidate_match("dentist booking appointment", "book dentist appointment")
 
 NOW = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
 
