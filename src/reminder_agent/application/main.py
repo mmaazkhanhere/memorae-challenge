@@ -169,6 +169,7 @@ def create_app(
             app.state.settings.llm_api_key,
             app.state.settings.llm_intent_model,
             app.state.settings.llm_timeout_seconds,
+            prompt_version=app.state.settings.llm_intent_prompt_version,
             client=llm_client,
         )
         configured_memory_answerer = OpenAICompatibleMemoryAnswerer(

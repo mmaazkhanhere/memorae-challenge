@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     llm_api_key: str | None = None
     llm_extract_model: str = "openai/gpt-oss-120b"
     llm_intent_model: str = "openai/gpt-oss-20b"
+    llm_intent_prompt_version: str = "v1"
     llm_timeout_seconds: float = Field(default=10.0, gt=0)
     stt_base_url: str = "https://api.groq.com/openai/v1"
     stt_api_key: str | None = None

@@ -24,6 +24,12 @@ from reminder_agent.features.intent import (
     restrict_to_explicit_field_updates,
 )
 from reminder_agent.features.intent.deterministic.routing import ConversationRoute
+from reminder_agent.features.intent.model.classifier_prompts import (
+    CLASSIFIER_PROMPT_V1,
+    CLASSIFIER_PROMPT_V2,
+    CLASSIFIER_PROMPTS,
+    get_classifier_prompt,
+)
 from reminder_agent.features.intent.policy import OUT_OF_SCOPE_RESPONSE
 from reminder_agent.features.memory.messages import MEMORY_LOOKUP_MESSAGES
 from reminder_agent.features.memory.retrieve.contracts import MemoryAnswerProposal
@@ -199,6 +205,54 @@ def test_intent_router_classifies_only_the_operation_and_limits_history(monkeypa
     assert len(context["recent_messages"]) == 8
     assert "message 31" not in context["recent_messages"]
     assert "message 34" in context["recent_messages"]
+
+
+def test_intent_router_uses_configured_prompt_version(monkeypatch) -> None:
+    captured: dict = {}
+
+    def fake_post(*args, **kwargs):
+        captured.update(kwargs["json"])
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={"choices": [{"message": {"content": '{"operation":"SOCIAL"}'}}]},
+        )
+
+    monkeypatch.setitem(CLASSIFIER_PROMPTS, "test", "test classifier prompt")
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    OpenAICompatibleIntentRouter(
+        "https://api.groq.example/openai/v1",
+        "secret",
+        "openai/gpt-oss-20b",
+        prompt_version="test",
+    ).classify("hello", pending=None, recent_messages=())
+
+    assert captured["messages"][0]["content"] == "test classifier prompt"
+
+
+def test_intent_router_rejects_unknown_prompt_version() -> None:
+    with pytest.raises(ValueError, match="unknown intent classifier prompt version"):
+        OpenAICompatibleIntentRouter(
+            "https://api.groq.example/openai/v1",
+            "secret",
+            "openai/gpt-oss-20b",
+            prompt_version="missing",
+        )
+
+
+def test_classifier_prompt_v1_is_the_default_prompt() -> None:
+    router = OpenAICompatibleIntentRouter(
+        "https://api.groq.example/openai/v1",
+        "secret",
+        "openai/gpt-oss-20b",
+    )
+
+    assert CLASSIFIER_PROMPT_V1 == CLASSIFIER_PROMPTS["v1"]
+    assert CLASSIFIER_PROMPT_V2 == CLASSIFIER_PROMPTS["v2"]
+    assert get_classifier_prompt("v1") == CLASSIFIER_PROMPT_V1
+    assert get_classifier_prompt("v2") == CLASSIFIER_PROMPT_V2
+    assert router._prompt_version == "v1"
 
 
 def test_intent_router_accepts_list_request_route(monkeypatch) -> None:
@@ -1030,6 +1084,7 @@ def test_default_llm_configuration_targets_openai_compatible_api() -> None:
     assert settings.llm_base_url == "https://api.openai.com/v1"
     assert settings.llm_extract_model == "openai/gpt-oss-120b"
     assert settings.llm_intent_model == "openai/gpt-oss-20b"
+    assert settings.llm_intent_prompt_version == "v1"
 
 
 def test_relative_minutes_are_resolved_from_one_reference_time() -> None:
