@@ -6,6 +6,7 @@ import inspect
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, cast
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
 
@@ -17,7 +18,11 @@ from reminder_agent.features.intent.contracts import (
     Interpretation,
     PendingReminder,
 )
-from reminder_agent.features.intent.deterministic.routing import ConversationRoute, route_message
+from reminder_agent.features.intent.deterministic.routing import (
+    ConversationRoute,
+    route_message,
+    selection_index,
+)
 from reminder_agent.features.intent.model.router import IntentRouter
 from reminder_agent.features.reminders.listing.service import list_reminders_from_interpretation
 
@@ -64,6 +69,7 @@ def process_authenticated_conversation(
     pending_reminder: PendingReminder | None = None,
     intent_router: IntentRouter | None = None,
     recent_messages: list[str] | None = None,
+    selection_context: tuple[dict[str, str], ...] = (),
 ) -> ConversationEntryResult:
     """Route an authenticated request before feature-specific dispatch."""
 
@@ -85,7 +91,38 @@ def process_authenticated_conversation(
             ),
         )
 
-    route = route_message(request.message_text, pending=pending_reminder).route
+    route = route_message(
+        request.message_text,
+        pending=pending_reminder,
+        selection_context=selection_context,
+    ).route
+    selected = selection_index(request.message_text)
+    if selected is not None and selection_context:
+        if selected >= len(selection_context):
+            return ConversationEntryResult(
+                route=route,
+                response=ApplicationResult(
+                    content="I could not find that reminder in the latest list.",
+                    response_kind="REMINDER_SELECTION_CLARIFICATION",
+                ),
+            )
+        item = selection_context[selected]
+        due_at = datetime.fromisoformat(item["due_at"]).astimezone(
+            ZoneInfo(user.timezone)
+        )
+        ordinal = ("first", "second", "third")[selected]
+        return ConversationEntryResult(
+            route=route,
+            response=ApplicationResult(
+                content=(
+                    f"The {ordinal} reminder is {due_at:%Y-%m-%d %H:%M %Z} - "
+                    f"{item['task']}."
+                ),
+                response_kind="REMINDER_SELECTION",
+                selection_context=(item,),
+            ),
+        )
+
     if has_pending_clarification or route is not ConversationRoute.LIST_REQUEST:
         return ConversationEntryResult(route=route)
 

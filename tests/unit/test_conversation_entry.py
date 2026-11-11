@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 
 from sqlalchemy import func, select
 
@@ -176,4 +176,67 @@ def test_entry_defers_list_requests_with_pending_clarification(session_factory, 
 
     assert result.route is ConversationRoute.LIST_REQUEST
     assert result.response is None
+    assert interpreter.calls == []
+
+
+def test_entry_uses_the_latest_list_selection_for_ordinal_follow_up(
+    session_factory, fixed_now
+) -> None:
+    with session_factory.begin() as db:
+        user, identity = _active_telegram_context(db)
+    interpreter = RecordingInterpreter()
+
+    with session_factory() as db:
+        result = process_authenticated_conversation(
+            db,
+            request=_request_for(user, identity, text="which on is first"),
+            interpreter=interpreter,
+            has_pending_clarification=False,
+            now=fixed_now,
+            selection_context=(
+                {
+                    "reminder_id": "00000000-0000-0000-0000-000000000001",
+                    "task": "pay rent",
+                    "due_at": datetime(2026, 11, 7, 10, tzinfo=UTC).isoformat(),
+                },
+                {
+                    "reminder_id": "00000000-0000-0000-0000-000000000002",
+                    "task": "call Alice",
+                    "due_at": datetime(2026, 11, 7, 12, tzinfo=UTC).isoformat(),
+                },
+            ),
+        )
+
+    assert result.response is not None
+    assert result.response.response_kind == "REMINDER_SELECTION"
+    assert "pay rent" in result.response.content
+    assert interpreter.calls == []
+
+
+def test_entry_uses_list_selection_before_an_unfinished_clarification(
+    session_factory, fixed_now
+) -> None:
+    with session_factory.begin() as db:
+        user, identity = _active_telegram_context(db)
+    interpreter = RecordingInterpreter()
+
+    with session_factory() as db:
+        result = process_authenticated_conversation(
+            db,
+            request=_request_for(user, identity, text="which one is first?"),
+            interpreter=interpreter,
+            has_pending_clarification=True,
+            now=fixed_now,
+            selection_context=(
+                {
+                    "reminder_id": "00000000-0000-0000-0000-000000000001",
+                    "task": "review my slides",
+                    "due_at": datetime(2026, 11, 12, 3, 30, tzinfo=UTC).isoformat(),
+                },
+            ),
+        )
+
+    assert result.response is not None
+    assert result.response.response_kind == "REMINDER_SELECTION"
+    assert "review my slides" in result.response.content
     assert interpreter.calls == []

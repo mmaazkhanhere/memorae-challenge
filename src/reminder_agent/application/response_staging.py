@@ -69,6 +69,12 @@ def _existing_record(db: Session, update: Any) -> IdempotencyRecord | None:
 
 def _reply_from_record(record: IdempotencyRecord) -> ReminderReply:
     assert record.response is not None
+    raw_selection_context = record.response.get("selection_context")
+    selection_context = (
+        tuple(item for item in raw_selection_context if isinstance(item, dict))
+        if isinstance(raw_selection_context, list)
+        else ()
+    )
     return ReminderReply(
         chat_id=int(record.response["chat_id"]),
         text=str(record.response["text"]),
@@ -80,6 +86,7 @@ def _reply_from_record(record: IdempotencyRecord) -> ReminderReply:
             "completion" if record.operation == "COMPLETE_REMINDER" else "REPLAY"
         ),
         cleanup_provider_message_id=record.response.get("cleanup_provider_message_id"),
+        selection_context=selection_context,
     )
 
 
@@ -171,6 +178,7 @@ def _store_response(
     include_request_text: bool = True,
     cleanup_provider_message_id: str | None = None,
     response_metadata: dict[str, Any] | None = None,
+    selection_context: tuple[dict[str, str], ...] = (),
 ) -> ReminderReply:
     """Stage an idempotent Telegram response in the caller's transaction."""
 
@@ -190,6 +198,7 @@ def _store_response(
         idempotency_key=str(update.update_id),
         response_kind=response_kind,
         cleanup_provider_message_id=cleanup_provider_message_id,
+        selection_context=selection_context,
     )
     now = datetime.now(UTC)
     response = {
@@ -201,6 +210,8 @@ def _store_response(
         response["request_text"] = update.message.text or ""
     if cleanup_provider_message_id is not None:
         response["cleanup_provider_message_id"] = cleanup_provider_message_id
+    if selection_context:
+        response["selection_context"] = list(selection_context)
     if response_metadata:
         response.update(response_metadata)
     db.add(

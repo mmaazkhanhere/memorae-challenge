@@ -43,6 +43,7 @@ def interpret_for_route(
     now: datetime,
     context: PendingReminder | None,
     recent_messages: list[str],
+    selection_context: list[dict[str, str]] | None = None,
 ) -> Interpretation:
     """Invoke the typed interpreter with one explicitly selected safe route."""
 
@@ -54,6 +55,8 @@ def interpret_for_route(
         kwargs["context"] = context
     if "recent_messages" in parameters:
         kwargs["recent_messages"] = recent_messages
+    if "selection_context" in parameters:
+        kwargs["selection_context"] = selection_context or []
     return cast(Interpretation, cast(Any, interpreter).interpret(text, **kwargs))
 
 
@@ -119,7 +122,9 @@ def route_and_interpret(
 ) -> tuple[ConversationRoute, Interpretation]:
     """Route first, then interpret only the route that permits extraction."""
 
-    route = deterministic_route or route_message(text, pending=pending).route
+    route = deterministic_route or route_message(
+        text, pending=pending, selection_context=selection_context or ()
+    ).route
     original_route = route
     recent_messages = recent_messages or []
     recent_delivered_reminders = recent_delivered_reminders or []
@@ -265,6 +270,7 @@ def route_and_interpret(
             now=now,
             context=pending if route in {ConversationRoute.CLARIFICATION_REPLY, ConversationRoute.MODEL_FALLBACK} else None,
             recent_messages=recent_messages,
+            selection_context=selection_context,
         )
 
     updates = interpretation.field_updates

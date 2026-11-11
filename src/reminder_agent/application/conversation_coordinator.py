@@ -31,6 +31,7 @@ from reminder_agent.application.conversations import (
     pending_from_session,
     pending_memory_from_session,
     pending_memory_lookup_from_session,
+    pending_reminder_batch_from_session,
     pending_reschedule_from_session,
     pending_snooze_from_session,
     session_expired,
@@ -41,6 +42,9 @@ from reminder_agent.application.conversations import (
 )
 from reminder_agent.application.conversations import (
     upsert_clarification_session as _upsert_clarification_session,
+)
+from reminder_agent.application.reminder_clarification import (
+    merge_pending_reminder_batch,
 )
 from reminder_agent.application.response_staging import (
     ReminderReply,
@@ -54,6 +58,7 @@ from reminder_agent.application.response_staging import (
 from reminder_agent.features.intent.contracts import (
     IntentInterpreter,
     Interpretation,
+    PendingReminderBatch,
     ReminderSummaryIntent,  # noqa: F401 - adapter compatibility export
 )
 from reminder_agent.features.intent.deterministic.routing import (
@@ -129,11 +134,11 @@ from reminder_agent.features.reminders.summary.telegram_adapter import (
     handle_reminder_summary_request,
 )
 from reminder_agent.infrastructure.database.models import ChannelIdentity, User
+from reminder_agent.infrastructure.observability import get_logger, log_event
 from reminder_agent.infrastructure.providers.embeddings import (
     EmbeddingPrivacyPolicy,
     EmbeddingProvider,
 )
-from reminder_agent.infrastructure.observability import get_logger, log_event
 from reminder_agent.shared.creation_routing import is_memory_reminder_collision
 from reminder_agent.shared.idempotency import IdempotencyConflict  # noqa: F401 - compatibility export
 from reminder_agent.shared.memory_contracts import (
@@ -166,6 +171,8 @@ def _route_and_interpret(*args: Any, **kwargs: Any):
         pass
     routing.restrict_to_explicit_field_updates = compatibility_restrict
     return feature_route_and_interpret(*args, **kwargs)
+
+
 
 
 # Legacy imports remain available while context ownership moves to
@@ -590,13 +597,28 @@ def handle_reminder_text(
         pending_reminder=pending,
         intent_router=intent_router,
         recent_messages=recent_messages,
+        selection_context=tuple(selection_context),
     )
     if conversation_entry.response is not None:
+        # Capture the scalar before rollback expires ORM instances; accessing
+        # ``user.id`` afterwards can implicitly begin a new transaction.
+        user_id = user.id
         db.rollback()
         result = conversation_entry.response
         if result.selection_context:
-            remember_selection_context(user.id, tuple(result.selection_context))
-        return ReminderReply(update.message.chat.id, result.content, response_kind=result.response_kind)
+            remember_selection_context(user_id, tuple(result.selection_context))
+        if result.response_kind != "REMINDER_LIST":
+            return ReminderReply(update.message.chat.id, result.content, response_kind=result.response_kind)
+        with db.begin():
+            return _store_response(
+                db,
+                update=update,
+                user_id=user_id,
+                text=result.content,
+                response_kind=result.response_kind,
+                operation="LIST_REMINDERS",
+                selection_context=tuple(result.selection_context or ()),
+            )
     assert conversation_entry.route is not None
     deterministic_route = conversation_entry.route
     log_event(
@@ -1270,6 +1292,17 @@ def handle_reminder_text(
                     route=route,
                 )
 
+            pending_batch = pending_reminder_batch_from_session(locked_session)
+            if pending_batch is not None and route in {
+                ConversationRoute.CLARIFICATION_REPLY,
+                ConversationRoute.MODEL_FALLBACK,
+            }:
+                interpretation = merge_pending_reminder_batch(
+                    interpretation,
+                    batch=pending_batch,
+                    now=now,
+                )
+
             if route in {ConversationRoute.UNRELATED, ConversationRoute.SOCIAL}:
                 # Do not parse, extend, or overwrite a pending reminder for
                 # conversational text that the router found unrelated.
@@ -1291,11 +1324,14 @@ def handle_reminder_text(
             if list_result is not None:
                 if list_result.selection_context:
                     remember_selection_context(user.id, tuple(list_result.selection_context))
-                return ReminderReply(
-                    chat_id=update.message.chat.id,
+                return _store_response(
+                    db,
+                    update=update,
+                    user_id=user.id,
                     text=list_result.content,
                     response_kind=list_result.response_kind,
-                    selection_context=tuple(list_result.selection_context),
+                    operation="LIST_REMINDERS",
+                    selection_context=tuple(list_result.selection_context or ()),
                 )
 
             summary_reply = handle_reminder_summary_request(
@@ -1311,6 +1347,11 @@ def handle_reminder_text(
 
             if interpretation.clarification is not None:
                 clarification = interpretation.clarification
+                active_pending = (
+                    clarification.pending.active
+                    if isinstance(clarification.pending, PendingReminderBatch)
+                    else clarification.pending
+                )
                 if locked_session is None:
                     locked_session = _upsert_clarification_session(
                         db,
@@ -1336,9 +1377,9 @@ def handle_reminder_text(
                     update_id=update.update_id,
                     session_id=str(locked_session.id),
                     session_version=locked_session.version,
-                    missing_task=clarification.pending.task is None,
-                    missing_date=clarification.pending.date_local is None,
-                    missing_time=clarification.pending.hour is None,
+                    missing_task=active_pending.task is None,
+                    missing_date=active_pending.date_local is None,
+                    missing_time=active_pending.hour is None,
                 )
                 return _store_response(
                     db,
