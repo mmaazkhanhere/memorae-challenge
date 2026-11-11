@@ -19,7 +19,8 @@ class ExplicitCreateRoute(StrEnum):
 
 
 REMINDER_COMMAND_PREFIX = re.compile(
-    r"^\s*(?:please\s+)?(?:"
+    r"^\s*(?:(?:hey|hi|hello)\s*[,!:-]?\s*)?"
+    r"(?:(?:can|could|would)\s+you\s+)?(?:please\s+)?(?:"
     r"(?:(?:and\s+)?also\s+)?"
     r"remind\s+me|"
     r"set\s+(?:a\s+)?reminder|"

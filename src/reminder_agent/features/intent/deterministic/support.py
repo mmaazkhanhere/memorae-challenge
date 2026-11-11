@@ -114,6 +114,19 @@ def normalise_meridiem(value: str | None) -> str | None:
     return value.lower().replace(".", "") if value else None
 
 
+def meridiem_from_day_part(value: str | None) -> Meridiem | None:
+    """Map an explicit natural-language day part to a safe 12-hour half."""
+
+    if not value:
+        return None
+    normalized = value.casefold().strip()
+    if normalized in {"morning"}:
+        return "am"
+    if normalized in {"afternoon", "evening", "night"}:
+        return "pm"
+    return None
+
+
 def valid_clock(hour: int | None, minute: int, meridiem: str | None) -> bool:
     return (
         hour is not None

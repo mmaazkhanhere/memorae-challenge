@@ -89,9 +89,12 @@ def test_router_recognizes_progress_questions() -> None:
 
 
 def test_router_recognizes_explicit_cancellation_requests() -> None:
-    assert (
-        route_message("Cancel the standup", pending=None).route is ConversationRoute.CANCEL_REQUEST
-    )
+    for text in (
+        "Cancel the standup",
+        "Could you please cancel all my reminders for tomorrow?",
+        "I would like to cancel all reminders on Friday",
+    ):
+        assert route_message(text, pending=None).route is ConversationRoute.CANCEL_REQUEST
     assert route_message("Cancel only tomorrow's standup", pending=_pending()).route is (
         ConversationRoute.CANCEL_REQUEST
     )
@@ -174,6 +177,28 @@ def test_router_distinguishes_unambiguous_reminders_from_memory_facts() -> None:
     assert (
         route_message("Remember to call Ali tomorrow at 9 AM", pending=None).route
         is ConversationRoute.NEW_REQUEST
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Show me all my callreminders",
+        "What recurring reminders have I got?",
+        "Hey, what is on my reminder list for tomorrow?",
+        "Can you summarize what I need to remember this week?",
+        "and on Firday?",
+        "Summarize my weekly recurring reminders.",
+        "What's on my agenda for the weekend?",
+    ],
+)
+def test_router_keeps_natural_language_overviews_in_read_only_listing_scope(text: str) -> None:
+    assert route_message(text, pending=None).route is ConversationRoute.LIST_REQUEST
+
+
+def test_router_classifies_forgotten_reminder_question_as_a_summary() -> None:
+    assert route_message("anything, i forgot to take care of", pending=None).route is (
+        ConversationRoute.SUMMARY_REQUEST
     )
     assert route_message("Remember to call Ali", pending=None).route is (
         ConversationRoute.NEW_REQUEST
@@ -322,3 +347,15 @@ def test_general_responses_are_selected_from_the_configured_catalog() -> None:
     assert social_response("What do you do?") in GENERAL_MESSAGES["capabilities"]
     assert social_response("Hello") in GENERAL_MESSAGES["greeting"]
     assert social_response("Thanks") in GENERAL_MESSAGES["thanks"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Hey, can you remind me in 5 minutes to check my email?",
+        "Can you remind me tomorrow at 9 AM to call the dentist?",
+        "Could you please remind me in an hour to review the report?",
+    ],
+)
+def test_polite_new_reminder_requests_override_pending_context(text: str) -> None:
+    assert route_message(text, pending=_pending()).route is ConversationRoute.NEW_REQUEST

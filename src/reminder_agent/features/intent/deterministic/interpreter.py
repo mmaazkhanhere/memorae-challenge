@@ -68,6 +68,9 @@ from reminder_agent.features.intent.deterministic.support import (
     date_from_day as _date_from_day,
 )
 from reminder_agent.features.intent.deterministic.support import (
+    meridiem_from_day_part as _meridiem_from_day_part,
+)
+from reminder_agent.features.intent.deterministic.support import (
     next_recurring_start_local as _next_recurring_start_local,
 )
 from reminder_agent.features.intent.deterministic.support import (
@@ -384,6 +387,9 @@ class RuleBasedIntentInterpreter(
             hour = int(tomorrow.group("hour"))
             minute = int(tomorrow.group("minute") or 0)
             meridiem = _normalise_meridiem(tomorrow.group("meridiem"))
+            meridiem = meridiem or _meridiem_from_day_part(
+                tomorrow.groupdict().get("day_part")
+            )
             if not _valid_clock(hour, minute, meridiem):
                 return self._invalid_time()
             local_date = reference.astimezone(zone).date() + timedelta(days=1)
@@ -448,6 +454,9 @@ class RuleBasedIntentInterpreter(
                 cast(Meridiem | None, _normalise_meridiem(clock.group("meridiem")))
                 if clock
                 else None
+            )
+            meridiem = meridiem or _meridiem_from_day_part(
+                clock.groupdict().get("day_part") if clock else None
             )
             if clock is not None and not _valid_clock(clock_hour, minute, meridiem):
                 return self._invalid_time()

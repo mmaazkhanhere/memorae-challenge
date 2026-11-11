@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -64,8 +65,27 @@ _NEXT_REMINDER_REQUEST = re.compile(
     r"^\s*what(?:'s|\s+is)\s+(?:my\s+)?(?:next|upcoming)\s+reminders?(?:\s+to\s+do)?\s*[?!.]*\s*$",
     re.IGNORECASE,
 )
+_RICH_LIST_REQUEST = re.compile(
+    r"^\s*(?:(?:hey|hi)[,\s]+)?(?:and\s+)?(?:"
+    r"(?:what|which)\s+(?:are\s+)?(?:my\s+)?(?:weekly\s+)?(?:recurring\s+)?"
+    r"reminders?\s+(?:have\s+i\s+got|do\s+i\s+have)|"
+    r"(?:what(?:'s|\s+is)\s+)?(?:on\s+)?(?:my\s+)?(?:reminder\s+list|agenda)\s+"
+    r"(?:for|on|this\s+week|next\s+week|the\s+weekend|tomorrow|today)\b|"
+    r"(?:can\s+you\s+)?summari[sz]e\s+.*(?:this\s+week|weekly|weekend|recurring|agenda)|"
+    r"(?:anything[,\s]+.*(?:forgot|take\s+care\s+of|need\s+to\s+remember))|"
+    r"(?:and\s+)?on\s+(?:monday|tuesday|wednesday|thursday|friday|firday|saturday|sunday)\b|"
+    r"(?:show|list)\s+(?:(?:my|me)\s+)?all\s+(?:(?:my|me)\s+)?\w+reminders?)"
+    r".*[?!.]*\s*$",
+    re.IGNORECASE,
+)
+_SELECTION_FOLLOW_UP = re.compile(
+    r"^\s*(?:which|what)\s+(?:one|on|item|reminder)\s+"
+    r"(?:is\s+)?(?P<ordinal>first|second|third|1|2|3)\b.*$",
+    re.IGNORECASE,
+)
 _SUMMARY_REQUEST = re.compile(
     r"^\s*(?:(?:how\s+many|what\s+is\s+the\s+number\s+of).*(?:pending|outstanding|unfinished|overdue|completed|done|finished)(?:.*(?:today|this\s+day))?.*"
+    r"|anything[,\s]+.*(?:forgot|take\s+care\s+of|need\s+to\s+remember)"
     r"|(?:what|which|show|list).*(?:still\s+have\s+to\s+do|have\s+left|remaining).*(?:today|this\s+day)"
     r"|(?:what|which|show|list).*(?:today|this\s+day).*(?:still\s+have\s+to\s+do|have\s+left|remaining)"
     r"|(?:what|which|show|list).*(?:completed|done|finished).*(?:today|this\s+day))\s*[?!.]*\s*$",
@@ -100,12 +120,13 @@ _REMINDER_STATUS_QUESTION = re.compile(
     re.IGNORECASE,
 )
 _DIRECT_CANCEL = re.compile(
-    r"^\s*(?:please\s+|can\s+you\s+|could\s+you\s+)?"
+    r"^\s*(?:please\s+)?(?:can\s+you\s+(?:please\s+)?|could\s+you\s+(?:please\s+)?|"
+    r"would\s+you\s+(?:please\s+)?|)"
     r"(?:cancel|delete|remove|stop)\s+.+?\s*[.!?]*\s*$",
     re.IGNORECASE,
 )
 _EXPLICIT_CANCEL_INTENT = re.compile(
-    r"^\s*(?:i|we)\s+(?:want|need)\s+to\s+"
+    r"^\s*(?:i|we)\s+(?:want|need|would\s+like)\s+to\s+"
     r"(?:cancel|delete|remove|stop)\s+.+?\s*[.!?]*\s*$",
     re.IGNORECASE,
 )
@@ -181,10 +202,22 @@ def is_list_request_command(text: str) -> bool:
     raw = text.strip()
     return (
         _LIST_REMINDERS.match(raw) is not None
+        or _RICH_LIST_REQUEST.match(raw) is not None
         or _SCHEDULE_LIST_REQUEST.match(raw) is not None
         or _TASK_LIST_REQUEST.match(raw) is not None
         or _NEXT_REMINDER_REQUEST.match(raw) is not None
     )
+
+
+def selection_index(text: str) -> int | None:
+    """Return the zero-based ordinal requested from the latest list."""
+
+    match = _SELECTION_FOLLOW_UP.fullmatch(text.strip())
+    if match is None:
+        return None
+    return {"first": 0, "1": 0, "second": 1, "2": 1, "third": 2, "3": 2}[
+        match.group("ordinal").lower()
+    ]
 
 
 def is_summary_request_command(text: str) -> bool:
@@ -211,7 +244,12 @@ def is_contextual_cancel_command(text: str) -> bool:
     return _CONTEXTUAL_CANCEL.fullmatch(text.strip()) is not None
 
 
-def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecision:
+def route_message(
+    text: str,
+    *,
+    pending: PendingReminder | None,
+    selection_context: Sequence[dict[str, str]] = (),
+) -> RouteDecision:
     """Choose a safe deterministic path or the model fallback.
 
     This deliberately does not attempt to determine whether free-form text is
@@ -222,6 +260,8 @@ def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecisio
     normalized = re.sub(r"[.!?]+$", "", raw.lower()).strip()
 
     creation_route = explicit_create_route(raw)
+    if selection_context and selection_index(raw) is not None:
+        return RouteDecision(ConversationRoute.LIST_REQUEST)
     # Creation wording can look explicit while still being a compound,
     # referential, or negated request.  Do not let unrelated deterministic
     # routes turn that ambiguity into a read or write operation.

@@ -115,7 +115,8 @@ class CancellationConflict(RuntimeError):
 
 
 _COMMAND = re.compile(
-    r"^\s*(?:please\s+|can\s+you\s+|could\s+you\s+)?"
+    r"^\s*(?:please\s+)?(?:can\s+you\s+(?:please\s+)?|could\s+you\s+(?:please\s+)?|"
+    r"would\s+you\s+(?:please\s+)?|)"
     r"(?:cancel|delete|remove|stop)\s+(?P<target>.+?)\s*[.!?]*\s*$",
     re.IGNORECASE,
 )
@@ -126,7 +127,7 @@ _INDIRECT_COMMAND = re.compile(
     re.IGNORECASE,
 )
 _INDIRECT_VERB_COMMAND = re.compile(
-    r"^\s*(?:i|we)\s+(?:want|need)\s+to\s+"
+    r"^\s*(?:i|we)\s+(?:want|need|would\s+like)\s+to\s+"
     r"(?:cancel|delete|remove|stop)\s+(?:the\s+)?(?P<target>.+?)\s*[.!?]*\s*$",
     re.IGNORECASE,
 )

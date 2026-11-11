@@ -27,6 +27,9 @@ from reminder_agent.features.intent.deterministic.support import (
     clock_to_24 as _clock_to_24,
 )
 from reminder_agent.features.intent.deterministic.support import (
+    meridiem_from_day_part as _meridiem_from_day_part,
+)
+from reminder_agent.features.intent.deterministic.support import (
     normalise_meridiem as _normalise_meridiem,
 )
 from reminder_agent.features.intent.deterministic.support import (
@@ -127,6 +130,7 @@ class RecurrenceIntentMixin:
         hour = int(hour_value) if hour_value is not None else None
         minute = int(match.group("minute") or 0)
         meridiem = _normalise_meridiem(match.group("meridiem"))
+        meridiem = meridiem or _meridiem_from_day_part(match.groupdict().get("day_part"))
         task = _strip_repeated_calendar_cadence(
             _task_from_remainder(f"{match.group('before') or ''} {match.group('after') or ''}"),
             frequency,
@@ -282,6 +286,7 @@ class RecurrenceIntentMixin:
         hour = int(match.group("hour"))
         minute = int(match.group("minute") or 0)
         meridiem = _normalise_meridiem(match.group("meridiem"))
+        meridiem = meridiem or _meridiem_from_day_part(match.groupdict().get("day_part"))
         if not _valid_clock(hour, minute, meridiem):
             return self._invalid_time()
         if meridiem is not None:

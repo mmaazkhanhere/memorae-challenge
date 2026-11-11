@@ -55,17 +55,21 @@ RELATIVE = re.compile(
 )
 TOMORROW = re.compile(
     r"\btomorrow\s+at\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*"
-    r"(?P<meridiem>a\.m\.|p\.m\.|am|pm)?\b",
+    r"(?P<meridiem>a\.m\.|p\.m\.|am|pm)?"
+    r"(?:\s+(?:in\s+the\s+)?(?P<day_part>morning|afternoon|evening|night))?\b",
     re.IGNORECASE,
 )
 CLOCK = re.compile(
     r"\bat\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*"
-    r"(?P<meridiem>a\.m\.|p\.m\.|am|pm)?\b",
+    r"(?P<meridiem>a\.m\.|p\.m\.|am|pm)?"
+    r"(?:\s+(?:in\s+the\s+)?(?P<day_part>morning|afternoon|evening|night))?\b",
     re.IGNORECASE,
 )
 FOLLOW_UP_CLOCK = re.compile(
     r"(?<!\w)(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*"
-    r"(?P<meridiem>a\.m\.|p\.m\.|am|pm)?(?=\s|$|[,.])",
+    r"(?P<meridiem>a\.m\.|p\.m\.|am|pm)?"
+    r"(?:\s+(?:in\s+the\s+)?(?P<day_part>morning|afternoon|evening|night))?"
+    r"(?=\s|$|[,.])",
     re.IGNORECASE,
 )
 DAY = re.compile(
@@ -82,6 +86,7 @@ RECURRENCE = re.compile(
     r"(?:\s*(?:,|and)\s*(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))*)"
     r"\s+at\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*"
     r"(?P<meridiem>a\.m\.|p\.m\.|am|pm)?"
+    r"(?:\s*,?\s*(?:in\s+the\s+)?(?P<day_part>morning|afternoon|evening|night))?"
     r"(?:\s*,?\s*(?:(?:to|for)\s+)?(?P<task>.+))?$",
     re.IGNORECASE,
 )
@@ -90,7 +95,8 @@ RECURRENCE_AFTER_TASK = re.compile(
     r"(?P<days>(?:day|monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
     r"(?:\s*(?:,|and)\s*(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))*)"
     r"\s+at\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*"
-    r"(?P<meridiem>a\.m\.|p\.m\.|am|pm)?$",
+    r"(?P<meridiem>a\.m\.|p\.m\.|am|pm)?"
+    r"(?:\s*,?\s*(?:in\s+the\s+)?(?P<day_part>morning|afternoon|evening|night))?$",
     re.IGNORECASE,
 )
 MONTHLY_RECURRENCE = re.compile(
@@ -136,19 +142,29 @@ MULTIPLE_REQUEST_SEPARATOR = re.compile(
     re.IGNORECASE,
 )
 LIST_REQUEST = re.compile(
-    r"^\s*(?:can\s+you\s+)?(?:what\s+(?:do\s+i\s+have|are\s+my\s+reminders?|"
-    r"reminders?\s+do\s+i\s+have)|"
-    r"what(?:'s|\s+is)\s+(?:my\s+)?reminders?(?:\s+(?:for|on|tomorrow|today))?|"
+    r"^\s*(?:(?:hey|hi)[,\s]+)?(?:can\s+you\s+)?(?:and\s+)?(?:what\s+(?:do\s+i\s+have|"
+    r"are\s+my\s+(?:weekly\s+)?(?:recurring\s+)?reminders?|"
+    r"reminders?\s+do\s+i\s+have|(?:weekly\s+)?(?:recurring\s+)?reminders?\s+"
+    r"(?:have\s+i\s+got|do\s+i\s+have))|"
+    r"what(?:'s|\s+is)\s+(?:(?:on|in)\s+)?(?:my\s+)?(?:reminder\s+list|agenda|"
+    r"(?:weekly\s+)?(?:recurring\s+)?reminders?)(?:\s+(?:for|on|tomorrow|today|this\s+week|the\s+weekend))?|"
     r"(?:any|do\s+i\s+have|are\s+there)\s+(?:any\s+)?reminders?(?:\s+(?:for|on)\s+\S+)?|"
     r"(?:list|show)(?:\s+(?:my|me))?\s+(?:all\s+(?:the\s+)?)?(?:recurring\s+)?reminders?|"
+    r"(?:list|show)(?:\s+(?:my|me))?\s+all\s+\w+reminders?|"
     r"(?:do\s+i\s+have|are\s+there)\s+(?:any\s+)?\S.+\s+reminders?|"
     r"what(?:'s|\s+is)\s+(?:my\s+)?(?:next|upcoming)\s+reminders?(?:\s+to\s+do)?|"
     r"what(?:'s|\s+is)\s+(?:(?:on|in)\s+)?(?:my\s+)?schedule|"
-    r"what\s+is\s+scheduled|anything\s+coming\s+up)\b",
+    r"what\s+is\s+scheduled|anything\s+coming\s+up|"
+    r"anything[,\s]+.*(?:forgot|take\s+care\s+of|need\s+to\s+remember)|"
+    r"(?:what|which)\s+.*(?:reminder\s+list|agenda)\s+.*|"
+    r"summari[sz]e\s+.*(?:week|weekend|recurring|agenda)|"
+    r"(?:what|which)\s+.*(?:on\s+)?(?:the\s+)?weekend|"
+    r"(?:and\s+)?on\s+(?:monday|tuesday|wednesday|thursday|friday|firday|saturday|sunday))\b",
     re.IGNORECASE,
 )
 SUMMARY_REQUEST = re.compile(
     r"^\s*(?:(?:how\s+many|what\s+is\s+the\s+number\s+of).*(?:pending|outstanding|unfinished|overdue|completed|done|finished)(?:.*(?:today|this\s+day))?"
+    r"|anything[,\s]+.*(?:forgot|take\s+care\s+of|need\s+to\s+remember)"
     r"|(?:what|which|show|list).*(?:still\s+have\s+to\s+do|have\s+left|remaining).*(?:today|this\s+day)"
     r"|(?:what|which|show|list).*(?:today|this\s+day).*(?:still\s+have\s+to\s+do|have\s+left|remaining)"
     r"|(?:what|which|show|list).*(?:completed|done|finished).*(?:today|this\s+day))\s*[?!.]*\s*$",
@@ -176,6 +192,11 @@ def contains_multiple_tasks(task: str) -> bool:
 
 LIST_TASK_PATTERNS = (
     re.compile(
+        r"^\s*(?:show|list)\s+(?:(?:my|me)\s+)?(?:all\s+)?"
+        r"(?:(?:my|me)\s+)?(?P<task>[A-Za-z][A-Za-z0-9_-]*)reminders?\s*[?!.]*\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
         r"^\s*(?:when|what)\s+(?:are|is)\s+(?:my\s+)?(?P<task>.+?)(?:\s+(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday))?\s*[?!.]*\s*$",
         re.IGNORECASE,
     ),
@@ -191,9 +212,20 @@ LIST_TASK_PATTERNS = (
 )
 
 
+def _strip_listing_prefix(text: str) -> str:
+    return re.sub(r"^\s*(?:(?:hey|hi)[,\s]+|and\s+)", "", text.strip(), flags=re.IGNORECASE)
+
+
 def extract_listing_task_query(text: str) -> str | None:
     """Return an explicit task/subject filter from supported listing wording."""
 
+    text = _strip_listing_prefix(text)
+    if re.search(
+        r"\b(?:agenda|schedule|reminder\s+list|weekend|this\s+week|next\s+week|recurring|weekly)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return None
     for pattern in LIST_TASK_PATTERNS:
         match = pattern.match(text)
         if match is None:
@@ -207,6 +239,11 @@ def extract_listing_task_query(text: str) -> str | None:
             "schedule",
             "any",
         }:
+            # Accommodate the common no-space typo "callreminders" while
+            # keeping the task filter narrow ("call", not all reminders).
+            task_query = re.sub(r"(?i)reminders?$", "", task_query).strip()
+            if not task_query:
+                return None
             return task_query
     return None
 
