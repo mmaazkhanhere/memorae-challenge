@@ -21,6 +21,8 @@ from reminder_agent.features.intent import (
     IntentRouteSuggestion,
     Interpretation,
     NeedsClarification,
+    PendingReminder,
+    PendingReminderBatch,
     PendingReminderFieldUpdate,
 )
 from reminder_agent.features.intent.policy import OUT_OF_SCOPE_RESPONSE
@@ -1426,6 +1428,93 @@ def test_explicit_multiple_reminder_requests_create_two_reminders(
     assert db.scalar(select(func.count()).select_from(Reminder)) == 2
     assert db.scalar(select(func.count()).select_from(ReminderOccurrence)) == 2
     assert db.scalar(select(func.count()).select_from(Notification)) == 2
+
+
+def test_multiple_reminder_clarification_keeps_all_drafts_until_follow_up(
+    api_client, telegram_client, db, update_factory, fixed_now
+) -> None:
+    onboard(api_client, update_factory)
+    user = db.scalar(select(User).where(User.name == "Ada"))
+    identity = db.scalar(select(ChannelIdentity).where(ChannelIdentity.external_id == "1001"))
+    assert user is not None and identity is not None
+
+    class BatchClarificationInterpreter:
+        def interpret(self, text, *, selected_route=None, timezone_name, now, context=None, recent_messages=()):
+            if selected_route is IntentRoute.NEW_REQUEST:
+                return Interpretation(
+                    clarification=NeedsClarification(
+                        pending=PendingReminderBatch(
+                            reminders=(
+                                PendingReminder(
+                                    task="call John",
+                                    date_local=date(2026, 10, 31),
+                                    hour=10,
+                                    minute=0,
+                                    meridiem="am",
+                                    date_explicit=True,
+                                    timezone_name=timezone_name,
+                                ),
+                                PendingReminder(
+                                    task="pay my electricity bill",
+                                    date_local=date(2026, 11, 6),
+                                    hour=6,
+                                    minute=0,
+                                    date_explicit=True,
+                                    timezone_name=timezone_name,
+                                ),
+                            ),
+                            clarification_index=1,
+                        ),
+                        question="Should 6 be AM or PM for the electricity bill?",
+                    )
+                )
+            assert selected_route is IntentRoute.UPDATE_PENDING
+            assert context is not None
+            assert context.task == "pay my electricity bill"
+            return Interpretation(
+                field_updates=PendingReminderFieldUpdate(
+                    hour=6,
+                    minute=0,
+                    meridiem="pm",
+                    certainty="CLEAR",
+                    evidence={"meridiem": "6 pm"},
+                )
+            )
+
+    first = handle_reminder_text(
+        db,
+        TelegramUpdate.model_validate(
+            update_factory(
+                137,
+                text="Remind me to call John tomorrow at 10, and pay my electricity bill on Friday at 6.",
+            )
+        ),
+        user_id=user.id,
+        identity_id=identity.id,
+        telegram_user_id=1001,
+        interpreter=BatchClarificationInterpreter(),
+        now=fixed_now,
+    )
+    assert "electricity bill" in first.text
+    session = db.scalar(select(ConversationSession))
+    assert session is not None
+    assert session.pending_clarification["operation"] == "CREATE_ONE_TIME_REMINDERS"
+    assert len(session.pending_clarification["reminders"]) == 2
+
+    second = handle_reminder_text(
+        db,
+        TelegramUpdate.model_validate(update_factory(138, text="6 pm")),
+        user_id=user.id,
+        identity_id=identity.id,
+        telegram_user_id=1001,
+        interpreter=BatchClarificationInterpreter(),
+        now=fixed_now,
+    )
+    assert db.scalar(select(func.count()).select_from(Reminder)) == 2
+    assert db.scalar(select(func.count()).select_from(ReminderOccurrence)) == 2
+    assert db.scalar(select(ConversationSession)).pending_clarification is None
+    assert "call John" in second.text
+    assert "electricity bill" in second.text
 
 
 def test_follow_up_with_minutes_and_day_completes_pending_reminder(

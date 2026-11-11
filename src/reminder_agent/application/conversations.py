@@ -353,11 +353,31 @@ def load_session(
 def pending_from_session(session: ConversationSession | None) -> PendingReminder | None:
     if session is None or session.pending_clarification is None:
         return None
-    if session.pending_clarification.get("operation") != "CREATE_ONE_TIME_REMINDER":
+    operation = session.pending_clarification.get("operation")
+    if operation == "CREATE_ONE_TIME_REMINDERS":
+        from reminder_agent.features.intent.contracts import PendingReminderBatch
+
+        batch = PendingReminderBatch.model_validate(session.pending_clarification)
+        return batch.active
+    if operation != "CREATE_ONE_TIME_REMINDER":
         return None
     from reminder_agent.features.intent.contracts import PendingReminder
 
     return PendingReminder.model_validate(session.pending_clarification)
+
+
+def pending_reminder_batch_from_session(
+    session: ConversationSession | None,
+) -> Any:
+    """Load a multi-reminder creation clarification, if one is active."""
+
+    if session is None or session.pending_clarification is None:
+        return None
+    if session.pending_clarification.get("operation") != "CREATE_ONE_TIME_REMINDERS":
+        return None
+    from reminder_agent.features.intent.contracts import PendingReminderBatch
+
+    return PendingReminderBatch.model_validate(session.pending_clarification)
 
 
 def pending_reschedule_from_session(session: ConversationSession | None) -> Any:

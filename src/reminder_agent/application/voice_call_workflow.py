@@ -35,11 +35,13 @@ from reminder_agent.application.conversations import (
     pending_from_session,
     pending_memory_from_session,
     pending_memory_lookup_from_session,
+    pending_reminder_batch_from_session,
     pending_reschedule_from_session,
     pending_snooze_from_session,
     save_pending_clarification_session,
 )
 from reminder_agent.application.identity.context import authorized_user_for_request
+from reminder_agent.application.reminder_clarification import merge_pending_reminder_batch
 from reminder_agent.application.pending_contracts import PendingCompletion, PendingSnooze
 from reminder_agent.application.reminder_updates import (
     ReminderUpdateConflict,
@@ -311,6 +313,16 @@ def _creation_response(
         for_update=True,
     )
     pending = pending_from_session(voice_session)
+    pending_batch = pending_reminder_batch_from_session(voice_session)
+    if pending_batch is not None and route in {
+        ConversationRoute.CLARIFICATION_REPLY,
+        ConversationRoute.MODEL_FALLBACK,
+    }:
+        interpretation = merge_pending_reminder_batch(
+            interpretation,
+            batch=pending_batch,
+            now=now,
+        )
     if voice_session is not None and (
         pending_memory_from_session(voice_session) is not None
         or pending_memory_lookup_from_session(voice_session) is not None
