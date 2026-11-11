@@ -26,8 +26,10 @@ from reminder_agent.application.contracts import (
     VerifiedChannelIdentity,
 )
 from reminder_agent.application.conversations import (
+    activate_voice_reminder_reference,
+    clear_voice_reminder_reference,
     end_session,
-    load_session,
+    load_voice_session,
     pending_cancellation_from_session,
     pending_completion_from_session,
     pending_from_session,
@@ -39,6 +41,10 @@ from reminder_agent.application.conversations import (
 )
 from reminder_agent.application.identity.context import authorized_user_for_request
 from reminder_agent.application.pending_contracts import PendingCompletion, PendingSnooze
+from reminder_agent.application.reminder_updates import (
+    ReminderUpdateConflict,
+    update_reminder_task,
+)
 from reminder_agent.application.voice_call_authorization import resolve_vapi_call_context
 from reminder_agent.features.intent.contracts import IntentInterpreter
 from reminder_agent.features.intent.deterministic.routing import ConversationRoute, route_message
@@ -71,6 +77,10 @@ from reminder_agent.features.reminders.listing.service import (
     list_reminders_from_interpretation,
     summarize_reminders_from_interpretation,
 )
+from reminder_agent.features.reminders.reschedule.contextual import (
+    ContextualCorrection,
+    parse_contextual_correction,
+)
 from reminder_agent.features.reminders.reschedule.decisions import RescheduleRequest
 from reminder_agent.features.reminders.reschedule.messages import choose_reschedule_message
 from reminder_agent.features.reminders.reschedule.models import (
@@ -91,7 +101,11 @@ from reminder_agent.features.reminders.snooze.operations import (
     parse_snooze_duration,
     snooze_target_text,
 )
-from reminder_agent.infrastructure.database.models import ChannelIdentity, IdempotencyRecord
+from reminder_agent.infrastructure.database.models import (
+    ChannelIdentity,
+    IdempotencyRecord,
+    Reminder,
+)
 from reminder_agent.infrastructure.observability import get_logger, log_event
 from reminder_agent.shared.idempotency import (
     IdempotencyConflict,
@@ -288,14 +302,13 @@ def _creation_response(
     user: Any,
     telegram_identity: ChannelIdentity,
 ) -> ApplicationResult:
-    voice_session = load_session(
+    voice_session = load_voice_session(
         db,
         user_id=user.id,
         external_session_id=request.context.external_session_id,
         now=now,
         ttl_seconds=session_ttl_seconds,
         for_update=True,
-        channel_type=VOICE_CALL,
     )
     pending = pending_from_session(voice_session)
     if voice_session is not None and (
@@ -392,17 +405,37 @@ def _creation_response(
             content="I couldn't create that reminder.",
             response_kind="persistence_failure",
         )
+    created_reminders = [
+        item.id for item in (creation.persistence.created_objects if creation.persistence else ())
+        if isinstance(item, Reminder)
+    ]
+    if len(created_reminders) == 1:
+        activate_voice_reminder_reference(
+            db,
+            user_id=user.id,
+            external_session_id=request.context.external_session_id,
+            reminder_id=created_reminders[0],
+            now=now,
+        )
     return creation.response
 
 
-def _voice_pending(db: Session, *, user_id: UUID, call_id: str, now: datetime, ttl: int) -> Any:
-    return load_session(
+def _voice_pending(
+    db: Session,
+    *,
+    user_id: UUID,
+    call_id: str,
+    now: datetime,
+    ttl: int,
+    for_update: bool = False,
+) -> Any:
+    return load_voice_session(
         db,
         user_id=user_id,
         external_session_id=call_id,
         now=now,
         ttl_seconds=ttl,
-        channel_type=VOICE_CALL,
+        for_update=for_update,
     )
 
 
@@ -471,6 +504,12 @@ def _voice_list_response(
         )
     db.rollback()
     with db.begin():
+        clear_voice_reminder_reference(
+            db,
+            user_id=request.context.canonical_user_id,
+            external_session_id=request.context.external_session_id,
+            now=now,
+        )
         return _record_and_return(
             db,
             request=request,
@@ -489,6 +528,9 @@ def _reschedule_response(
     text: str,
     now: datetime,
     session_ttl_seconds: int,
+    active_reminder_id: UUID | None = None,
+    request_override: RescheduleRequest | None = None,
+    candidate_id_override: UUID | None = None,
 ) -> VoiceToolOutcome:
     session = _voice_pending(
         db,
@@ -510,6 +552,8 @@ def _reschedule_response(
         recent_messages=recent_messages,
         selection_context=selection_context,
         update_id=None,
+        request_override=request_override,
+        candidate_id_override=candidate_id_override,
     )
     decision = preparation.decision
     if decision is None:
@@ -523,6 +567,7 @@ def _reschedule_response(
             call_id=request.context.external_session_id,
             now=now,
             ttl=session_ttl_seconds,
+            for_update=True,
         )
         if decision.kind == "CANCEL":
             if locked_session is not None:
@@ -576,6 +621,7 @@ def _reschedule_response(
                     pending=pending_record,
                     now=now,
                     channel_type=VOICE_CALL,
+                    active_reminder_id=active_reminder_id,
                 )
                 response = ApplicationResult(
                     content=decision.text,
@@ -625,6 +671,13 @@ def _reschedule_response(
                     kind = "RESCHEDULE_REMINDER"
                 if locked_session is not None:
                     end_session(locked_session, now=now)
+                activate_voice_reminder_reference(
+                    db,
+                    user_id=user.id,
+                    external_session_id=request.context.external_session_id,
+                    reminder_id=mutation.reminder.id,
+                    now=now,
+                )
                 response = ApplicationResult(
                     content=content,
                     response_kind=kind,
@@ -634,6 +687,84 @@ def _reschedule_response(
             db,
             request=request,
             operation="RESCHEDULE_REMINDER",
+            response=response,
+        )
+
+
+def _active_correction_response(
+    db: Session,
+    *,
+    request: ApplicationRequest,
+    user: Any,
+    telegram_identity: ChannelIdentity,
+    interpreter: IntentInterpreter,
+    correction: ContextualCorrection,
+    active_reminder_id: UUID,
+    now: datetime,
+    session_ttl_seconds: int,
+) -> VoiceToolOutcome:
+    """Apply a correction only to the reminder persisted in call context."""
+
+    if correction.reschedule is not None:
+        return _reschedule_response(
+            db,
+            request=request,
+            user=user,
+            telegram_identity=telegram_identity,
+            interpreter=interpreter,
+            text=request.message_text,
+            now=now,
+            session_ttl_seconds=session_ttl_seconds,
+            active_reminder_id=active_reminder_id,
+            request_override=correction.reschedule,
+            candidate_id_override=active_reminder_id,
+        )
+
+    if correction.task is None:
+        return VoiceToolOutcome(error="Please tell me what to change on that reminder.")
+
+    db.rollback()
+    with db.begin():
+        session = load_voice_session(
+            db,
+            user_id=user.id,
+            external_session_id=request.context.external_session_id,
+            now=now,
+            ttl_seconds=session_ttl_seconds,
+            for_update=True,
+        )
+        if session is None or session.active_reminder_id != active_reminder_id:
+            response = ApplicationResult(
+                content="Which reminder should I change?",
+                response_kind="clarification",
+            )
+        else:
+            try:
+                reminder = update_reminder_task(
+                    db,
+                    user_id=user.id,
+                    reminder_id=active_reminder_id,
+                    task=correction.task,
+                    now=now,
+                )
+            except ReminderUpdateConflict:
+                response = ApplicationResult(
+                    content="I couldn't update that reminder. Which reminder should I change?",
+                    response_kind="clarification",
+                )
+            else:
+                response = ApplicationResult(
+                    content=(
+                        f"Okay, I changed the reminder to {reminder.task}. "
+                        "The scheduled time and Telegram delivery are unchanged."
+                    ),
+                    response_kind="REMINDER_UPDATED",
+                    resource_id=reminder.id,
+                )
+        return _record_and_return(
+            db,
+            request=request,
+            operation="UPDATE_REMINDER",
             response=response,
         )
 
@@ -1038,6 +1169,37 @@ def process_vapi_reminder_tool(
             and re.search(r"\b(?:move|reschedule|change|update)\b", request.message_text, re.I)
         ):
             deterministic_route = ConversationRoute.RESCHEDULE_REQUEST
+
+        active_reminder_id = (
+            voice_session.active_reminder_id
+            if voice_session is not None and pending_reschedule is None
+            else None
+        )
+        if active_reminder_id is not None and deterministic_route not in {
+            ConversationRoute.NEW_REQUEST,
+            ConversationRoute.CANCEL_REQUEST,
+            ConversationRoute.SAVE_MEMORY_REQUEST,
+            ConversationRoute.RETRIEVE_MEMORY_REQUEST,
+            ConversationRoute.LIST_REQUEST,
+            ConversationRoute.SUMMARY_REQUEST,
+        }:
+            correction = parse_contextual_correction(
+                request.message_text,
+                now=now,
+                timezone_name=user.timezone,
+            )
+            if correction is not None:
+                return _active_correction_response(
+                    db,
+                    request=request,
+                    user=user,
+                    telegram_identity=telegram_identity,
+                    interpreter=interpreter,
+                    correction=correction,
+                    active_reminder_id=active_reminder_id,
+                    now=now,
+                    session_ttl_seconds=session_ttl_seconds,
+                )
 
         if (
             deterministic_route is ConversationRoute.CANCEL_REQUEST

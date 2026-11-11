@@ -65,6 +65,8 @@ def _assistant_response(settings: Any) -> dict[str, Any]:
         "when the caller asks you to remember/save a fact, and "
         "submit_memory_lookup_utterance when the caller asks about a saved fact, "
         "including personal date or time questions. "
+        "Forward corrections such as 'actually, make it half an hour' verbatim to "
+        "submit_reminder_utterance; do not create a new reminder for a correction. "
         "Pass the caller's complete request as utterance without extracting or changing "
         "its content. Wait for the tool result before claiming success, and repeat the "
         "returned response exactly. Never invent a saved fact or confirmation."
@@ -73,6 +75,12 @@ def _assistant_response(settings: Any) -> dict[str, Any]:
         "assistant": {
             "name": settings.vapi_assistant_name,
             "firstMessage": settings.vapi_assistant_first_message,
+            "firstMessageInterruptionsEnabled": settings.vapi_first_message_interruptions_enabled,
+            "stopSpeakingPlan": {
+                "numWords": settings.vapi_stop_speaking_num_words,
+                "voiceSeconds": settings.vapi_stop_speaking_voice_seconds,
+                "backoffSeconds": settings.vapi_stop_speaking_backoff_seconds,
+            },
             "model": {
                 "provider": settings.vapi_model_provider,
                 "model": settings.vapi_model,

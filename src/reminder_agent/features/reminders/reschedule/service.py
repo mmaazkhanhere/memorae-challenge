@@ -580,13 +580,15 @@ def prepare_reschedule(
     recent_messages: list[str] | None = None,
     selection_context: list[dict[str, str]] | None = None,
     update_id: int | None = None,
+    request_override: RescheduleRequest | None = None,
+    candidate_id_override: UUID | None = None,
 ) -> ReschedulePreparation:
     """Resolve targets, proposals, and validation without owning writes."""
 
     unsupported_cadence_change = pending is None and has_unsupported_series_cadence_change(text)
 
     parsed_request = None
-    if pending is None:
+    if pending is None and request_override is None:
         parsed_request = parse_reschedule_request(
             text,
             timezone_name=timezone_name,
@@ -618,6 +620,8 @@ def prepare_reschedule(
                 else None
             ),
         )
+    elif request_override is not None:
+        parsed_request = request_override
     deterministic_pending_proposal = (
         parse_pending_reschedule_parameters(
             text,
@@ -647,6 +651,7 @@ def prepare_reschedule(
         request_override=(
             parsed_request if isinstance(parsed_request, RescheduleRequest) else None
         ),
+        candidate_id_override=candidate_id_override,
     )
     if unsupported_cadence_change:
         decision = RescheduleDecision(
@@ -705,7 +710,8 @@ def prepare_reschedule(
             accepted=pending_proposal is not None,
         )
     if (
-        isinstance(parsed_request, str)
+        request_override is None
+        and isinstance(parsed_request, str)
         and not unsupported_cadence_change
         and reschedule_interpreter is not None
     ):
@@ -773,6 +779,7 @@ def prepare_reschedule(
                 now=now,
                 pending=pending,
                 request_override=proposal,
+                candidate_id_override=candidate_id_override,
             )
         elif isinstance(proposal, RescheduleClarification):
             candidates = find_candidates(

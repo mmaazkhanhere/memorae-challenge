@@ -277,6 +277,29 @@ def decide_reschedule(
     )
     if isinstance(parsed, str):
         return RescheduleDecision("RESPONSE", parsed)
+    if candidate_id_override is not None:
+        candidates = [
+            candidate
+            for candidate in find_all_candidates(db, user_id=user_id)
+            if candidate.reminder_id == candidate_id_override
+        ]
+        if len(candidates) != 1:
+            return RescheduleDecision("RESPONSE", reschedule_message("reminder_inactive"))
+        candidate = candidates[0]
+        if candidate.schedule_type == RECURRING and parsed.scope is None:
+            return RescheduleDecision(
+                "CLARIFY",
+                choose_reschedule_message("recurring_scope_required", task=candidate.task),
+                request=parsed,
+                candidate_ids=(candidate.reminder_id,),
+            )
+        return RescheduleDecision(
+            "MUTATE",
+            "",
+            _resolve_candidate_due(parsed, candidate, timezone_name=timezone_name),
+            (candidate.reminder_id,),
+            candidate.occurrence_id,
+        )
     candidates = find_candidates(
         db,
         user_id=user_id,

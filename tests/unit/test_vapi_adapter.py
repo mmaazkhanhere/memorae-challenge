@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, timedelta
 
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
@@ -201,6 +201,12 @@ def test_authorized_assistant_request_creates_one_server_side_binding(
     assert body["assistant"]["model"]["tools"][0]["function"]["name"] == (
         "submit_reminder_utterance"
     )
+    assert body["assistant"]["firstMessageInterruptionsEnabled"] is True
+    assert body["assistant"]["stopSpeakingPlan"] == {
+        "numWords": 0,
+        "voiceSeconds": 0.2,
+        "backoffSeconds": 1.0,
+    }
     rendered = response.text
     assert PHONE not in rendered
     db = session_factory()
@@ -845,6 +851,144 @@ def test_vapi_lists_and_reschedules_existing_reminders(session_factory, fixed_no
     try:
         assert db.get(Reminder, reminder_id).status == "ACTIVE"
         assert db.scalar(select(ReminderOccurrence).where(ReminderOccurrence.reminder_id == reminder_id)).next_due_at.hour == 14
+    finally:
+        db.close()
+
+
+def test_vapi_correction_updates_the_last_created_reminder_without_duplication(
+    session_factory, fixed_now
+) -> None:
+    user, _phone, telegram = _seed_linked_user_with_telegram(session_factory)
+    app = create_app(_settings(), session_factory=session_factory, clock=lambda: fixed_now)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    with TestClient(app) as client:
+        client.post("/webhook/vapi", json=_payload(), headers=headers)
+        created = client.post(
+            "/webhook/vapi",
+            json=_tool_payload(
+                tool_call_id="voice-create-correction-1",
+                utterance="Remind me tomorrow at 10 AM to call the bank",
+            ),
+            headers=headers,
+        )
+        corrected = client.post(
+            "/webhook/vapi",
+            json=_tool_payload(
+                tool_call_id="voice-create-correction-2",
+                utterance="Actually, make it half an hour",
+            ),
+            headers=headers,
+        )
+
+    assert created.status_code == 200
+    assert corrected.status_code == 200
+    assert "call the bank" in corrected.json()["results"][0]["result"]
+    db = session_factory()
+    try:
+        reminders = db.scalars(select(Reminder).where(Reminder.user_id == user.id)).all()
+        assert len(reminders) == 1
+        reminder = reminders[0]
+        occurrence = db.scalar(
+            select(ReminderOccurrence).where(ReminderOccurrence.reminder_id == reminder.id)
+        )
+        assert occurrence is not None
+        assert occurrence.next_due_at.replace(tzinfo=UTC) == fixed_now + timedelta(minutes=30)
+        notifications = db.scalars(
+            select(Notification).where(Notification.occurrence_id == occurrence.id)
+        ).all()
+        assert sum(notification.status == "PENDING" for notification in notifications) == 1
+        assert (
+            sum(
+                notification.due_at.replace(tzinfo=UTC) == fixed_now + timedelta(minutes=30)
+                for notification in notifications
+            )
+            == 1
+        )
+        session = db.scalar(
+            select(ConversationSession).where(
+                ConversationSession.user_id == user.id,
+                ConversationSession.channel_type == "VOICE_CALL",
+                ConversationSession.external_session_id == "call-test-1",
+            )
+        )
+        assert session is not None
+        assert session.active_reminder_id == reminder.id
+        assert session.status == "ACTIVE"
+    finally:
+        db.close()
+
+
+def test_vapi_correction_can_update_the_active_reminder_task(session_factory, fixed_now) -> None:
+    user, _phone, _telegram = _seed_linked_user_with_telegram(session_factory)
+    app = create_app(_settings(), session_factory=session_factory, clock=lambda: fixed_now)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    with TestClient(app) as client:
+        client.post("/webhook/vapi", json=_payload(), headers=headers)
+        client.post(
+            "/webhook/vapi",
+            json=_tool_payload(
+                tool_call_id="voice-create-task-correction-1",
+                utterance="Remind me tomorrow at 10 AM to call the bank",
+            ),
+            headers=headers,
+        )
+        corrected = client.post(
+            "/webhook/vapi",
+            json=_tool_payload(
+                tool_call_id="voice-create-task-correction-2",
+                utterance="Actually, change the task to call the dentist",
+            ),
+            headers=headers,
+        )
+
+    assert "call the dentist" in corrected.json()["results"][0]["result"]
+    db = session_factory()
+    try:
+        reminder = db.scalar(select(Reminder).where(Reminder.user_id == user.id))
+        assert reminder is not None
+        assert reminder.task == "call the dentist"
+        assert db.scalar(select(func.count()).select_from(Reminder)) == 1
+    finally:
+        db.close()
+
+
+def test_vapi_memory_request_ends_the_previous_reminder_topic(session_factory, fixed_now) -> None:
+    user, _phone, _telegram = _seed_linked_user_with_telegram(session_factory)
+    app = create_app(_settings(), session_factory=session_factory, clock=lambda: fixed_now)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    with TestClient(app) as client:
+        client.post("/webhook/vapi", json=_payload(), headers=headers)
+        client.post(
+            "/webhook/vapi",
+            json=_tool_payload(
+                tool_call_id="voice-create-before-memory",
+                utterance="Remind me tomorrow at 10 AM to call the bank",
+            ),
+            headers=headers,
+        )
+        saved = client.post(
+            "/webhook/vapi",
+            json=_memory_tool_payload(
+                name="submit_memory_save_utterance",
+                utterance="Remember my favorite color is blue",
+                tool_call_id="memory-after-reminder",
+            ),
+            headers=headers,
+        )
+
+    assert saved.json()["results"][0]["result"] in MEMORY_SAVE_MESSAGES["confirmation"]
+    db = session_factory()
+    try:
+        session = db.scalar(
+            select(ConversationSession).where(
+                ConversationSession.user_id == user.id,
+                ConversationSession.channel_type == "VOICE_CALL",
+                ConversationSession.external_session_id == "call-test-1",
+            )
+        )
+        assert session is not None
+        assert session.active_reminder_id is None
+        assert session.status == "ENDED"
     finally:
         db.close()
 

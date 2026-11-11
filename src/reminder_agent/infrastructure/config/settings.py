@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     vapi_model: str = "gpt-4o-mini"
     vapi_voice_provider: str = "11labs"
     vapi_voice_id: str = "sarah"
+    vapi_first_message_interruptions_enabled: bool = True
+    vapi_stop_speaking_num_words: int = Field(default=0, ge=0, le=10)
+    vapi_stop_speaking_voice_seconds: float = Field(default=0.2, ge=0, le=0.5)
+    vapi_stop_speaking_backoff_seconds: float = Field(default=1.0, ge=0, le=10)
     telegram_api_timeout_seconds: float = Field(default=10.0, gt=0)
     telegram_voice_max_bytes: int = Field(default=20 * 1024 * 1024, ge=1024, le=50 * 1024 * 1024)
     telegram_voice_max_duration_seconds: int = Field(default=300, ge=1, le=3600)

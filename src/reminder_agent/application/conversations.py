@@ -21,8 +21,10 @@ if TYPE_CHECKING:
     from reminder_agent.features.intent.contracts import PendingReminder
 
 TELEGRAM = "TELEGRAM"
+VOICE_CALL = "VOICE_CALL"
 AWAITING_CLARIFICATION = "AWAITING_CLARIFICATION"
 ENDED = "ENDED"
+ACTIVE = "ACTIVE"
 logger = get_logger()
 
 
@@ -161,6 +163,7 @@ def save_pending_clarification_session(
     pending: BaseModel,
     now: datetime,
     channel_type: str = TELEGRAM,
+    active_reminder_id: UUID | None = None,
 ) -> ConversationSession:
     """Persist pending context without coupling the store to a provider."""
 
@@ -179,6 +182,7 @@ def save_pending_clarification_session(
             user_id=user_id,
             channel_type=channel_type,
             external_session_id=external_session_id,
+            active_reminder_id=active_reminder_id,
             pending_clarification=pending_data,
             status=AWAITING_CLARIFICATION,
             version=1,
@@ -188,10 +192,107 @@ def save_pending_clarification_session(
     else:
         session.pending_clarification = pending_data
         session.status = AWAITING_CLARIFICATION
-        session.active_reminder_id = None
+        session.active_reminder_id = active_reminder_id
         session.version += 1
         session.updated_at = _utc(now)
     return session
+
+
+def load_voice_session(
+    db: Session,
+    *,
+    user_id: UUID,
+    external_session_id: str,
+    now: datetime,
+    ttl_seconds: int,
+    for_update: bool = False,
+) -> ConversationSession | None:
+    """Load active voice context, including completed-operation references.
+
+    ``load_session`` intentionally serves clarification workflows and only
+    returns ``AWAITING_CLARIFICATION`` rows. Voice calls also need a durable
+    reference after a committed reminder operation, so they use this broader
+    helper at the channel application boundary.
+    """
+
+    statement = select(ConversationSession).where(
+        ConversationSession.user_id == user_id,
+        ConversationSession.channel_type == VOICE_CALL,
+        ConversationSession.external_session_id == external_session_id,
+    )
+    if for_update:
+        statement = statement.with_for_update()
+    session = db.scalar(statement)
+    if session is None or session.status == ENDED:
+        return None
+    if session_expired(session, now=now, ttl_seconds=ttl_seconds):
+        if for_update:
+            end_session(session, now=now)
+        return None
+    return session
+
+
+def activate_voice_reminder_reference(
+    db: Session,
+    *,
+    user_id: UUID,
+    external_session_id: str,
+    reminder_id: UUID,
+    now: datetime,
+) -> ConversationSession:
+    """Persist one committed, owner-scoped reminder as the call's active topic."""
+
+    session = db.scalar(
+        select(ConversationSession)
+        .where(
+            ConversationSession.user_id == user_id,
+            ConversationSession.channel_type == VOICE_CALL,
+            ConversationSession.external_session_id == external_session_id,
+        )
+        .with_for_update()
+    )
+    if session is None:
+        session = ConversationSession(
+            user_id=user_id,
+            channel_type=VOICE_CALL,
+            external_session_id=external_session_id,
+            status=ACTIVE,
+            version=1,
+            updated_at=_utc(now),
+        )
+        db.add(session)
+        db.flush()
+    session.active_reminder_id = reminder_id
+    session.pending_clarification = None
+    session.status = ACTIVE
+    session.version += 1
+    session.updated_at = _utc(now)
+    return session
+
+
+def clear_voice_reminder_reference(
+    db: Session,
+    *,
+    user_id: UUID,
+    external_session_id: str,
+    now: datetime,
+) -> None:
+    """Clear only the active voice topic while leaving the call available."""
+
+    session = db.scalar(
+        select(ConversationSession)
+        .where(
+            ConversationSession.user_id == user_id,
+            ConversationSession.channel_type == VOICE_CALL,
+            ConversationSession.external_session_id == external_session_id,
+        )
+        .with_for_update()
+    )
+    if session is None or session.status == ENDED:
+        return
+    session.active_reminder_id = None
+    session.version += 1
+    session.updated_at = _utc(now)
 
 
 def _utc(value: datetime) -> datetime:
@@ -222,7 +323,10 @@ def load_session(
     if for_update:
         statement = statement.with_for_update()
     session = db.scalar(statement)
-    if session is None or session.status != AWAITING_CLARIFICATION:
+    if session is None or (
+        session.status != AWAITING_CLARIFICATION
+        and not (channel_type == VOICE_CALL and session.status == ACTIVE)
+    ):
         return None
     if session_expired(session, now=now, ttl_seconds=ttl_seconds):
         if for_update:
@@ -239,7 +343,9 @@ def load_session(
         # can carry its context for the expiry check, while only the transaction
         # holding the row lock is allowed to end it.
         return session
-    if session.pending_clarification is None:
+    if session.pending_clarification is None and not (
+        channel_type == VOICE_CALL and session.status == ACTIVE
+    ):
         return None
     return session
 
