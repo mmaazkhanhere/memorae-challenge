@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from pydantic import ValidationError
 
+from reminder_agent.features.intent.context import CONVERSATION_CONTEXT_TURNS
 from reminder_agent.features.intent.contracts import (
     IntentRoute,
     Interpretation,
@@ -32,12 +33,12 @@ from reminder_agent.features.intent.model.response import (
 )
 from reminder_agent.features.intent.pending import reminder_creation as _pending_reminders
 from reminder_agent.features.memory.messages import lookup_memory_message, save_memory_message
+from reminder_agent.infrastructure.observability import exception_details, get_logger, log_event
 from reminder_agent.infrastructure.providers.llm import (
     OpenAICompatibleLLMClient,
     StructuredIntentProvider,
     supports_strict_json_schema,
 )
-from reminder_agent.infrastructure.observability import exception_details, get_logger, log_event
 
 logger = get_logger()
 
@@ -97,6 +98,16 @@ class OpenAICompatibleIntentInterpreter:
     def _response_format(self, route: IntentRoute) -> dict[str, Any]:
         """Use constrained cancellation output only where the provider supports it."""
 
+        # Groq's gpt-oss-120b endpoint rejects the cancellation schema with
+        # HTTP 400 in production. Keep strict schemas for the other supported
+        # structured calls and let the response validator enforce this route's
+        # contract for that model.
+        if (
+            route is IntentRoute.CANCEL_REQUEST
+            and (urlsplit(self._url).hostname or "").lower() == "api.groq.com"
+            and self._model == "openai/gpt-oss-120b"
+        ):
+            return {"type": "json_object"}
         if route is IntentRoute.CANCEL_REQUEST and _supports_strict_json_schema(
             self._url, self._model
         ):
@@ -176,7 +187,10 @@ class OpenAICompatibleIntentInterpreter:
             model=self._model,
             route=route,
             input_length=len(text.strip()),
-            recent_message_count=len(recent_messages),
+            # The prompt itself uses the bounded conversation window. Report
+            # that same effective count so diagnostics do not suggest that all
+            # loaded history was sent to the extractor.
+            recent_message_count=min(len(recent_messages), CONVERSATION_CONTEXT_TURNS),
             has_pending_context=context is not None,
             reschedule_candidate_count=len(reschedule_candidates),
             cancellation_candidate_count=len(cancellation_candidates),

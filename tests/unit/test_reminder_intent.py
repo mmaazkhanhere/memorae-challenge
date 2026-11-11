@@ -17,6 +17,7 @@ from reminder_agent.features.intent import (
     OpenAICompatibleIntentRouter,
     OpenAICompatibleMemoryAnswerer,
     PendingReminder,
+    PendingReminderBatch,
     PendingReminderFieldUpdate,
     ReminderIntentInterpreter,
     RuleBasedIntentInterpreter,
@@ -938,6 +939,47 @@ def test_cancellation_uses_strict_json_schema_on_supported_provider(monkeypatch)
     assert captured["response_format"]["type"] == "json_schema"
     assert captured["response_format"]["json_schema"]["strict"] is True
     assert result.cancellation_request is not None
+
+
+def test_cancellation_normalizes_timestamp_leaked_into_occurrence_date(monkeypatch) -> None:
+    def fake_post(*args, **kwargs):
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "operation": "CANCEL_REMINDER",
+                                    "target_text": "laundry",
+                                    "scope": None,
+                                    "occurrence_date": "2026-11-11T17:41:37.082890+00:00",
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    result = OpenAICompatibleIntentInterpreter(
+        "https://api.groq.example/openai/v1", "secret", "openai/gpt-oss-120b"
+    ).interpret(
+        "Actually, the laundry's done. You can forget that.",
+        selected_route=IntentRoute.CANCEL_REQUEST,
+        timezone_name="Asia/Karachi",
+        now=NOW,
+        recent_messages=("user: Remind me in 20 minutes to check the laundry",),
+    )
+
+    assert result.cancellation_request is not None
+    assert result.cancellation_request.target_text == "laundry"
+    # The current turn contains no date, so grounding must remove the leaked
+    # candidate timestamp rather than treating it as an occurrence constraint.
+    assert result.cancellation_request.occurrence_date is None
 
 
 @pytest.mark.parametrize(
@@ -1965,6 +2007,23 @@ def test_shared_date_multiple_times_are_parsed_independently() -> None:
     assert [intent.due_at for intent in result.resolved_intents] == [
         datetime(2026, 11, 1, 9, 0, tzinfo=UTC),
         datetime(2026, 11, 1, 18, 0, tzinfo=UTC),
+    ]
+
+
+def test_compound_partial_request_preserves_all_pending_drafts() -> None:
+    result = RuleBasedIntentInterpreter().interpret(
+        "Remind me to call John tomorrow at 10, and pay my electricity bill on Friday at 6.",
+        timezone_name="Asia/Karachi",
+        now=datetime(2026, 11, 11, 12, 0, tzinfo=UTC),
+    )
+
+    assert isinstance(result.clarification, NeedsClarification)
+    assert isinstance(result.clarification.pending, PendingReminderBatch)
+    batch = result.clarification.pending
+    assert len(batch.reminders) == 2
+    assert [draft.task for draft in batch.reminders] == [
+        "call John",
+        "pay my electricity bill",
     ]
 
 
