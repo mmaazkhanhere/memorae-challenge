@@ -197,6 +197,98 @@ def test_router_defers_overlapping_or_ambiguous_creation_language() -> None:
         assert route_message(text, pending=None).route is ConversationRoute.MODEL_FALLBACK
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Remember the above",
+        "Remember this",
+        "Don't remember my gate code",
+        "Remember my gate code and remind me tomorrow at 9",
+        "Remind me tomorrow at 9 and save my gate code",
+        "Remind me about that tomorrow at 9",
+    ],
+)
+def test_router_defers_contextual_negated_and_mixed_creation_requests(text: str) -> None:
+    assert route_message(text, pending=None).route is ConversationRoute.MODEL_FALLBACK
+
+
+def test_router_does_not_treat_embedded_or_referential_memory_as_a_save() -> None:
+    assert route_message("Save Ali's number and remind me to call him", pending=None).route is (
+        ConversationRoute.MODEL_FALLBACK
+    )
+    assert route_message("Save Ali's number and set a reminder to call him", pending=None).route is (
+        ConversationRoute.MODEL_FALLBACK
+    )
+    assert route_message("Remember that I need a reminder to call Ali", pending=None).route is (
+        ConversationRoute.MODEL_FALLBACK
+    )
+    assert route_message("Save this as a reminder to call Ali", pending=None).route is (
+        ConversationRoute.NEW_REQUEST
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Remember this is important",
+        "Save this as a fact",
+        "Make a note of this is important",
+    ],
+)
+def test_router_defers_unresolved_memory_references_with_or_without_pending(text: str) -> None:
+    assert route_message(text, pending=None).route is ConversationRoute.MODEL_FALLBACK
+    assert route_message(text, pending=_pending()).route is ConversationRoute.MODEL_FALLBACK
+
+
+def test_router_preserves_clear_memory_reference_forms() -> None:
+    assert route_message(
+        "Remember this fact: my birthday is January 10", pending=None
+    ).route is ConversationRoute.SAVE_MEMORY_REQUEST
+    assert route_message(
+        "Remember this fact: my birthday is January 10", pending=_pending()
+    ).route is ConversationRoute.SAVE_MEMORY_REQUEST
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "I do not want a reminder to call Ali",
+        "I do not want you to save this",
+    ],
+)
+def test_router_defers_indirect_negations_instead_of_cancelling(text: str) -> None:
+    assert route_message(text, pending=None).route is ConversationRoute.MODEL_FALLBACK
+
+
+@pytest.mark.parametrize("text", ["Cancel this", "Cancel it"])
+def test_router_defers_contextual_cancellation_without_pending(text: str) -> None:
+    assert route_message(text, pending=None).route is ConversationRoute.MODEL_FALLBACK
+
+
+def test_router_keeps_pending_cancel_it_as_cancellation_but_not_cancel_this() -> None:
+    pending = _pending()
+    assert route_message("Cancel it", pending=pending).route is ConversationRoute.CANCELLATION
+    assert route_message("Cancel this", pending=pending).route is ConversationRoute.MODEL_FALLBACK
+
+
+def test_router_preserves_explicit_cancellation_target() -> None:
+    assert route_message("Cancel my dentist reminder", pending=None).route is (
+        ConversationRoute.CANCEL_REQUEST
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "What is the number of unfinished reminders?",
+        "How many reminders have I completed today?",
+        "What reminders do I still have to do today?",
+    ],
+)
+def test_router_prioritizes_summary_over_memory_lookup_collisions(text: str) -> None:
+    assert route_message(text, pending=None).route is ConversationRoute.SUMMARY_REQUEST
+
+
 def test_router_allows_free_text_only_when_the_task_is_missing() -> None:
     pending_without_task = _pending(task=None)
 

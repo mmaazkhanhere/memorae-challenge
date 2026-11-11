@@ -12,6 +12,7 @@ from reminder_agent.features.reminders.snooze.operations import is_snooze_comman
 from reminder_agent.shared.creation_routing import (
     ExplicitCreateRoute,
     explicit_create_route,
+    is_unsafe_creation_command,
 )
 from reminder_agent.shared.memory_text import extract_memory_lookup_query
 
@@ -62,7 +63,7 @@ _NEXT_REMINDER_REQUEST = re.compile(
     re.IGNORECASE,
 )
 _SUMMARY_REQUEST = re.compile(
-    r"^\s*(?:(?:how\s+many|what\s+is\s+the\s+number\s+of).*(?:pending|outstanding|unfinished|overdue|completed|done|finished)(?:.*(?:today|this\s+day))?"
+    r"^\s*(?:(?:how\s+many|what\s+is\s+the\s+number\s+of).*(?:pending|outstanding|unfinished|overdue|completed|done|finished)(?:.*(?:today|this\s+day))?.*"
     r"|(?:what|which|show|list).*(?:still\s+have\s+to\s+do|have\s+left|remaining).*(?:today|this\s+day)"
     r"|(?:what|which|show|list).*(?:today|this\s+day).*(?:still\s+have\s+to\s+do|have\s+left|remaining)"
     r"|(?:what|which|show|list).*(?:completed|done|finished).*(?:today|this\s+day))\s*[?!.]*\s*$",
@@ -94,6 +95,22 @@ _COMPLETION = re.compile(
 )
 _REMINDER_STATUS_QUESTION = re.compile(
     r"^\s*will\s+you\s+still\s+remind(?:\s+me)?\b.*[?!.]*\s*$",
+    re.IGNORECASE,
+)
+_DIRECT_CANCEL = re.compile(
+    r"^\s*(?:please\s+|can\s+you\s+|could\s+you\s+)?"
+    r"(?:cancel|delete|remove|stop)\s+.+?\s*[.!?]*\s*$",
+    re.IGNORECASE,
+)
+_EXPLICIT_CANCEL_INTENT = re.compile(
+    r"^\s*(?:i|we)\s+(?:want|need)\s+to\s+"
+    r"(?:cancel|delete|remove|stop)\s+.+?\s*[.!?]*\s*$",
+    re.IGNORECASE,
+)
+_CONTEXTUAL_CANCEL = re.compile(
+    r"^\s*(?:please\s+|can\s+you\s+|could\s+you\s+)?"
+    r"(?:cancel|delete|remove|stop)\s+"
+    r"(?:it|this|that|the\s+above|above|previous|prior)\s*[.!?]*\s*$",
     re.IGNORECASE,
 )
 
@@ -166,6 +183,24 @@ def is_summary_request_command(text: str) -> bool:
     return _SUMMARY_REQUEST.fullmatch(normalized) is not None
 
 
+def is_clear_cancel_command(text: str) -> bool:
+    """Return true only for an explicit cancellation operation.
+
+    Indirect negations (for example, "I do not want you to save this") are
+    intentionally left to the model because they do not establish that an
+    existing reminder should be canceled.
+    """
+    return (
+        _DIRECT_CANCEL.fullmatch(text.strip()) is not None
+        or _EXPLICIT_CANCEL_INTENT.fullmatch(text.strip()) is not None
+    ) and is_cancel_command(text)
+
+
+def is_contextual_cancel_command(text: str) -> bool:
+    """Return whether cancellation names only an unresolved pronoun/reference."""
+    return _CONTEXTUAL_CANCEL.fullmatch(text.strip()) is not None
+
+
 def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecision:
     """Choose a safe deterministic path or the model fallback.
 
@@ -176,6 +211,19 @@ def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecisio
     raw = text.strip()
     normalized = re.sub(r"[.!?]+$", "", raw.lower()).strip()
 
+    creation_route = explicit_create_route(raw)
+    # Creation wording can look explicit while still being a compound,
+    # referential, or negated request.  Do not let unrelated deterministic
+    # routes turn that ambiguity into a read or write operation.
+    if (
+        is_unsafe_creation_command(raw)
+        or (
+            creation_route is ExplicitCreateRoute.MODEL_FALLBACK
+            and not (pending is not None and normalized in _CANCELLATIONS)
+        )
+    ):
+        return RouteDecision(ConversationRoute.MODEL_FALLBACK)
+
     if is_completion_command(raw):
         return RouteDecision(ConversationRoute.COMPLETE_REQUEST)
     if is_snooze_command(raw):
@@ -183,18 +231,18 @@ def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecisio
     # Reminder/date wording wins over a broad question-shaped memory lookup.
     # For example, "What's my reminder for tomorrow?" is a schedule query,
     # while "What's my gate code?" remains an exact memory lookup.
+    # Summary questions are a narrower kind of read request than listings,
+    # but can share "what/list/show" wording with memory lookups.
+    if is_summary_request_command(raw):
+        return RouteDecision(ConversationRoute.SUMMARY_REQUEST)
     if is_list_request_command(raw):
         return RouteDecision(ConversationRoute.LIST_REQUEST)
     if is_memory_lookup_command(raw):
         return RouteDecision(ConversationRoute.RETRIEVE_MEMORY_REQUEST)
-    creation_route = explicit_create_route(raw)
     if creation_route is ExplicitCreateRoute.SAVE_MEMORY:
         return RouteDecision(ConversationRoute.SAVE_MEMORY_REQUEST)
     if creation_route is ExplicitCreateRoute.NEW_REMINDER:
         return RouteDecision(ConversationRoute.NEW_REQUEST)
-    if creation_route is ExplicitCreateRoute.MODEL_FALLBACK:
-        return RouteDecision(ConversationRoute.MODEL_FALLBACK)
-
     # An acknowledgement is conversational only when there is no active
     # clarification.  With pending context it must be interpreted as an answer
     # to the outstanding question, or preserve that state and ask again.
@@ -202,9 +250,9 @@ def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecisio
         return RouteDecision(ConversationRoute.SOCIAL)
 
     if pending is None:
-        if is_summary_request_command(raw):
-            return RouteDecision(ConversationRoute.SUMMARY_REQUEST)
-        if is_cancel_command(raw):
+        if is_contextual_cancel_command(raw):
+            return RouteDecision(ConversationRoute.MODEL_FALLBACK)
+        if is_clear_cancel_command(raw):
             return RouteDecision(ConversationRoute.CANCEL_REQUEST)
         if _BARE_CLOCK.fullmatch(raw):
             return RouteDecision(ConversationRoute.UNRELATED)
@@ -212,16 +260,14 @@ def route_message(text: str, *, pending: PendingReminder | None) -> RouteDecisio
 
     if normalized in _CANCELLATIONS:
         return RouteDecision(ConversationRoute.CANCELLATION)
-    if is_cancel_command(raw):
+    if is_contextual_cancel_command(raw):
+        return RouteDecision(ConversationRoute.MODEL_FALLBACK)
+    if is_clear_cancel_command(raw):
         return RouteDecision(ConversationRoute.CANCEL_REQUEST)
     if normalized in _CONFIRMATION_WORDS:
         return RouteDecision(ConversationRoute.CLARIFICATION_REPLY)
     if normalized in _ACKNOWLEDGEMENTS:
         return RouteDecision(ConversationRoute.SOCIAL)
-    if is_list_request_command(raw):
-        return RouteDecision(ConversationRoute.LIST_REQUEST)
-    if is_summary_request_command(raw):
-        return RouteDecision(ConversationRoute.SUMMARY_REQUEST)
     # Only explicit new-reminder commands are classified before considering
     # the active conversation.  A message containing a date/time may still be
     # a new reminder, an answer to the pending question, or something else;
