@@ -182,7 +182,11 @@ def prepare_cancellation(
         decision = None
 
     partial_candidates = []
-    if decision is not None and decision.kind == "RESPONSE" and parsed_request is not None:
+    if (
+        decision is not None
+        and decision.kind in {"RESPONSE", "CLARIFY"}
+        and parsed_request is not None
+    ):
         partial_candidates = find_partial_candidates(
             db,
             user_id=user_id,

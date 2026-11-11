@@ -428,7 +428,7 @@ def test_canceling_a_nonexistent_reminder_returns_not_found_without_reminder_mut
     response = post_update(api_client, update_factory(4069, text="Cancel the bank reminder"))
 
     assert response.status_code == 200
-    assert "couldn't find" in telegram_client.messages[-1][1].lower()
+    assert telegram_client.messages[-1][1] in _cancel_message_variants("no_match")
     db.expire_all()
     assert _reminder_state(db, reminder.id) == before
 
@@ -917,7 +917,7 @@ def test_semantically_different_target_requests_clarification_without_fallback(
         post_update(api_client, update_factory(4105, text="Cancel evening exercise")).status_code
         == 200
     )
-    assert "couldn't confidently match" in telegram_client.messages[-1][1].lower()
+    assert telegram_client.messages[-1][1] in _cancel_message_variants("uncertain_match")
     assert db.scalar(select(Reminder)).status == "ACTIVE"
 
 
@@ -1256,7 +1256,7 @@ def test_confidently_parsed_missing_reminder_returns_not_found_without_fallback(
         post_update(api_client, update_factory(4090, text="Cancel the bank reminder")).status_code
         == 200
     )
-    assert "couldn't find" in telegram_client.messages[-1][1].lower()
+    assert telegram_client.messages[-1][1] in _cancel_message_variants("no_match")
     assert db.scalar(select(Reminder)).status == "ACTIVE"
 
 
@@ -1321,7 +1321,7 @@ def test_semantic_fallback_model_failure_leaves_reminder_unchanged(
         post_update(api_client, update_factory(4094, text="Skip my banking errand")).status_code
         == 200
     )
-    assert "please tell me which" in telegram_client.messages[-1][1].lower()
+    assert telegram_client.messages[-1][1] in _cancel_message_variants("missing_target")
     assert db.scalar(select(Reminder)).status == "ACTIVE"
 
 

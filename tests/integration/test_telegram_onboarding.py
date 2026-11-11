@@ -189,7 +189,7 @@ def test_telegram_502_is_acknowledged_without_duplicate_retry(
 ) -> None:
     from fastapi.testclient import TestClient
 
-        from reminder_agent.application.main import create_app
+    from reminder_agent.application.main import create_app
     from reminder_agent.channels.telegram.provider import TelegramAPIError
     from reminder_agent.infrastructure.config.settings import Settings
 

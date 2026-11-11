@@ -309,7 +309,7 @@ def _candidate_match(target: str, task: str) -> bool:
 def _partial_candidate_match(target: str, task: str) -> bool:
     wanted = _tokens(target)
     actual = _tokens(task)
-    return bool(wanted) and wanted < actual and not _candidate_match(target, task)
+    return len(wanted) > 1 and wanted < actual
 
 
 def _resolve_date(raw: str, *, now: datetime, timezone_name: str) -> date:

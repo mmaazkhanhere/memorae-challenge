@@ -268,7 +268,7 @@ def test_empty_listing_is_explicit_and_formatting_is_local():
         message.format(date="2026-11-01")
         for message in REMINDER_LIST_MESSAGES["empty_specific_date"]
     }
-    assert "2026-11-01 at 09:00 UTC" in format_reminder_list(
+    assert "09:00 UTC - call the bank" in format_reminder_list(
         [
             ListedReminder(
                 reminder_id=UUID(int=0),
