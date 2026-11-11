@@ -42,6 +42,7 @@ IntentInterpreter = _contracts.IntentInterpreter
 ListRemindersIntent = _contracts.ListRemindersIntent
 NeedsClarification = _contracts.NeedsClarification
 PendingReminder = _contracts.PendingReminder
+PendingReminderBatch = _contracts.PendingReminderBatch
 PendingReminderFieldUpdate = _contracts.PendingReminderFieldUpdate
 ReminderSummaryIntent = _contracts.ReminderSummaryIntent
 normalize_task_query = _contracts.normalize_task_query

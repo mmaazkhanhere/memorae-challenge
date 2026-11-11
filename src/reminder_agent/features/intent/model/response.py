@@ -18,6 +18,7 @@ from reminder_agent.features.intent.contracts import (
     ListRemindersIntent,
     NeedsClarification,
     PendingReminder,
+    PendingReminderBatch,
     PendingReminderFieldUpdate,
     ReminderSummaryIntent,
     normalize_task_query,
@@ -180,6 +181,8 @@ def interpret_memory_response(
     if route is IntentRoute.SAVE_MEMORY:
         if operation != "SAVE_MEMORY":
             if operation == "NEEDS_CLARIFICATION":
+                if set(data) - {"operation", "question"}:
+                    raise ValueError("memory clarification has unexpected fields")
                 question = data.get("question")
                 if not isinstance(question, str) or not question.strip():
                     raise ValueError("missing memory clarification question")
@@ -194,6 +197,8 @@ def interpret_memory_response(
     if route is IntentRoute.RETRIEVE_MEMORY:
         if operation != "RETRIEVE_MEMORY":
             if operation == "NEEDS_CLARIFICATION":
+                if set(data) - {"operation", "question"}:
+                    raise ValueError("memory lookup clarification has unexpected fields")
                 question = data.get("question")
                 if not isinstance(question, str) or not question.strip():
                     raise ValueError("missing memory lookup clarification question")
@@ -215,6 +220,13 @@ def interpret_simple_response(
 
     operation = data.get("operation")
     if route is IntentRoute.SNOOZE_REQUEST:
+        if operation == "NEEDS_CLARIFICATION":
+            if set(data) - {"operation", "question"}:
+                raise ValueError("snooze clarification has unexpected fields")
+            question = data.get("question")
+            if not isinstance(question, str) or not question.strip():
+                raise ValueError("missing snooze clarification question")
+            return Interpretation(response_text=question.strip(), fallback_allowed=False)
         if operation not in {"SNOOZE_OCCURRENCE", "SNOOZE_REMINDER"}:
             raise ValueError("provider returned an unsupported snooze operation")
         if set(data) - {"operation", "duration_seconds"}:
@@ -227,6 +239,13 @@ def interpret_simple_response(
         duration = SnoozeDuration(duration_seconds=duration_seconds)
         return Interpretation(snooze_duration_seconds=duration.duration_seconds, fallback_allowed=False)
     if route is IntentRoute.SUMMARY_REQUEST:
+        if operation == "NEEDS_CLARIFICATION":
+            if set(data) - {"operation", "question"}:
+                raise ValueError("summary clarification has unexpected fields")
+            question = data.get("question")
+            if not isinstance(question, str) or not question.strip():
+                raise ValueError("missing summary clarification question")
+            return Interpretation(response_text=question.strip(), fallback_allowed=False)
         if operation in {"SUMMARY_REQUEST", "REMINDER_SUMMARY", "STATUS_SUMMARY"}:
             operation = "SUMMARY"
         if operation != "SUMMARY":
@@ -266,6 +285,27 @@ def interpret_response(
     """Validate one provider object and convert it to a channel-neutral result."""
 
     operation = data.get("operation")
+    if (
+        route is IntentRoute.NEW_REQUEST
+        and operation is None
+        and set(data) == {"task", "due_local"}
+    ):
+        # Some OpenAI-compatible providers omit the discriminator even though
+        # they return the complete, route-specific one-time proposal. The
+        # route is already selected by the classifier and the exact field set
+        # keeps this compatibility correction narrowly scoped. All normal
+        # datetime, task, ownership, and business validation still follows.
+        data = {**data, "operation": "CREATE_ONE_TIME_REMINDER"}
+        operation = "CREATE_ONE_TIME_REMINDER"
+        log_event_fn(
+            logger,
+            logging.WARNING,
+            "reminder_intent_provider_operation_inferred",
+            endpoint_host=endpoint_host,
+            model=model,
+            route=route,
+            operation=operation,
+        )
     memory_result = interpret_memory_response(
         data,
         route=route,
@@ -303,6 +343,13 @@ def interpret_response(
             "scope",
             "occurrence_date",
         }
+        if operation == "NEEDS_CLARIFICATION":
+            if set(data) - {"operation", "question"}:
+                raise ValueError("cancellation clarification has unexpected fields")
+            question = data.get("question")
+            if not isinstance(question, str) or not question.strip():
+                raise ValueError("missing cancellation clarification question")
+            return Interpretation(response_text=question.strip(), fallback_allowed=False)
         if unexpected_fields:
             raise ValueError("cancellation intent has unexpected fields")
         if operation != "CANCEL_REMINDER":
@@ -322,7 +369,16 @@ def interpret_response(
         if occurrence_date_value is not None:
             if not isinstance(occurrence_date_value, str):
                 raise ValueError("cancellation occurrence_date was not a string")
-            occurrence_date = date.fromisoformat(occurrence_date_value)
+            try:
+                occurrence_date = date.fromisoformat(occurrence_date_value)
+            except ValueError:
+                # Some providers copy the ISO timestamp from cancellation
+                # candidate context into the date-only field. Keep the
+                # provider boundary tolerant here; grounding below remains
+                # authoritative and will discard dates not stated in the
+                # user's current request.
+                candidate_due_at = datetime.fromisoformat(occurrence_date_value)
+                occurrence_date = candidate_due_at.date()
         else:
             occurrence_date = None
         cancellation_request = CancellationRequest(
@@ -558,12 +614,20 @@ def interpret_response(
         if operation == "UNKNOWN":
             return Interpretation(response_text=OUT_OF_SCOPE_RESPONSE, fallback_allowed=False)
         raise ValueError("provider returned an authoritative pending reminder")
+    if route is IntentRoute.LIST_REQUEST and operation == "NEEDS_CLARIFICATION":
+        if set(data) - {"operation", "question"}:
+            raise ValueError("list clarification has unexpected fields")
+        question = data.get("question")
+        if not isinstance(question, str) or not question.strip():
+            raise ValueError("missing list clarification question")
+        return Interpretation(response_text=question.strip(), fallback_allowed=False)
     if operation == "NEEDS_CLARIFICATION":
+        if set(data) - {"operation", "question", "pending"}:
+            raise ValueError("clarification has unexpected fields")
         raw_pending = data.get("pending") or {}
         if not isinstance(raw_pending, dict):
             raise ValueError("pending clarification was not an object")
-        pending_values = context.model_dump(mode="python") if context is not None else {}
-        for field in (
+        pending_fields = {
             "task",
             "date_local",
             "hour",
@@ -575,11 +639,76 @@ def interpret_response(
             "recurrence_interval",
             "recurrence_day_of_month",
             "recurrence_month",
-        ):
-            if field in raw_pending and raw_pending[field] is not None:
-                pending_values[field] = raw_pending[field]
-        pending_values["timezone_name"] = timezone_name
-        pending = PendingReminder.model_validate(pending_values)
+            "reminders",
+            "clarification_index",
+        }
+        if set(raw_pending) - pending_fields:
+            raise ValueError("pending clarification has unexpected fields")
+        if "reminders" in raw_pending:
+            if route is not IntentRoute.NEW_REQUEST or context is not None:
+                raise ValueError("multiple reminder drafts are only valid for a new request")
+            raw_reminders = raw_pending.get("reminders")
+            if not isinstance(raw_reminders, list) or not raw_reminders:
+                raise ValueError("pending reminder drafts were not an array")
+            clarification_index = raw_pending.get("clarification_index")
+            if isinstance(clarification_index, bool) or not isinstance(clarification_index, int):
+                raise ValueError("pending clarification index was not an integer")
+            reminders: list[PendingReminder] = []
+            for raw_reminder in raw_reminders:
+                if not isinstance(raw_reminder, dict):
+                    raise ValueError("pending reminder draft was not an object")
+                if set(raw_reminder) - (pending_fields - {"reminders", "clarification_index"}):
+                    raise ValueError("pending reminder draft has unexpected fields")
+                pending_values = {
+                    key: value
+                    for key, value in raw_reminder.items()
+                    if key
+                    in {
+                        "task",
+                        "date_local",
+                        "hour",
+                        "minute",
+                        "meridiem",
+                        "date_explicit",
+                        "recurrence_weekdays",
+                        "recurrence_frequency",
+                        "recurrence_interval",
+                        "recurrence_day_of_month",
+                        "recurrence_month",
+                    }
+                    and value is not None
+                }
+                pending_values["timezone_name"] = timezone_name
+                reminders.append(PendingReminder.model_validate(pending_values))
+            pending: PendingReminder | PendingReminderBatch = PendingReminderBatch(
+                reminders=tuple(reminders),
+                clarification_index=clarification_index,
+            )
+            field_count = sum(
+                value is not None
+                for reminder in reminders
+                for value in reminder.model_dump(mode="python").values()
+            )
+        else:
+            pending_values = context.model_dump(mode="python") if context is not None else {}
+            for field in (
+                "task",
+                "date_local",
+                "hour",
+                "minute",
+                "meridiem",
+                "date_explicit",
+                "recurrence_weekdays",
+                "recurrence_frequency",
+                "recurrence_interval",
+                "recurrence_day_of_month",
+                "recurrence_month",
+            ):
+                if field in raw_pending and raw_pending[field] is not None:
+                    pending_values[field] = raw_pending[field]
+            pending_values["timezone_name"] = timezone_name
+            pending = PendingReminder.model_validate(pending_values)
+            field_count = sum(value is not None for value in pending_values.values())
         question = data.get("question")
         if not isinstance(question, str) or not question.strip():
             raise ValueError("missing clarification question")
@@ -589,7 +718,7 @@ def interpret_response(
             "reminder_extraction_completed",
             model=model,
             operation=operation,
-            field_count=sum(value is not None for value in pending_values.values()),
+            field_count=field_count,
             has_pending_context=False,
         )
         return Interpretation(clarification=NeedsClarification(pending=pending, question=question))
@@ -618,7 +747,29 @@ def interpret_response(
         return Interpretation(intents=tuple(intents))
     if operation == "CREATE_RECURRING_REMINDER":
         task = data.get("task")
-        weekdays = _normalise_weekdays(data.get("weekdays", data.get("day_of_week")))
+        # ``weekdays`` is the canonical complete-operation field.  Older model
+        # prompt variants emitted the pending-draft name ``recurrence_weekdays``
+        # instead, which was silently ignored and left a weekly schedule with
+        # no selected day.  Keep this narrow compatibility alias at the
+        # provider boundary; the validated intent remains canonical.
+        raw_weekdays = data.get("weekdays")
+        if raw_weekdays is None:
+            raw_weekdays = data.get("day_of_week")
+        if raw_weekdays is None:
+            raw_weekdays = data.get("recurrence_weekdays")
+            if raw_weekdays is not None:
+                log_event_fn(
+                    logger,
+                    logging.WARNING,
+                    "reminder_intent_provider_field_alias_normalized",
+                    endpoint_host=endpoint_host,
+                    model=model,
+                    route=route,
+                    operation=operation,
+                    provider_field="recurrence_weekdays",
+                    canonical_field="weekdays",
+                )
+        weekdays = _normalise_weekdays(raw_weekdays)
         start_local_value = data.get("start_local")
         frequency_value = str(data.get("frequency", "WEEKLY")).upper()
         if frequency_value == "DAILY":
@@ -662,11 +813,36 @@ def interpret_response(
             )
         )
     if operation == "LIST_REMINDERS":
+        allowed_fields = {
+            "operation",
+            "filters",
+            "start_date",
+            "end_date",
+            "date_range",
+            "date",
+            "task_query",
+            "time_after",
+            "time_before",
+            "weekdays",
+            "weekday",
+            "recurrence_only",
+            "recurrence_series_only",
+            "recurrence_frequency",
+            "limit",
+        }
+        unknown_fields = set(data) - allowed_fields
+        if unknown_fields:
+            raise ValueError("list intent contains unsupported fields")
         nested_filters = data.get("filters")
         if nested_filters is not None and not isinstance(nested_filters, dict):
             raise ValueError("list intent filters were not an object")
         filter_data = dict(nested_filters or {})
-        filter_data.update({key: value for key, value in data.items() if key != "filters"})
+        filter_data.update(
+            {key: value for key, value in data.items() if key not in {"operation", "filters"}}
+        )
+        unknown_filter_fields = set(filter_data) - (allowed_fields - {"operation", "filters"})
+        if unknown_filter_fields:
+            raise ValueError("list intent filters contain unsupported fields")
 
         start_date_value = filter_data.get("start_date")
         end_date_value = filter_data.get("end_date")
@@ -706,6 +882,19 @@ def interpret_response(
                 raise ValueError("list intent limit was not an integer")
             if raw_limit < 1 or raw_limit > 100:
                 raise ValueError("list intent limit was outside 1..100")
+        recurrence_frequency = filter_data.get("recurrence_frequency")
+        if recurrence_frequency is not None:
+            if not isinstance(recurrence_frequency, str):
+                raise ValueError("list intent recurrence frequency was not a string")
+            recurrence_frequency = recurrence_frequency.upper()
+            if recurrence_frequency not in {"WEEKLY", "MONTHLY", "YEARLY"}:
+                raise ValueError("list intent recurrence frequency was not recognized")
+        recurrence_only = filter_data.get("recurrence_only", False)
+        if not isinstance(recurrence_only, bool):
+            raise ValueError("list intent recurrence_only was not boolean")
+        recurrence_series_only = filter_data.get("recurrence_series_only", False)
+        if not isinstance(recurrence_series_only, bool):
+            raise ValueError("list intent recurrence_series_only was not boolean")
         return Interpretation(
             intent=ListRemindersIntent(
                 start_date=date.fromisoformat(start_date_value) if start_date_value else None,
@@ -714,6 +903,9 @@ def interpret_response(
                 time_after=time_after,
                 time_before=time_before,
                 weekdays=tuple(weekdays) if weekdays else None,
+                recurrence_only=recurrence_only,
+                recurrence_series_only=recurrence_series_only,
+                recurrence_frequency=recurrence_frequency,
                 limit=raw_limit,
                 timezone_name=timezone_name,
             )

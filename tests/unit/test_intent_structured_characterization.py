@@ -10,6 +10,7 @@ from reminder_agent.features.intent import (
     NeedsClarification,
     OpenAICompatibleIntentInterpreter,
     PendingReminder,
+    PendingReminderBatch,
 )
 
 NOW = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
@@ -57,6 +58,84 @@ def test_structured_one_time_response_converts_user_local_time_to_utc() -> None:
     assert "CREATE_ONE_TIME_REMINDER" in provider.payload["messages"][0]["content"]
 
 
+def test_structured_one_time_response_infers_missing_operation_for_new_request() -> None:
+    interpreter, _ = _interpreter(
+        '{"task":"send the proposal to Sarah","due_local":"2026-11-12T09:00"}'
+    )
+
+    result = interpreter.interpret(
+        "Oh, and tomorrow morning at 9 am, remind me to send the proposal to Sarah.",
+        selected_route=IntentRoute.NEW_REQUEST,
+        timezone_name="Asia/Karachi",
+        now=NOW,
+    )
+
+    assert isinstance(result.intent, CreateOneTimeReminderIntent)
+    assert result.intent.task == "send the proposal to Sarah"
+    assert result.intent.due_at == datetime(2026, 11, 12, 4, 0, tzinfo=UTC)
+
+
+def test_structured_one_time_response_does_not_infer_operation_with_extra_fields() -> None:
+    interpreter, _ = _interpreter(
+        '{"task":"send the proposal to Sarah","due_local":"2026-11-12T09:00",'
+        '"unexpected":"value"}'
+    )
+
+    result = interpreter.interpret(
+        "Oh, and tomorrow morning at 9 am, remind me to send the proposal to Sarah.",
+        selected_route=IntentRoute.NEW_REQUEST,
+        timezone_name="Asia/Karachi",
+        now=NOW,
+    )
+
+    assert result.intent is None
+
+
+def test_structured_multi_reminder_clarification_preserves_all_drafts() -> None:
+    interpreter, _ = _interpreter(
+        {
+            "operation": "NEEDS_CLARIFICATION",
+            "question": "Should 6 be AM or PM for the electricity bill?",
+            "pending": {
+                "reminders": [
+                    {
+                        "task": "call John",
+                        "date_local": "2026-10-31",
+                        "hour": 10,
+                        "minute": 0,
+                        "meridiem": "am",
+                        "date_explicit": True,
+                    },
+                    {
+                        "task": "pay my electricity bill",
+                        "date_local": "2026-11-06",
+                        "hour": 6,
+                        "minute": 0,
+                        "date_explicit": True,
+                    },
+                ],
+                "clarification_index": 1,
+            },
+        }
+    )
+
+    result = interpreter.interpret(
+        "Remind me to call John tomorrow at 10, and pay my electricity bill on Friday at 6.",
+        selected_route=IntentRoute.NEW_REQUEST,
+        timezone_name="Asia/Karachi",
+        now=NOW,
+    )
+
+    assert isinstance(result.clarification, NeedsClarification)
+    assert isinstance(result.clarification.pending, PendingReminderBatch)
+    batch = result.clarification.pending
+    assert batch.clarification_index == 1
+    assert [draft.task for draft in batch.reminders] == [
+        "call John",
+        "pay my electricity bill",
+    ]
+
+
 def test_structured_recurring_response_normalizes_provider_time_aliases() -> None:
     interpreter, _ = _interpreter(
         '{"operation":"CREATE_RECURRING_REMINDER",'
@@ -75,6 +154,27 @@ def test_structured_recurring_response_normalizes_provider_time_aliases() -> Non
     assert result.intent.task == "team standup"
     assert result.intent.weekdays == (0,)
     assert result.intent.hour == 8
+    assert result.intent.minute == 0
+
+
+def test_structured_recurring_response_accepts_legacy_recurrence_weekdays_alias() -> None:
+    interpreter, _ = _interpreter(
+        '{"operation":"CREATE_RECURRING_REMINDER",'
+        '"task":"exercise","frequency":"WEEKLY","interval":1,'
+        '"recurrence_weekdays":["Monday","Tuesday","Wednesday","Thursday",'
+        '"Friday","Saturday","Sunday"],"hour":9,"minute":0,'
+        '"start_local":"2026-10-31T09:00"}'
+    )
+
+    result = interpreter.interpret(
+        "I want you to remind me to exercise every morning at 9 am",
+        timezone_name="UTC",
+        now=NOW,
+    )
+
+    assert isinstance(result.intent, CreateRecurringReminderIntent)
+    assert result.intent.weekdays == (0, 1, 2, 3, 4, 5, 6)
+    assert result.intent.hour == 9
     assert result.intent.minute == 0
 
 
