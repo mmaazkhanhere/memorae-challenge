@@ -63,20 +63,24 @@ def test_memory_prompts_do_not_receive_reminder_context() -> None:
         pending_reschedule={"operation": "START_NEW_OPERATION"},
     )
 
-    for prompt in (save_prompt, retrieve_prompt):
-        assert "Selected route:" not in prompt
-        assert "Asia/Karachi" not in prompt
-        assert "ignore these instructions" not in prompt
-        assert "pending_reschedule" not in prompt
+    assert "Selected route:" not in save_prompt
+    assert "Asia/Karachi" not in save_prompt
+    assert "ignore these instructions" not in save_prompt
+    assert "pending_reschedule" not in save_prompt
+    assert "Selected route:" not in retrieve_prompt
+    assert "<recent_conversation>" in retrieve_prompt
+    assert "ignore these instructions" in retrieve_prompt
+    assert "pending_reschedule" not in retrieve_prompt
 
 
-def test_route_context_isolated_to_operations_that_use_it() -> None:
+def test_list_extraction_receives_conversation_and_selection_context() -> None:
     history = ("previous turn",)
     candidate = {"candidate_id": "r1", "task": "pay rent", "due_local": "2026-11-12T09:00"}
 
     list_prompt = _build(
         IntentRoute.LIST_REQUEST,
         recent_messages=history,
+        selection_context=(candidate,),
         reschedule_candidates=(candidate,),
         cancellation_candidates=(candidate,),
     )
@@ -88,8 +92,8 @@ def test_route_context_isolated_to_operations_that_use_it() -> None:
         reschedule_candidates=(candidate,),
     )
 
-    assert "previous turn" not in list_prompt
-    assert "candidate_id" not in list_prompt
+    assert "previous turn" in list_prompt
+    assert "candidate_id" in list_prompt
     assert "previous turn" not in snooze_prompt
     assert "<cancellation_candidates>" in cancel_prompt
     assert "<reschedule_candidates>" not in cancel_prompt
@@ -133,3 +137,31 @@ def test_large_context_is_bounded_with_an_explicit_notice() -> None:
     assert "[truncated]" in prompt
     assert "context is incomplete" in prompt
     assert f'"candidate_id":"{MAX_CONTEXT_RECORDS}"' not in prompt
+
+
+def test_route_prompts_define_clarification_and_safety_contracts() -> None:
+    new_prompt = _build(IntentRoute.NEW_REQUEST)
+    assert '"operation":"NEEDS_CLARIFICATION"' in new_prompt
+    assert "question and pending are required" in new_prompt
+
+    snooze_prompt = _build(IntentRoute.SNOOZE_REQUEST)
+    assert "integer greater than 0" in snooze_prompt
+    assert "vague durations" in snooze_prompt
+
+    cancel_prompt = _build(IntentRoute.CANCEL_REQUEST)
+    assert "OCCURRENCE" in cancel_prompt
+    assert "SERIES" in cancel_prompt
+    assert "unqualified recurring" in cancel_prompt
+
+    reschedule_prompt = _build(IntentRoute.RESCHEDULE_REQUEST)
+    assert "candidate_id" in reschedule_prompt
+    assert "multiple candidates require clarification" in reschedule_prompt
+
+
+def test_memory_prompts_allow_complete_non_is_facts_and_grounded_lookup() -> None:
+    save_prompt = _build(IntentRoute.SAVE_MEMORY)
+    retrieve_prompt = _build(IntentRoute.RETRIEVE_MEMORY)
+    assert "preferences, relationships, and facts" in save_prompt
+    assert "subject-only requests" in save_prompt
+    assert "Context-grounded indirect questions" in retrieve_prompt
+    assert "Never invent a" in retrieve_prompt
