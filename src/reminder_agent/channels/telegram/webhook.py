@@ -216,6 +216,24 @@ def telegram_webhook(
             if update.callback_query is not None
             else None
         )
+        if completion_callback is not None:
+            if client is None:
+                client = HttpTelegramClient(
+                    request.app.state.settings.telegram_bot_token,
+                    request.app.state.settings.telegram_api_timeout_seconds,
+                )
+            if hasattr(client, "answer_callback_query"):
+                try:
+                    acknowledge_callback(client, completion_callback.callback_query_id)
+                except TelegramAPIError as exc:
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "telegram_callback_acknowledgement_failed",
+                        update_id=update.update_id,
+                        failure_kind=exc.failure_kind,
+                        provider_status_code=exc.status_code,
+                    )
         reply = (
             handle_onboarding_request(
                 db,
@@ -285,27 +303,6 @@ def telegram_webhook(
                 "telegram_update_duplicate",
                 update_id=update.update_id,
             )
-        if reply is not None and update.callback_query is not None:
-            if client is None:
-                client = HttpTelegramClient(
-                    request.app.state.settings.telegram_bot_token,
-                    request.app.state.settings.telegram_api_timeout_seconds,
-                )
-            if hasattr(client, "answer_callback_query"):
-                try:
-                    acknowledge_callback(client, update.callback_query.id)
-                except TelegramAPIError as exc:
-                    # Callback acknowledgement is only UI feedback. The
-                    # completion mutation and durable response must still
-                    # be delivered even if this best-effort call fails.
-                    log_event(
-                        logger,
-                        logging.WARNING,
-                        "telegram_callback_acknowledgement_failed",
-                        update_id=update.update_id,
-                        failure_kind=exc.failure_kind,
-                        provider_status_code=exc.status_code,
-                    )
         if reply is not None and reply.response_kind == "completion":
             if client is None:
                 client = HttpTelegramClient(
