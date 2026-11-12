@@ -63,6 +63,7 @@ def run_memory_lookup_workflow[ResponseT_co](
     pending: PendingMemoryLookup | None,
     query: str | None,
     source_text: str,
+    clarification_text: str | None = None,
     from_model: bool = False,
     now: datetime,
     session_ttl_seconds: int,
@@ -91,6 +92,8 @@ def run_memory_lookup_workflow[ResponseT_co](
         extraction_source="llm" if from_model else "deterministic_or_clarification",
         query_present=query is not None,
         query_length=len(query or ""),
+        query_text=query,
+        clarification_question=clarification_text,
         pending_candidate_count=len(pending.candidate_ids) if pending is not None else 0,
         embedding_provider_configured=embedding_provider is not None,
     )
@@ -106,8 +109,12 @@ def run_memory_lookup_workflow[ResponseT_co](
             **event_context,
             reason="missing_or_ungrounded_query",
             from_model=from_model,
+            clarification_question=clarification_text,
+            clarification_question_length=len(clarification_text or ""),
         )
-        return responses.direct(lookup_memory_message("missing_subject"))
+        return responses.direct(
+            clarification_text or lookup_memory_message("missing_subject")
+        )
 
     db.rollback()
     try:

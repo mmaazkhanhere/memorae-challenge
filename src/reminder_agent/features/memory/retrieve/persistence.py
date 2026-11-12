@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from reminder_agent.features.memory.retrieve.contracts import (
@@ -24,10 +24,44 @@ from reminder_agent.infrastructure.providers.embeddings import (
     embed_query,
     validate_embedding,
 )
-from reminder_agent.shared.memory_contracts import _lookup_tokens
+from reminder_agent.shared.memory_contracts import _lookup_token_forms, _lookup_tokens
 
 logger = get_logger()
 DEFAULT_EMBEDDING_PRIVACY_POLICY = EmbeddingPrivacyPolicy()
+
+
+def _are_redundant_memory_facts(left: MemoryFact, right: MemoryFact) -> bool:
+    """Recognize near-identical saved facts without collapsing distinct values.
+
+    A replay or UI artifact can append words and a timestamp to an otherwise
+    identical fact. Those copies must not force an answer model to cite both
+    records. Distinct facts remain separate unless they share a code-like
+    anchor and at least 70% of their meaningful tokens.
+    """
+
+    left_tokens = set(_lookup_tokens(left.content))
+    right_tokens = set(_lookup_tokens(right.content))
+    if not left_tokens or not right_tokens:
+        return False
+    if left_tokens == right_tokens:
+        return True
+    shared_tokens = left_tokens & right_tokens
+    shared_code_like_anchor = any(
+        any(character.isdigit() for character in token) for token in shared_tokens
+    )
+    return shared_code_like_anchor and (
+        len(shared_tokens) / max(len(left_tokens), len(right_tokens)) >= 0.7
+    )
+
+
+def _collapse_redundant_memory_facts(facts: tuple[MemoryFact, ...] | list[MemoryFact]) -> tuple[MemoryFact, ...]:
+    """Keep the first ranked representative for each redundant fact group."""
+
+    retained: list[MemoryFact] = []
+    for fact in facts:
+        if not any(_are_redundant_memory_facts(fact, existing) for existing in retained):
+            retained.append(fact)
+    return tuple(retained)
 
 
 def revalidate_owned_memory_candidates(
@@ -95,7 +129,10 @@ def lookup_memory_fact(
             return MemoryLookupResult(status="UNKNOWN")
         filters.append(MemoryFact.id.in_(candidate_ids))
     normalized_content = func.replace(func.replace(func.lower(MemoryFact.content), "-", ""), "_", "")
-    lexical_filters = [normalized_content.contains(token) for token in query_tokens]
+    lexical_filters = [
+        or_(*(normalized_content.contains(form) for form in _lookup_token_forms(token)))
+        for token in query_tokens
+    ]
     facts = list(
         db.scalars(
             select(MemoryFact)
@@ -105,11 +142,13 @@ def lookup_memory_fact(
         ).all()
     )
 
-    matches = [
-        fact
-        for fact in facts
-        if set(query_tokens).issubset(set(_lookup_tokens(fact.content)))
-    ]
+    matches = _collapse_redundant_memory_facts(
+        [
+            fact
+            for fact in facts
+            if _lookup_token_forms(query).issubset(_lookup_token_forms(fact.content))
+        ]
+    )
     log_event(
         logger,
         logging.INFO,
@@ -246,10 +285,12 @@ def _semantic_lookup(
         candidate_ids=[str(fact.id) for fact, _ in scored],
         similarity_scores=[round(score, 6) for _, score in scored],
     )
-    safe_candidates = tuple(
-        fact
-        for fact, _score in scored
-        if allow_sensitive_facts or not contains_sensitive_memory(fact.content)
+    safe_candidates = _collapse_redundant_memory_facts(
+        [
+            fact
+            for fact, _score in scored
+            if allow_sensitive_facts or not contains_sensitive_memory(fact.content)
+        ]
     )[:answer_candidate_limit]
     if not safe_candidates:
         log_event(

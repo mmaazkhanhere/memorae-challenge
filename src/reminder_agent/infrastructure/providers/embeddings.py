@@ -9,8 +9,8 @@ from typing import Protocol, runtime_checkable
 
 import httpx
 
-from reminder_agent.infrastructure.database.models import MEMORY_EMBEDDING_DIMENSIONS
 from reminder_agent.infrastructure.config.settings import Settings
+from reminder_agent.infrastructure.database.models import MEMORY_EMBEDDING_DIMENSIONS
 
 
 class EmbeddingProviderError(RuntimeError):
@@ -55,14 +55,15 @@ _SENSITIVE_MEMORY = re.compile(
     r"\b(?:password|passphrase|passcode|pin|secret|api[\s_-]*key|token|"
     r"access\s+code|gate\s+code|door\s+code|security\s+code|cvv|cvc|"
     r"private\s+key|recovery\s+(?:code|phrase)|seed\s+phrase|"
-    r"e-?mail(?:\s+address)?|phone\s+number|mobile\s+number|telephone\s+number|"
+    r"e-?mail\s+address|phone\s+number|mobile\s+number|telephone\s+number|"
     r"account\s+number)\b",
     re.IGNORECASE,
 )
+_EMAIL_ADDRESS = re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b")
 
 
 def contains_sensitive_memory(value: str) -> bool:
-    return _SENSITIVE_MEMORY.search(value) is not None
+    return _SENSITIVE_MEMORY.search(value) is not None or _EMAIL_ADDRESS.search(value) is not None
 
 
 def validate_embedding(values: list[float], *, dimensions: int) -> list[float]:

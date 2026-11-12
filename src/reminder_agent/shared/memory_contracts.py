@@ -16,7 +16,7 @@ _LOOKUP_IDENTIFIER = re.compile(
     r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
     re.IGNORECASE,
 )
-_LOOKUP_STOP_WORDS = {"a", "an", "and", "for", "my", "of", "the", "to"}
+_LOOKUP_STOP_WORDS = {"a", "an", "and", "for", "my", "of", "the", "their", "to"}
 
 
 def _lookup_tokens(value: str) -> tuple[str, ...]:
@@ -28,6 +28,23 @@ def _lookup_tokens(value: str) -> tuple[str, ...]:
         for token in re.findall(r"[^\W_]+", normalized, flags=re.UNICODE)
         if token not in _LOOKUP_STOP_WORDS and len(token) > 1
     )
+
+
+def _lookup_token_forms(value: str) -> frozenset[str]:
+    """Return conservative singular/plural forms for lookup matching."""
+
+    tokens = set(_lookup_tokens(value))
+    for token in tuple(tokens):
+        if len(token) >= 5 and token.endswith("ies"):
+            tokens.add(token[:-3] + "y")
+        elif len(token) >= 4 and token.endswith("s") and not token.endswith(("ss", "us", "is")):
+            tokens.add(token[:-1])
+        elif len(token) >= 3 and not token.endswith("s"):
+            if token.endswith("y") and len(token) >= 4 and token[-2] not in "aeiou":
+                tokens.add(token[:-1] + "ies")
+            else:
+                tokens.add(token + "s")
+    return frozenset(tokens)
 
 
 class MemoryIntentEvidence(BaseModel):

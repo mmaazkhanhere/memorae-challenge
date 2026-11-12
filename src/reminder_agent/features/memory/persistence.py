@@ -145,6 +145,7 @@ def index_memory_fact(
         and not privacy_policy.allow_sensitive_external
         and fact.embedding_model == embedding_provider.model
         and fact.embedding_content_hash == content_hash
+        and contains_sensitive_memory(fact.content)
     ):
         return False
     if (
@@ -249,9 +250,11 @@ def backfill_memory_embeddings(
 
     if not 1 <= batch_size <= 1000:
         raise ValueError("batch size must be between 1 and 1000")
-    retry_statuses = ["PENDING", "FAILED"]
-    if not embedding_provider.is_external or privacy_policy.allow_sensitive_external:
-        retry_statuses.append("SKIPPED_SENSITIVE")
+    # Re-evaluate skipped rows because the privacy classifier may have marked
+    # an older fact based on a false positive, such as "email" as a channel.
+    # Truly sensitive rows remain SKIPPED_SENSITIVE in _prepare_embedding when
+    # external indexing is not allowed.
+    retry_statuses = ["PENDING", "FAILED", "SKIPPED_SENSITIVE"]
     facts = list(
         db.scalars(
             select(MemoryFact)

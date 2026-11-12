@@ -11,7 +11,10 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from reminder_agent.shared.memory_contracts import RetrieveMemoryQuery, _lookup_tokens
+from reminder_agent.shared.memory_contracts import (
+    RetrieveMemoryQuery,
+    _lookup_token_forms,
+)
 
 
 @dataclass(frozen=True)
@@ -54,7 +57,7 @@ def is_memory_lookup_query_grounded(source: str, query: str) -> bool:
         query = RetrieveMemoryQuery(query=query).query
     except (TypeError, ValueError):
         return False
-    return set(_lookup_tokens(query)).issubset(set(_lookup_tokens(source)))
+    return _lookup_token_forms(query).issubset(_lookup_token_forms(source))
 
 
 def cosine_similarity(left: list[float], right: list[float]) -> float:

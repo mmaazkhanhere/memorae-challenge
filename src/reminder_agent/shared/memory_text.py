@@ -11,8 +11,17 @@ _MEMORY_PREFIX = re.compile(
     r"^\s*(?:please\s+)?(?:remember|save|(?:make|take)\s+(?:a\s+)?note)\b",
     re.IGNORECASE,
 )
+_MEMORY_FACT_SUFFIX = re.compile(
+    r"^\s*(?P<fact>.+?)\s*[.!]\s*(?:please\s+)?save\s+(?:this|that)\s*[.!?]*\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
 _LEADING_FILLER = re.compile(r"^(?:that|this|of|to|for\s+me)\s+", re.IGNORECASE)
 _LOOKUP_PATTERNS = (
+    re.compile(
+        r"^\s*what\s+was\s+(?:the\s+)?name\s+of\s+(?:my|the)\s+"
+        r"(?P<query>.+?)\s*[?!.]*\s*$",
+        re.IGNORECASE,
+    ),
     re.compile(
         r"^\s*(?:what(?:['â€™]s|\s+is)|do\s+you\s+(?:remember|know)|tell\s+me)\s+"
         r"(?:my|the)\s+(?P<query>.+?)\s*[?!.]*\s*$",
@@ -23,7 +32,7 @@ _LOOKUP_PATTERNS = (
         re.IGNORECASE,
     ),
     re.compile(
-        r"^\s*which\s+(?P<query>.+?)\s+do\s+i\s+(?:like|prefer)\s+most\s*[?!.]*\s*$",
+        r"^\s*which\s+(?P<query>.+?)\s+do\s+i\s+(?:like|prefer)(?:\s+most)?\s*[?!.]*\s*$",
         re.IGNORECASE,
     ),
 )
@@ -39,9 +48,13 @@ def extract_memory_content(text: str) -> str | None:
     if not is_memory_save_command(text):
         return None
     match = _MEMORY_PREFIX.match(text)
-    if match is None:
-        return None
-    remainder = _LEADING_FILLER.sub("", text[match.end() :].strip())
+    if match is not None:
+        remainder = _LEADING_FILLER.sub("", text[match.end() :].strip())
+    else:
+        suffix_match = _MEMORY_FACT_SUFFIX.match(text)
+        if suffix_match is None:
+            return None
+        remainder = suffix_match.group("fact").strip()
     if not remainder or remainder.casefold().strip(" .!?,") in {
         "this",
         "that",
