@@ -63,7 +63,9 @@ def _tokens(value: str) -> set[str]:
             continue
         if token.endswith("ing") and len(token) > 5:
             token = token[:-3]
-        if token.endswith("s") and not token.endswith(("ss", "us", "is")):
+        if token.endswith("ies") and len(token) > 4:
+            token = token[:-3] + "y"
+        elif token.endswith("s") and not token.endswith(("ss", "us", "is")):
             token = token[:-1]
         tokens.add(token)
     return tokens

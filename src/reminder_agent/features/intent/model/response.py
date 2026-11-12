@@ -58,6 +58,21 @@ _TIME_PATTERN = re.compile(
 )
 
 
+def _provider_local_datetime(value: str, *, timezone_name: str) -> datetime:
+    """Parse a model datetime and normalize accidental offset-bearing output.
+
+    The contract asks providers for a naive local datetime, but compatible
+    models occasionally include ``Z`` or an explicit offset.  Treat that as
+    an absolute instant and convert it into the user's local wall-clock time
+    before the existing timezone-aware domain conversion.
+    """
+
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is not None and parsed.utcoffset() is not None:
+        parsed = parsed.astimezone(ZoneInfo(timezone_name)).replace(tzinfo=None)
+    return parsed
+
+
 def _normalise_weekdays(value: Any) -> list[int] | None:
     """Normalize provider weekday aliases to the canonical Monday=0 form."""
 
@@ -285,6 +300,18 @@ def interpret_response(
     """Validate one provider object and convert it to a channel-neutral result."""
 
     operation = data.get("operation")
+    if route is IntentRoute.RESCHEDULE_REQUEST and operation in {
+        "RESCHEDULE",
+        "RESCHEDULE_REQUEST",
+        "MOVE_REMINDER",
+        "UPDATE_REMINDER",
+        "CHANGE_REMINDER",
+        "SHIFT_REMINDER",
+    }:
+        # Keep provider wording differences inside the untrusted boundary;
+        # canonical schema, ownership, and transition validation still run.
+        operation = "RESCHEDULE_REMINDER"
+        data = {**data, "operation": operation}
     if (
         route is IntentRoute.NEW_REQUEST
         and operation is None
@@ -422,9 +449,9 @@ def interpret_response(
             if due_local_value is not None:
                 if not isinstance(due_local_value, str):
                     raise ValueError("pending reschedule due_local was not a string")
-                due_local = datetime.fromisoformat(due_local_value)
-                if due_local.tzinfo is not None and due_local.utcoffset() is not None:
-                    raise ValueError("provider returned an offset-bearing local datetime")
+                due_local = _provider_local_datetime(
+                    due_local_value, timezone_name=timezone_name
+                )
                 raw_proposal["due_at"] = due_local.replace(
                     tzinfo=ZoneInfo(timezone_name)
                 ).astimezone(UTC)
@@ -463,9 +490,9 @@ def interpret_response(
                 raise ValueError("reschedule intent needs exactly one time target")
             due_at = None
             if isinstance(due_local_value, str):
-                due_local = datetime.fromisoformat(due_local_value)
-                if due_local.tzinfo is not None and due_local.utcoffset() is not None:
-                    raise ValueError("provider returned an offset-bearing local datetime")
+                due_local = _provider_local_datetime(
+                    due_local_value, timezone_name=timezone_name
+                )
                 due_at = due_local.replace(tzinfo=ZoneInfo(timezone_name)).astimezone(UTC)
             reschedule_scope: RescheduleScope | None
             if scope_value is not None:
@@ -539,9 +566,9 @@ def interpret_response(
                 due_at = None
                 if has_absolute_time:
                     assert isinstance(due_local_value, str)
-                    due_local = datetime.fromisoformat(due_local_value)
-                    if due_local.tzinfo is not None and due_local.utcoffset() is not None:
-                        raise ValueError("provider returned an offset-bearing local datetime")
+                    due_local = _provider_local_datetime(
+                        due_local_value, timezone_name=timezone_name
+                    )
                     due_at = due_local.replace(tzinfo=ZoneInfo(timezone_name)).astimezone(UTC)
                 clarification_scope_with_time: RescheduleScope | None = None
                 if scope_value is not None:
@@ -734,9 +761,9 @@ def interpret_response(
             due_local_value = raw_intent.get("due_local")
             if not isinstance(task, str) or not isinstance(due_local_value, str):
                 raise ValueError("multiple reminder intent is missing fields")
-            due_local = datetime.fromisoformat(due_local_value)
-            if due_local.tzinfo is not None and due_local.utcoffset() is not None:
-                raise ValueError("provider returned an offset-bearing local datetime")
+            due_local = _provider_local_datetime(
+                due_local_value, timezone_name=timezone_name
+            )
             intents.append(
                 CreateOneTimeReminderIntent(
                     task=task,
@@ -785,7 +812,9 @@ def interpret_response(
         day_of_month = int(data["day_of_month"]) if data.get("day_of_month") is not None else None
         recurrence_month = int(data["month"]) if data.get("month") is not None else None
         if isinstance(start_local_value, str):
-            start_local = datetime.fromisoformat(start_local_value)
+            start_local = _provider_local_datetime(
+                start_local_value, timezone_name=timezone_name
+            )
         else:
             start_local = next_recurring_start_local(
                 frequency=frequency,
@@ -926,9 +955,7 @@ def interpret_response(
     due_local_value = data.get("due_local")
     if not isinstance(task, str) or not isinstance(due_local_value, str):
         raise ValueError("missing structured fields")
-    due_local = datetime.fromisoformat(due_local_value)
-    if due_local.tzinfo is not None and due_local.utcoffset() is not None:
-        raise ValueError("provider returned an offset-bearing local datetime")
+    due_local = _provider_local_datetime(due_local_value, timezone_name=timezone_name)
     one_time_intent = CreateOneTimeReminderIntent(
         task=task,
         due_at=due_local.replace(tzinfo=ZoneInfo(timezone_name)).astimezone(UTC),

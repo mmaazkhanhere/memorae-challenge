@@ -709,9 +709,13 @@ def prepare_reschedule(
             update_id=update_id,
             accepted=pending_proposal is not None,
         )
+    deterministic_reschedule_needs_fallback = (
+        isinstance(parsed_request, str)
+        or (isinstance(parsed_request, RescheduleRequest) and decision.kind == "RESPONSE")
+    )
     if (
         request_override is None
-        and isinstance(parsed_request, str)
+        and deterministic_reschedule_needs_fallback
         and not unsupported_cadence_change
         and reschedule_interpreter is not None
     ):

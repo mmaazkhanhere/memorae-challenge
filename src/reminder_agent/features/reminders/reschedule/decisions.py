@@ -7,6 +7,8 @@ ownership and state checks are repeated inside the write transaction.
 
 from __future__ import annotations
 
+import re
+from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -324,6 +326,15 @@ def decide_reschedule(
         occurrence_date=parsed.occurrence_date,
         timezone_name=timezone_name,
     )
+    if not candidates and re.fullmatch(
+        r"(?:it|that|this|the previous|the prior)\s+(?:reminder|one)?",
+        parsed.target_text.strip(),
+        re.IGNORECASE,
+    ):
+        all_candidates = find_all_candidates(db, user_id=user_id)
+        if len(all_candidates) == 1:
+            parsed = replace(parsed, target_text=all_candidates[0].task)
+            candidates = all_candidates
     if not candidates:
         return RescheduleDecision("RESPONSE", reschedule_message("no_matching_reminder"))
     if len(candidates) > 1:

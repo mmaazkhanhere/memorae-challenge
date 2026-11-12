@@ -29,6 +29,15 @@ _COMMAND_GREEDY = re.compile(
     r"(?P<separator>to|until|for)\s+(?P<when>.+?)\s*[.!?]*\s*$",
     re.IGNORECASE,
 )
+_OFFSET_COMMAND = re.compile(
+    r"^\s*(?:please\s+|can\s+you\s+|could\s+you\s+|actually,?\s+)?"
+    r"(?:move|reschedule|change|shift|push|postpone|delay|make)\s+(?:the\s+)?"
+    r"(?P<target>.+?)\s+(?:(?P<direction>back|forward|later|earlier)\s+by\s+"
+    r"(?P<article>an?\s+)?(?P<number>\d+)?\s*(?P<unit>minute|minutes|hour|hours|day|days)|"
+    r"(?P<number_before>\d+)\s*(?P<unit_before>minute|minutes|hour|hours|day|days)\s+"
+    r"(?P<direction_before>earlier|later))\s*[.!?]*\s*$",
+    re.IGNORECASE,
+)
 _INCOMPLETE_COMMAND = re.compile(
     r"^\s*(?:i\s+(?:want|need)\s+(?:you\s+to\s+)?|can\s+you\s+|could\s+you\s+)?"
     r"(?:please\s+)?(?:move|reschedule|change|shift|push|postpone|delay)\s+"
@@ -39,6 +48,23 @@ _WHEN = re.compile(
     r"^(?:(?P<day>today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
     r"\d{4}-\d{1,2}-\d{1,2})\s+)?(?:at\s+)?(?P<hour>\d{1,2})"
     r"(?::(?P<minute>\d{2}))?\s*(?P<meridiem>a\.?m\.?|p\.?m\.?|am|pm)?$",
+    re.IGNORECASE,
+)
+_DAY_PART = re.compile(
+    r"^(?:(?:on|for)\s+)?(?:next\s+)?(?P<day>today|tomorrow|monday|tuesday|wednesday|"
+    r"thursday|friday|saturday|sunday)\s+(?P<part>morning|afternoon|evening|tonight)$",
+    re.IGNORECASE,
+)
+_DATE_ONLY = re.compile(
+    r"^(?:(?:on|for)\s+)?(?:next\s+)?(?P<day>today|tomorrow|monday|tuesday|wednesday|"
+    r"thursday|friday|saturday|sunday|\d{4}-\d{1,2}-\d{1,2})$",
+    re.IGNORECASE,
+)
+_CONTEXTUAL_DATE_ONLY = re.compile(
+    r"\b(?:remind\s+me\s+about|move|shift|push|reschedule|change)\s+"
+    r"(?P<target>it|that\s+reminder|that\s+one)\s+"
+    r"(?:on\s+|for\s+)?(?P<day>today|tomorrow|monday|tuesday|wednesday|"
+    r"thursday|friday|saturday|sunday)(?:\s+instead)?\b",
     re.IGNORECASE,
 )
 _OLD_TIME = re.compile(
@@ -198,14 +224,65 @@ def extract_target_and_occurrence(
     return " ".join(target.split()).strip(" .,!?"), scope, occurrence_date
 
 
+def _duration_minutes(number: int | None, unit: str) -> int:
+    count = number or 1
+    normalized = unit.lower()
+    multiplier = 60 if normalized.startswith("hour") else 1440 if normalized.startswith("day") else 1
+    return count * multiplier
+
+
 def parse_reschedule_request(
     text: str, *, timezone_name: str, now: datetime
 ) -> RescheduleRequest | str:
     """Parse the deliberately small, unambiguous VS-09 command language."""
 
-    match = _COMMAND.match(text)
+    command_text = text
+    embedded_command = re.search(
+        r"\b(?:move|reschedule|change|shift|push|postpone|delay)\b", text, re.IGNORECASE
+    )
+    if embedded_command is not None and embedded_command.start() > 0:
+        command_text = text[embedded_command.start() :]
+
+    contextual_date = _CONTEXTUAL_DATE_ONLY.search(text)
+    if contextual_date is not None:
+        destination_date = parse_date(
+            contextual_date.group("day"), now=now, zone=ZoneInfo(timezone_name)
+        )
+        return RescheduleRequest(
+            target_text=contextual_date.group("target"),
+            date_explicit=True,
+            destination_date=destination_date,
+            source_text=text,
+        )
+
+    offset_match = _OFFSET_COMMAND.match(command_text)
+    if offset_match is not None:
+        target = " ".join(offset_match.group("target").split())
+        target = re.sub(r"^my\s+", "", target, flags=re.I)
+        target = re.sub(r"^(?:a\s+)?reminders?\s+to\s+", "", target, flags=re.I)
+        target, scope, occurrence_date = extract_target_and_occurrence(
+            target, timezone_name=timezone_name, now=now
+        )
+        if not target:
+            return reschedule_message("missing_reminder_target")
+        number = offset_match.group("number") or offset_match.group("number_before")
+        unit = offset_match.group("unit") or offset_match.group("unit_before")
+        direction = offset_match.group("direction") or offset_match.group("direction_before")
+        assert unit is not None and direction is not None
+        offset = _duration_minutes(int(number) if number else None, unit)
+        if direction.lower() in {"back", "earlier"}:
+            offset = -offset
+        return RescheduleRequest(
+            target_text=target,
+            offset_minutes=offset,
+            scope=scope,
+            occurrence_date=occurrence_date,
+            source_text=text,
+        )
+
+    match = _COMMAND.match(command_text)
     if match is None:
-        incomplete = _INCOMPLETE_COMMAND.match(text)
+        incomplete = _INCOMPLETE_COMMAND.match(command_text)
         if incomplete is None:
             return reschedule_message("missing_reminder_target")
         raw_target = " ".join(incomplete.group("target").split())
@@ -243,9 +320,31 @@ def parse_reschedule_request(
     if not target:
         return reschedule_message("missing_reminder_target")
 
-    when = _WHEN.match(match.group("when"))
+    when_text = " ".join(match.group("when").split())
+    day_part = _DAY_PART.match(when_text)
+    date_only = _DATE_ONLY.match(when_text)
+    if day_part is not None or date_only is not None:
+        day = (day_part or date_only).group("day")
+        try:
+            destination_date = parse_date(day, now=now, zone=ZoneInfo(timezone_name))
+        except (TypeError, ValueError):
+            return "Please provide a valid future date."
+        return RescheduleRequest(
+            target_text=target,
+            date_explicit=True,
+            destination_date=destination_date,
+            scope=scope,
+            occurrence_date=occurrence_date,
+            destination_weekday=_DAY_INDEX.get(day.lower()),
+            source_text=text,
+        )
+    when = _WHEN.match(when_text)
     if when is None:
-        fallback_match = _COMMAND_GREEDY.match(text)
+        # Use the embedded command rather than the full conversational prefix;
+        # otherwise the greedy separator can consume the wrong ``to`` in
+        # requests such as "I'm busy ... shift my reminder to send the invoice
+        # to tomorrow at 11".
+        fallback_match = _COMMAND_GREEDY.match(command_text)
         if fallback_match is not None:
             fallback_when = _WHEN.match(fallback_match.group("when"))
             if fallback_when is not None:
