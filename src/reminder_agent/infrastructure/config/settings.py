@@ -6,6 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    app_env: str = "production"
     database_url: str = "sqlite:///./memorae.db"
     telegram_bot_token: str = ""
     telegram_webhook_secret: str = Field(default="change-me", min_length=1)
@@ -81,7 +82,7 @@ class Settings(BaseSettings):
 
 def validate_runtime_settings(settings: Settings, *, allow_local_database: bool = False) -> None:
     """Reject unsafe production settings while preserving local/test mode."""
-    if allow_local_database:
+    if allow_local_database or settings.app_env.casefold() in {"development", "test"}:
         return
 
     errors: list[str] = []

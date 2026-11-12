@@ -6,26 +6,23 @@ VS-03 and VS-07 implement Telegram onboarding, verified phone linking, one-time 
 weekly recurring reminders
 with FastAPI, SQLAlchemy, Alembic, and PostgreSQL.
 
-```powershell
-uv sync --extra test
-docker compose up -d postgres
-docker compose --profile test up -d postgres-test
-$env:DATABASE_URL = "postgresql+psycopg://memorae:memorae@localhost:5433/memorae"
-$env:TEST_DATABASE_URL = "postgresql+psycopg://memorae:memorae@localhost:5434/memorae_test"
-uv run alembic upgrade head
-uv run uvicorn reminder_agent.application.main:app --reload
-# In a second process:
-uv run reminder-worker
-```
-
-For a supervised two-process local deployment, copy `.env.example` to `.env`, then run:
+The full local stack (PostgreSQL, migrations, API, and worker) starts with one command:
 
 ```powershell
-docker compose up -d
+docker compose up --build
 ```
+
+`docker compose up` also works after the first build. Compose loads `.env.example` by
+default and optionally overlays a local, untracked `.env`; copying the example is not
+required. The API is exposed on port 8000 and the worker has no public port. The example
+configuration keeps semantic embeddings disabled and does not require provider credentials
+for local startup; configure real Telegram, LLM, and STT credentials before using those
+integrations.
+
+The same startup path is available through `make run`.
 
 Compose runs migrations once, then supervises the API and `reminder-worker` as separate services
-with independent restart policies. The API is exposed on port 8000; the worker has no public port.
+with independent restart policies.
 
 ### Development and production databases
 
@@ -37,8 +34,8 @@ Railway variables. Do not put the Neon URL in the local `.env` or run production
 against the local database. Apply migrations from the production environment with
 `uv run alembic upgrade head` before starting the production API and worker.
 
-Copy `.env.example` to `.env` and configure `TELEGRAM_BOT_TOKEN` and
-`TELEGRAM_WEBHOOK_SECRET`. `PHONE_DEFAULT_REGION` is only a deployment-wide
+For a real Telegram deployment, copy `.env.example` to `.env` and configure
+`TELEGRAM_BOT_TOKEN` and `TELEGRAM_WEBHOOK_SECRET`. `PHONE_DEFAULT_REGION` is only a deployment-wide
 fallback; in a multi-country deployment, users with local-format contacts can
 set their own region with `/phone_region XX`. Set the Telegram webhook to
 `POST /webhook/telegram` with the same secret token.

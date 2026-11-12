@@ -34,10 +34,15 @@ services:
 
   migrate:
     build: .
-    env_file: .env
+    env_file:
+      - path: .env.example
+        required: true
+      - path: .env
+        required: false
     environment:
+      APP_ENV: development
       DATABASE_URL: postgresql+psycopg://memorae:memorae@postgres:5432/memorae
-    command: ["uv", "run", "alembic", "upgrade", "head"]
+    command: ["uv", "run", "--no-dev", "alembic", "upgrade", "head"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -45,11 +50,16 @@ services:
 
   api:
     build: .
-    env_file: .env
+    env_file:
+      - path: .env.example
+        required: true
+      - path: .env
+        required: false
     environment:
+      APP_ENV: development
       DATABASE_URL: postgresql+psycopg://memorae:memorae@postgres:5432/memorae
     command:
-      ["uv", "run", "uvicorn", "reminder_agent.application.main:app", "--host", "0.0.0.0", "--port", "8000"]
+      ["uv", "run", "--no-dev", "uvicorn", "reminder_agent.application.main:app", "--host", "0.0.0.0", "--port", "8000"]
     ports:
       - "8000:8000"
     depends_on:
@@ -65,10 +75,15 @@ services:
 
   worker:
     build: .
-    env_file: .env
+    env_file:
+      - path: .env.example
+        required: true
+      - path: .env
+        required: false
     environment:
+      APP_ENV: development
       DATABASE_URL: postgresql+psycopg://memorae:memorae@postgres:5432/memorae
-    command: ["uv", "run", "reminder-worker"]
+    command: ["uv", "run", "--no-dev", "reminder-worker"]
     depends_on:
       migrate:
         condition: service_completed_successfully
