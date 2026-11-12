@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
@@ -27,15 +28,34 @@ class OpenAICompatibleLLMClient:
         self.timeout_seconds = timeout_seconds
 
     def complete(self, payload: dict[str, Any]) -> tuple[dict[str, Any], Any]:
-        response = httpx.post(
-            self.url,
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            json=payload,
-            timeout=self.timeout_seconds,
-        )
-        response.raise_for_status()
-        response_payload: dict[str, Any] = response.json()
-        return response_payload, response_payload["choices"][0]["message"]["content"]
+        for attempt in range(3):
+            try:
+                response = httpx.post(
+                    self.url,
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    json=payload,
+                    timeout=self.timeout_seconds,
+                )
+            except (httpx.ConnectError, httpx.ReadTimeout):
+                if attempt == 2:
+                    raise
+                time.sleep(0.25 * (2**attempt))
+                continue
+            status_code = getattr(response, "status_code", 200)
+            if status_code == 429 or status_code >= 500:
+                if attempt == 2:
+                    response.raise_for_status()
+                retry_after = response.headers.get("retry-after")
+                try:
+                    delay = min(float(retry_after), 2.0) if retry_after else 0.25 * (2**attempt)
+                except ValueError:
+                    delay = 0.25 * (2**attempt)
+                time.sleep(delay)
+                continue
+            response.raise_for_status()
+            response_payload: dict[str, Any] = response.json()
+            return response_payload, response_payload["choices"][0]["message"]["content"]
+        raise RuntimeError("LLM request retry loop exited unexpectedly")
 
 
 def supports_strict_json_schema(base_url: str, model: str) -> bool:
