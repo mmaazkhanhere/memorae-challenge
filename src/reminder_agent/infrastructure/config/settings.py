@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     vapi_webhook_bearer_token: str = ""
     vapi_call_authorization_ttl_seconds: int = Field(default=3600, ge=60, le=86400)
     vapi_assistant_name: str = "Memorae"
+    vapi_public_phone_number: str = ""
     vapi_assistant_first_message: str = "Hi, you're connected to Memorae. How can I help?"
     vapi_assistant_system_prompt: str = (
         "You are Memorae's voice assistant. Greet the caller briefly and keep responses "

@@ -47,6 +47,11 @@ ONBOARDING_MESSAGES: dict[str, list[str]] = {
         "One more thing, if you'd like! You can talk to me over the phone too. Just share your number using the button below, or skip for now.",
         "Prefer talking sometimes? 📞 Link your number and we can pick up on a phone call with the same reminders and memories. Totally optional!",
     ],
+    "phone_link_prompt_with_number": [
+        "I'd love to hear from you by phone too! Tap Share my phone number so I can link your account. Once linked, call me at {call_number}.",
+        "Want to talk instead of type sometimes? Share your number with the button below, then call Memorae at {call_number} whenever you need me.",
+        "Phone calls are ready when you are. Share your own number using the button below, and you can reach Memorae at {call_number}.",
+    ],
     "phone_link_skipped": [
         "Of course! We can stick to Telegram for now. You can connect your phone whenever you feel like it. Try saying 'Remind me to stretch in 5 minutes.'",
         "Sounds good! No phone needed. I'm right here whenever you've got something to remember. Try saying 'Remind me to stretch in 5 minutes.'",
@@ -151,7 +156,9 @@ def phone_already_linked() -> str:
     return render_message("phone_already_linked")
 
 
-def phone_link_prompt() -> str:
+def phone_link_prompt(public_phone_number: str | None = None) -> str:
+    if public_phone_number:
+        return render_message("phone_link_prompt_with_number", call_number=public_phone_number)
     return render_message("phone_link_prompt")
 
 

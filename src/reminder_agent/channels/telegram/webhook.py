@@ -239,6 +239,7 @@ def telegram_webhook(
                 db,
                 onboarding_request,
                 default_region=request.app.state.settings.phone_default_region,
+                public_phone_number=request.app.state.settings.vapi_public_phone_number,
                 now=request.app.state.clock(),
             )
             if onboarding_request is not None

@@ -371,6 +371,7 @@ def handle_onboarding_request(
     request: OnboardingRequest,
     *,
     default_region: str | None = None,
+    public_phone_number: str | None = None,
     now: datetime | None = None,
 ) -> OutboundResponse | None:
     """Process one normalized onboarding request.
@@ -438,7 +439,7 @@ def handle_onboarding_request(
                 request=request,
                 user_id=user.id,
                 operation="PHONE_LINK_PROMPT",
-                text=messages.phone_link_prompt(),
+                text=messages.phone_link_prompt(public_phone_number),
                 presentation_hint="PHONE_CONTACT_REQUEST",
                 now=handled_at,
             )
