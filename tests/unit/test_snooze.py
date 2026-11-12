@@ -1,29 +1,28 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import httpx
 
-from reminder_agent.db.models import (
+from reminder_agent.application.conversation_coordinator import _route_and_interpret
+from reminder_agent.features.intent import (
+    IntentRoute,
+    IntentRouteSuggestion,
+    Interpretation,
+    OpenAICompatibleIntentInterpreter,
+)
+from reminder_agent.features.reminders.snooze import (
+    parse_snooze_duration,
+    snooze_occurrence,
+    snooze_target_text,
+)
+from reminder_agent.infrastructure.database.models import (
     ChannelIdentity,
     Notification,
     Reminder,
     ReminderOccurrence,
     User,
 )
-from reminder_agent.snooze import (
-    parse_snooze_duration,
-    snooze_occurrence,
-    snooze_target_text,
-)
-from reminder_agent.intent import (
-    IntentRoute,
-    IntentRouteSuggestion,
-    Interpretation,
-    OpenAICompatibleIntentInterpreter,
-)
-from reminder_agent.reminders import _route_and_interpret
 
-
-NOW = datetime(2026, 10, 30, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
 
 
 def _seed(db, *, recurring: bool = False):
@@ -45,9 +44,7 @@ def _seed(db, *, recurring: bool = False):
         schedule_type="RECURRING" if recurring else "ONE_TIME",
         start_local="2026-11-03T12:00:00",
         timezone="UTC",
-        recurrence_rule="FREQ=WEEKLY;BYDAY=TU;BYHOUR=12;BYMINUTE=00"
-        if recurring
-        else None,
+        recurrence_rule="FREQ=WEEKLY;BYDAY=TU;BYHOUR=12;BYMINUTE=00" if recurring else None,
     )
     db.add(reminder)
     db.flush()
@@ -84,6 +81,7 @@ def test_parse_snooze_duration_accepts_explicit_positive_relative_durations():
 def test_parse_snooze_duration_rejects_non_positive_or_ambiguous_values():
     assert parse_snooze_duration("0 minutes") is None
     assert parse_snooze_duration("-10 minutes") is None
+    assert parse_snooze_duration("snooze -5 minutes") is None
     assert parse_snooze_duration("snooze") is None
     assert parse_snooze_duration("tomorrow at 10") is None
 
@@ -114,14 +112,14 @@ def test_snooze_stages_one_new_notification_without_creating_occurrence(db):
         .all()
     )
     assert occurrence.status == "PENDING"
-    assert occurrence.next_due_at.replace(tzinfo=timezone.utc) == NOW + timedelta(minutes=10)
+    assert occurrence.next_due_at.replace(tzinfo=UTC) == NOW + timedelta(minutes=10)
     assert reminder.status == "ACTIVE"
     assert len(notifications) == 2
     assert notifications[0].status == "SENT"
     assert notifications[0].provider_message_id == "777"
     assert notifications[1].status == "PENDING"
     assert notifications[1].sequence == 2
-    assert notifications[1].due_at.replace(tzinfo=timezone.utc) == NOW + timedelta(minutes=10)
+    assert notifications[1].due_at.replace(tzinfo=UTC) == NOW + timedelta(minutes=10)
 
 
 def test_snooze_recurring_occurrence_does_not_change_series_schedule(db):
@@ -215,7 +213,7 @@ def test_deterministic_snooze_duration_does_not_call_classifier_or_external_extr
         def interpret(self, *args, **kwargs):  # pragma: no cover - assertion below
             raise AssertionError("complete snooze duration must not call the extractor")
 
-    from reminder_agent.intent import ReminderIntentInterpreter
+    from reminder_agent.features.intent import ReminderIntentInterpreter
 
     route, result = _route_and_interpret(
         ReminderIntentInterpreter(FailingExtractor()),

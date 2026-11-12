@@ -1,23 +1,29 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
 
-from reminder_agent.rescheduling import (
+from reminder_agent.features.reminders.reschedule.candidates import (
+    _candidate_match,
+    select_pending_candidate_ids,
+)
+from reminder_agent.features.reminders.reschedule.decisions import (
+    PendingReschedule,
     PendingRescheduleOperation,
     PendingRescheduleProposal,
-    RescheduleScope,
-    RescheduleRequest,
     RescheduleCandidate,
-    PendingReschedule,
+    RescheduleRequest,
+    RescheduleScope,
     _resolve_candidate_due,
     apply_pending_reschedule_proposal,
     parse_reschedule_request,
-    select_pending_candidate_ids,
 )
 
 
-NOW = datetime(2026, 10, 30, 12, 0, tzinfo=timezone.utc)
+def test_reschedule_matching_normalizes_simple_verb_forms() -> None:
+    assert _candidate_match("dentist booking appointment", "book dentist appointment")
+
+NOW = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
 
 
 def test_parse_reschedule_request_resolves_explicit_local_time() -> None:
@@ -29,7 +35,7 @@ def test_parse_reschedule_request_resolves_explicit_local_time() -> None:
 
     assert isinstance(result, RescheduleRequest)
     assert result.target_text == "bank reminder"
-    assert result.due_at == datetime(2026, 10, 31, 10, 0, tzinfo=timezone.utc)
+    assert result.due_at == datetime(2026, 10, 31, 10, 0, tzinfo=UTC)
     assert result.date_explicit is True
 
 
@@ -56,7 +62,7 @@ def test_time_only_reschedule_preserves_selected_candidate_local_date() -> None:
         reminder_id=uuid4(),
         occurrence_id=uuid4(),
         task="call John",
-        due_at=datetime(2026, 10, 31, 9, 0, tzinfo=timezone.utc),
+        due_at=datetime(2026, 10, 31, 9, 0, tzinfo=UTC),
         schedule_type="ONE_TIME",
     )
 
@@ -68,13 +74,13 @@ def test_time_only_reschedule_preserves_selected_candidate_local_date() -> None:
 
     resolved = _resolve_candidate_due(request, candidate, timezone_name="UTC")
 
-    assert resolved.due_at == datetime(2026, 10, 31, 18, 0, tzinfo=timezone.utc)
+    assert resolved.due_at == datetime(2026, 10, 31, 18, 0, tzinfo=UTC)
 
 
 def test_pending_parameter_proposal_preserves_explicit_date_semantics() -> None:
     pending = PendingReschedule(
         target_text="call John",
-        due_at=datetime(2026, 10, 31, 18, 0, tzinfo=timezone.utc),
+        due_at=datetime(2026, 10, 31, 18, 0, tzinfo=UTC),
         date_explicit=True,
         candidate_ids=(uuid4(),),
         timezone_name="UTC",
@@ -84,7 +90,7 @@ def test_pending_parameter_proposal_preserves_explicit_date_semantics() -> None:
         pending,
         PendingRescheduleProposal(
             operation=PendingRescheduleOperation.UPDATE_PENDING_PARAMETERS,
-            due_at=datetime(2026, 10, 30, 19, 0, tzinfo=timezone.utc),
+            due_at=datetime(2026, 10, 30, 19, 0, tzinfo=UTC),
             date_explicit=False,
         ),
         timezone_name="UTC",
@@ -93,33 +99,39 @@ def test_pending_parameter_proposal_preserves_explicit_date_semantics() -> None:
         time_only,
         PendingRescheduleProposal(
             operation=PendingRescheduleOperation.UPDATE_PENDING_PARAMETERS,
-            destination_date=datetime(2026, 11, 1, tzinfo=timezone.utc).date(),
+            destination_date=datetime(2026, 11, 1, tzinfo=UTC).date(),
         ),
         timezone_name="UTC",
     )
 
     assert time_only.date_explicit is False
-    assert tomorrow.due_at == datetime(2026, 11, 1, 19, 0, tzinfo=timezone.utc)
+    assert tomorrow.due_at == datetime(2026, 11, 1, 19, 0, tzinfo=UTC)
     assert tomorrow.date_explicit is True
 
 
 def test_pending_candidate_selection_prioritizes_clock_and_day_before_ordinal(monkeypatch) -> None:
     first_id, second_id, third_id = uuid4(), uuid4(), uuid4()
     candidates = [
-        RescheduleCandidate(first_id, uuid4(), "call John", datetime(2026, 10, 30, 16, tzinfo=timezone.utc), "ONE_TIME"),
-        RescheduleCandidate(second_id, uuid4(), "call John", datetime(2026, 10, 31, 9, tzinfo=timezone.utc), "ONE_TIME"),
-        RescheduleCandidate(third_id, uuid4(), "call John", datetime(2026, 11, 2, 9, tzinfo=timezone.utc), "ONE_TIME"),
+        RescheduleCandidate(
+            first_id, uuid4(), "call John", datetime(2026, 10, 30, 16, tzinfo=UTC), "ONE_TIME"
+        ),
+        RescheduleCandidate(
+            second_id, uuid4(), "call John", datetime(2026, 10, 31, 9, tzinfo=UTC), "ONE_TIME"
+        ),
+        RescheduleCandidate(
+            third_id, uuid4(), "call John", datetime(2026, 11, 2, 9, tzinfo=UTC), "ONE_TIME"
+        ),
     ]
 
     pending = PendingReschedule(
         target_text="call John",
-        due_at=datetime(2026, 10, 30, 18, tzinfo=timezone.utc),
+        due_at=datetime(2026, 10, 30, 18, tzinfo=UTC),
         candidate_ids=(first_id, second_id, third_id),
         timezone_name="UTC",
     )
 
     monkeypatch.setattr(
-        "reminder_agent.rescheduling.find_candidates",
+        "reminder_agent.features.reminders.reschedule.candidates.find_candidates",
         lambda db, user_id, target_text: candidates,
     )
     assert select_pending_candidate_ids(
@@ -174,18 +186,37 @@ def test_parse_recurring_occurrence_selector_is_not_part_of_task_target() -> Non
 @pytest.mark.parametrize(
     ("text", "target", "scope", "occurrence_date"),
     [
-        ("Move Friday's exercise occurrence to 7 PM", "exercise", RescheduleScope.OCCURRENCE, "2026-11-06"),
-        ("Move all future exercise reminders to 10 AM", "all future exercise reminders", RescheduleScope.SERIES, None),
-        ("Move the next occurrence exercise reminder to 11 AM", "exercise reminder", RescheduleScope.OCCURRENCE, None),
+        (
+            "Move Friday's exercise occurrence to 7 PM",
+            "exercise",
+            RescheduleScope.OCCURRENCE,
+            "2026-11-06",
+        ),
+        (
+            "Move all future exercise reminders to 10 AM",
+            "all future exercise reminders",
+            RescheduleScope.SERIES,
+            None,
+        ),
+        (
+            "Move the next occurrence exercise reminder to 11 AM",
+            "exercise reminder",
+            RescheduleScope.OCCURRENCE,
+            None,
+        ),
     ],
 )
-def test_parse_recurring_scope_and_occurrence_selection(text, target, scope, occurrence_date) -> None:
+def test_parse_recurring_scope_and_occurrence_selection(
+    text, target, scope, occurrence_date
+) -> None:
     result = parse_reschedule_request(text, timezone_name="UTC", now=NOW)
 
     assert isinstance(result, RescheduleRequest)
     assert result.target_text == target
     assert result.scope is scope
-    assert (result.occurrence_date.isoformat() if result.occurrence_date else None) == occurrence_date
+    assert (
+        result.occurrence_date.isoformat() if result.occurrence_date else None
+    ) == occurrence_date
 
 
 def test_parse_reschedule_request_requires_am_pm_for_ambiguous_clock() -> None:
@@ -242,7 +273,7 @@ def test_relative_offset_is_resolved_from_the_selected_candidate_due_time() -> N
         reminder_id=uuid4(),
         occurrence_id=uuid4(),
         task="call the bank",
-        due_at=datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc),
+        due_at=datetime(2026, 10, 31, 12, 0, tzinfo=UTC),
         schedule_type="ONE_TIME",
     )
 
@@ -250,7 +281,7 @@ def test_relative_offset_is_resolved_from_the_selected_candidate_due_time() -> N
         RescheduleRequest(target_text="bank", offset_minutes=-120), candidate
     )
 
-    assert resolved.due_at == datetime(2026, 10, 31, 10, 0, tzinfo=timezone.utc)
+    assert resolved.due_at == datetime(2026, 10, 31, 10, 0, tzinfo=UTC)
     assert resolved.offset_minutes is None
 
 
@@ -266,6 +297,6 @@ def test_pending_reschedule_requires_one_time_target() -> None:
     with pytest.raises(ValueError, match="both absolute and relative targets"):
         PendingReschedule(
             **common,
-            due_at=datetime(2026, 10, 31, 10, 0, tzinfo=timezone.utc),
+            due_at=datetime(2026, 10, 31, 10, 0, tzinfo=UTC),
             offset_minutes=120,
         )

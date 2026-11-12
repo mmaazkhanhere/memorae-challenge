@@ -1,10 +1,9 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 
-from reminder_agent.db.models import Notification, Reminder, ReminderOccurrence
-from reminder_agent.worker import NotificationWorker
-
+from reminder_agent.infrastructure.database.models import Notification, Reminder, ReminderOccurrence
+from reminder_agent.infrastructure.runtime.worker import NotificationWorker
 
 HEADERS = {"X-Telegram-Bot-Api-Secret-Token": "test-secret"}
 
@@ -26,7 +25,7 @@ def test_recurring_telegram_reminder_survives_creation_and_delivers_its_first_in
     assert _post_update(
         api_client, update_factory(3, text="Remind me every Monday at 8 AM to call the bank.")
     ).json() == {"ok": True}
-    assert "every Mon at 08:00 Asia/Karachi via Telegram" in telegram_client.messages[-1][1]
+    assert "every Monday at 8:00 AM PKT on Telegram" in telegram_client.messages[-1][1]
 
     reminder = db.scalar(select(Reminder))
     assert reminder is not None
@@ -41,7 +40,7 @@ def test_recurring_telegram_reminder_survives_creation_and_delivers_its_first_in
     worker = NotificationWorker(
         session_factory,
         telegram_client,
-        clock=lambda: datetime(2026, 11, 2, 3, 0, 1, tzinfo=timezone.utc),
+        clock=lambda: datetime(2026, 11, 2, 3, 0, 1, tzinfo=UTC),
     )
     assert worker.run_once() == 1
 

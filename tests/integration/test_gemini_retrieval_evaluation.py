@@ -14,10 +14,9 @@ from statistics import mean, median
 
 import pytest
 
-from reminder_agent.embeddings import GeminiEmbeddingProvider
-from reminder_agent.memories import _lookup_tokens
-from reminder_agent.settings import Settings
-
+from reminder_agent.shared.memory_contracts import _lookup_tokens
+from reminder_agent.infrastructure.providers.embeddings import GeminiEmbeddingProvider
+from reminder_agent.infrastructure.config.settings import Settings
 
 DOCUMENTS = {
     "parking_b17": "my parking slot is B17",
@@ -161,9 +160,7 @@ def _lexical_ranked(subject: str) -> list[tuple[str, float]]:
     return sorted(ranked, key=lambda item: (-item[1], item[0]))
 
 
-def _recall_at_k(
-    cases: list[tuple[str, list[tuple[str, float]]]], k: int
-) -> int:
+def _recall_at_k(cases: list[tuple[str, list[tuple[str, float]]]], k: int) -> int:
     return sum(expected in {label for label, _ in ranked[:k]} for expected, ranked in cases)
 
 
@@ -265,7 +262,10 @@ def test_live_gemini_retrieval_evaluation_dataset() -> None:
         for expected_label, query, subject in POSITIVE_CASES:
             query_vector = vectors[query if representation == "full" else subject]
             ranked = sorted(
-                ((label, _cosine(query_vector, vector)) for label, vector in document_vectors.items()),
+                (
+                    (label, _cosine(query_vector, vector))
+                    for label, vector in document_vectors.items()
+                ),
                 key=lambda item: (-item[1], item[0]),
             )
             status, selected, _ = _classify(ranked, threshold=threshold, margin=margin)
@@ -301,8 +301,7 @@ def test_live_gemini_retrieval_evaluation_dataset() -> None:
         for expected_label, query, _ in POSITIVE_CASES
     ]
     lexical_rankings = [
-        (expected_label, _lexical_ranked(subject))
-        for expected_label, _, subject in POSITIVE_CASES
+        (expected_label, _lexical_ranked(subject)) for expected_label, _, subject in POSITIVE_CASES
     ]
     combined_rankings = []
     for (expected_label, lexical_ranked), (_, vector_ranked) in zip(
@@ -322,8 +321,7 @@ def test_live_gemini_retrieval_evaluation_dataset() -> None:
             "recall_at_3": _recall_at_k(rankings, 3),
             "recall_at_5": _recall_at_k(rankings, 5),
             "candidate_miss_count": sum(
-                expected not in {label for label, _ in ranked[:5]}
-                for expected, ranked in rankings
+                expected not in {label for label, _ in ranked[:5]} for expected, ranked in rankings
             ),
         }
 
@@ -346,7 +344,7 @@ def test_live_gemini_retrieval_evaluation_dataset() -> None:
     negative_status_counts: dict[str, int] = {}
     negative_scores: list[float] = []
     negative_rankings: list[list[tuple[str, float]]] = []
-    for query, query_vector in negative_queries.items():
+    for _query, query_vector in negative_queries.items():
         ranked = sorted(
             ((label, _cosine(query_vector, vector)) for label, vector in document_vectors.items()),
             key=lambda item: (-item[1], item[0]),
@@ -359,7 +357,10 @@ def test_live_gemini_retrieval_evaluation_dataset() -> None:
     conflict_results = []
     for conflict_label, query in CONFLICT_CASES:
         ranked = sorted(
-            ((label, _cosine(conflict_queries[query], vector)) for label, vector in document_vectors.items()),
+            (
+                (label, _cosine(conflict_queries[query], vector))
+                for label, vector in document_vectors.items()
+            ),
             key=lambda item: (-item[1], item[0]),
         )
         status, _, plausible = _classify(ranked, threshold=threshold, margin=margin)
@@ -394,7 +395,10 @@ def test_live_gemini_retrieval_evaluation_dataset() -> None:
         for expected_label, query, subject in POSITIVE_CASES:
             query_vector = vectors[query if representation == "full" else subject]
             ranked = sorted(
-                ((label, _cosine(query_vector, vector)) for label, vector in document_vectors.items()),
+                (
+                    (label, _cosine(query_vector, vector))
+                    for label, vector in document_vectors.items()
+                ),
                 key=lambda item: (-item[1], item[0]),
             )
             positive_rankings.append((expected_label, ranked))

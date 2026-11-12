@@ -3,7 +3,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from reminder_agent.transcription import (
+from reminder_agent.infrastructure.providers.transcription import (
     GroqWhisperTranscriber,
     TranscriptionError,
     is_ogg_voice_note,
@@ -37,9 +37,9 @@ def test_transcriber_posts_multipart_and_returns_text(monkeypatch) -> None:
         return Response()
 
     monkeypatch.setattr(httpx, "post", fake_post)
-    result = GroqWhisperTranscriber(
-        "https://stt.example/v1", "key", "whisper", 5
-    ).transcribe(b"OggS-audio", filename="voice.ogg", media_type="audio/ogg")
+    result = GroqWhisperTranscriber("https://stt.example/v1", "key", "whisper", 5).transcribe(
+        b"OggS-audio", filename="voice.ogg", media_type="audio/ogg"
+    )
 
     assert result.text == "Remind me tomorrow at nine to call the bank"
     assert captured["url"] == "https://stt.example/v1/audio/transcriptions"

@@ -2,17 +2,19 @@ from datetime import date
 
 import pytest
 
-from reminder_agent.conversation_router import (
+from reminder_agent.features.intent import PendingReminder
+from reminder_agent.features.intent.deterministic.routing import (
     ConversationRoute,
     is_completion_command,
+    is_list_request_command,
     is_memory_lookup_command,
     is_memory_save_command,
-    is_list_request_command,
+    is_reminder_status_question,
     is_summary_request_command,
     route_message,
     social_response,
 )
-from reminder_agent.intent import PendingReminder
+from reminder_agent.features.intent.messages import GENERAL_MESSAGES
 
 
 def _pending(*, task: str | None = "call the bank") -> PendingReminder:
@@ -37,6 +39,12 @@ def test_router_classifies_pending_conversation_before_parsing() -> None:
     assert route_message("thanks", pending=pending).route is ConversationRoute.SOCIAL
 
 
+def test_router_recognizes_also_remind_me_as_a_new_request() -> None:
+    assert route_message(
+        "Also remind me tomorrow at 2 to email the client", pending=None
+    ).route is ConversationRoute.NEW_REQUEST
+
+
 def test_router_recognizes_read_only_listing_with_or_without_pending_draft() -> None:
     for text in ("What do I have tomorrow?", "What reminders do I have tomorrow?"):
         assert route_message(text, pending=None).route is ConversationRoute.LIST_REQUEST
@@ -44,8 +52,14 @@ def test_router_recognizes_read_only_listing_with_or_without_pending_draft() -> 
 
 
 def test_router_recognizes_recurring_reminder_list_requests() -> None:
-    assert route_message("can you show me all the recurring reminders?", pending=None).route == ConversationRoute.LIST_REQUEST
-    assert route_message("what do i have on every Tuesday?", pending=None).route == ConversationRoute.LIST_REQUEST
+    assert (
+        route_message("can you show me all the recurring reminders?", pending=None).route
+        == ConversationRoute.LIST_REQUEST
+    )
+    assert (
+        route_message("what do i have on every Tuesday?", pending=None).route
+        == ConversationRoute.LIST_REQUEST
+    )
     assert route_message("Show my reminders this week", pending=_pending()).route is (
         ConversationRoute.LIST_REQUEST
     )
@@ -69,9 +83,18 @@ def test_router_recognizes_progress_questions() -> None:
         assert route_message(text, pending=None).route is ConversationRoute.SUMMARY_REQUEST
         assert route_message(text, pending=_pending()).route is ConversationRoute.SUMMARY_REQUEST
 
+    assert route_message('"How many reminders do I have pending?"', pending=None).route is (
+        ConversationRoute.SUMMARY_REQUEST
+    )
+
 
 def test_router_recognizes_explicit_cancellation_requests() -> None:
-    assert route_message("Cancel the standup", pending=None).route is ConversationRoute.CANCEL_REQUEST
+    for text in (
+        "Cancel the standup",
+        "Could you please cancel all my reminders for tomorrow?",
+        "I would like to cancel all reminders on Friday",
+    ):
+        assert route_message(text, pending=None).route is ConversationRoute.CANCEL_REQUEST
     assert route_message("Cancel only tomorrow's standup", pending=_pending()).route is (
         ConversationRoute.CANCEL_REQUEST
     )
@@ -82,6 +105,11 @@ def test_router_recognizes_completion_without_invoking_reminder_creation() -> No
         assert is_completion_command(text) is True
         assert route_message(text, pending=None).route is ConversationRoute.COMPLETE_REQUEST
     assert is_completion_command("Remind me to mark the task done") is False
+
+
+def test_router_recognizes_replied_reminder_status_question() -> None:
+    assert is_reminder_status_question("Will you still remind me next Monday?") is True
+    assert is_reminder_status_question("remind me next Monday") is False
 
 
 def test_router_does_not_start_a_reminder_from_unrelated_text() -> None:
@@ -98,9 +126,7 @@ def test_router_recognizes_explicit_memory_save_deterministically() -> None:
         "Take note of my backup email",
     ):
         assert is_memory_save_command(text) is True
-        assert route_message(text, pending=None).route is (
-            ConversationRoute.SAVE_MEMORY_REQUEST
-        )
+        assert route_message(text, pending=None).route is (ConversationRoute.SAVE_MEMORY_REQUEST)
 
 
 def test_router_recognizes_memory_lookup_without_model_fallback() -> None:
@@ -109,18 +135,71 @@ def test_router_recognizes_memory_lookup_without_model_fallback() -> None:
         assert route_message(text, pending=None).route is ConversationRoute.RETRIEVE_MEMORY_REQUEST
 
 
+def test_ambiguous_temporal_personal_question_uses_model_fallback() -> None:
+    assert route_message("When is my birthday?", pending=None).route is (
+        ConversationRoute.MODEL_FALLBACK
+    )
+
+
 @pytest.mark.parametrize(
     "text",
-    ["What's my reminder for tomorrow?", "What reminders do I have tomorrow?"],
+    [
+        "What's my reminder for tomorrow?",
+        "What reminders do I have tomorrow?",
+        "What's my next reminder?",
+        "What is my upcoming reminder?",
+    ],
 )
 def test_router_prefers_reminder_listing_over_memory_lookup_collision(text: str) -> None:
     assert route_message(text, pending=None).route is ConversationRoute.LIST_REQUEST
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Any reminders for Friday?",
+        "What's my next reminder to do?",
+        "Do I have any payment reminders?",
+        "Show reminders after 6 PM.",
+        "What do I have scheduled for next month?",
+        "Do I have any reminders on weekends?",
+    ],
+)
+def test_router_recognizes_rich_listing_questions(text: str) -> None:
+    assert route_message(text, pending=None).route is ConversationRoute.LIST_REQUEST
+
+
+def test_next_reminder_is_not_treated_as_a_memory_lookup() -> None:
+    assert is_memory_lookup_command("What's my next reminder?") is False
+
+
 def test_router_distinguishes_unambiguous_reminders_from_memory_facts() -> None:
-    assert route_message(
-        "Remember to call Ali tomorrow at 9 AM", pending=None
-    ).route is ConversationRoute.NEW_REQUEST
+    assert (
+        route_message("Remember to call Ali tomorrow at 9 AM", pending=None).route
+        is ConversationRoute.NEW_REQUEST
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Show me all my callreminders",
+        "What recurring reminders have I got?",
+        "Hey, what is on my reminder list for tomorrow?",
+        "Can you summarize what I need to remember this week?",
+        "and on Firday?",
+        "Summarize my weekly recurring reminders.",
+        "What's on my agenda for the weekend?",
+    ],
+)
+def test_router_keeps_natural_language_overviews_in_read_only_listing_scope(text: str) -> None:
+    assert route_message(text, pending=None).route is ConversationRoute.LIST_REQUEST
+
+
+def test_router_classifies_forgotten_reminder_question_as_a_summary() -> None:
+    assert route_message("anything, i forgot to take care of", pending=None).route is (
+        ConversationRoute.SUMMARY_REQUEST
+    )
     assert route_message("Remember to call Ali", pending=None).route is (
         ConversationRoute.NEW_REQUEST
     )
@@ -144,6 +223,98 @@ def test_router_defers_overlapping_or_ambiguous_creation_language() -> None:
         assert route_message(text, pending=None).route is ConversationRoute.MODEL_FALLBACK
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Remember the above",
+        "Remember this",
+        "Don't remember my gate code",
+        "Remember my gate code and remind me tomorrow at 9",
+        "Remind me tomorrow at 9 and save my gate code",
+        "Remind me about that tomorrow at 9",
+    ],
+)
+def test_router_defers_contextual_negated_and_mixed_creation_requests(text: str) -> None:
+    assert route_message(text, pending=None).route is ConversationRoute.MODEL_FALLBACK
+
+
+def test_router_does_not_treat_embedded_or_referential_memory_as_a_save() -> None:
+    assert route_message("Save Ali's number and remind me to call him", pending=None).route is (
+        ConversationRoute.MODEL_FALLBACK
+    )
+    assert route_message("Save Ali's number and set a reminder to call him", pending=None).route is (
+        ConversationRoute.MODEL_FALLBACK
+    )
+    assert route_message("Remember that I need a reminder to call Ali", pending=None).route is (
+        ConversationRoute.MODEL_FALLBACK
+    )
+    assert route_message("Save this as a reminder to call Ali", pending=None).route is (
+        ConversationRoute.NEW_REQUEST
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Remember this is important",
+        "Save this as a fact",
+        "Make a note of this is important",
+    ],
+)
+def test_router_defers_unresolved_memory_references_with_or_without_pending(text: str) -> None:
+    assert route_message(text, pending=None).route is ConversationRoute.MODEL_FALLBACK
+    assert route_message(text, pending=_pending()).route is ConversationRoute.MODEL_FALLBACK
+
+
+def test_router_preserves_clear_memory_reference_forms() -> None:
+    assert route_message(
+        "Remember this fact: my birthday is January 10", pending=None
+    ).route is ConversationRoute.SAVE_MEMORY_REQUEST
+    assert route_message(
+        "Remember this fact: my birthday is January 10", pending=_pending()
+    ).route is ConversationRoute.SAVE_MEMORY_REQUEST
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "I do not want a reminder to call Ali",
+        "I do not want you to save this",
+    ],
+)
+def test_router_defers_indirect_negations_instead_of_cancelling(text: str) -> None:
+    assert route_message(text, pending=None).route is ConversationRoute.MODEL_FALLBACK
+
+
+@pytest.mark.parametrize("text", ["Cancel this", "Cancel it"])
+def test_router_defers_contextual_cancellation_without_pending(text: str) -> None:
+    assert route_message(text, pending=None).route is ConversationRoute.MODEL_FALLBACK
+
+
+def test_router_keeps_pending_cancel_it_as_cancellation_but_not_cancel_this() -> None:
+    pending = _pending()
+    assert route_message("Cancel it", pending=pending).route is ConversationRoute.CANCELLATION
+    assert route_message("Cancel this", pending=pending).route is ConversationRoute.MODEL_FALLBACK
+
+
+def test_router_preserves_explicit_cancellation_target() -> None:
+    assert route_message("Cancel my dentist reminder", pending=None).route is (
+        ConversationRoute.CANCEL_REQUEST
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "What is the number of unfinished reminders?",
+        "How many reminders have I completed today?",
+        "What reminders do I still have to do today?",
+    ],
+)
+def test_router_prioritizes_summary_over_memory_lookup_collisions(text: str) -> None:
+    assert route_message(text, pending=None).route is ConversationRoute.SUMMARY_REQUEST
+
+
 def test_router_allows_free_text_only_when_the_task_is_missing() -> None:
     pending_without_task = _pending(task=None)
 
@@ -162,3 +333,29 @@ def test_router_keeps_greetings_and_thanks_deterministic_and_personalized() -> N
         "Hi Ada! What would you like me to remind you about?"
     )
     assert social_response("Thanks", user_name="Ada Lovelace") == "You're welcome."
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["What do you do?", "What can you help me with?", "How can you help me?"],
+)
+def test_router_handles_capability_questions_without_model_fallback(text: str) -> None:
+    assert route_message(text, pending=None).route is ConversationRoute.CAPABILITIES
+
+
+def test_general_responses_are_selected_from_the_configured_catalog() -> None:
+    assert social_response("What do you do?") in GENERAL_MESSAGES["capabilities"]
+    assert social_response("Hello") in GENERAL_MESSAGES["greeting"]
+    assert social_response("Thanks") in GENERAL_MESSAGES["thanks"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Hey, can you remind me in 5 minutes to check my email?",
+        "Can you remind me tomorrow at 9 AM to call the dentist?",
+        "Could you please remind me in an hour to review the report?",
+    ],
+)
+def test_polite_new_reminder_requests_override_pending_context(text: str) -> None:
+    assert route_message(text, pending=_pending()).route is ConversationRoute.NEW_REQUEST

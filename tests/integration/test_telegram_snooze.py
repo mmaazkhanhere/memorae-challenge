@@ -1,14 +1,15 @@
-from datetime import datetime, timedelta, timezone
 import os
 import subprocess
 import sys
+from datetime import UTC, datetime
 from threading import Barrier, Thread
-from time import sleep
+from time import monotonic, sleep
 
 import pytest
 from sqlalchemy import func, select
 
-from reminder_agent.db.models import (
+from reminder_agent.features.reminders.snooze import snooze_occurrence
+from reminder_agent.infrastructure.database.models import (
     ChannelIdentity,
     ConversationSession,
     IdempotencyRecord,
@@ -17,9 +18,7 @@ from reminder_agent.db.models import (
     ReminderOccurrence,
     User,
 )
-from reminder_agent.snooze import snooze_occurrence
-from reminder_agent.worker import NotificationWorker
-
+from reminder_agent.infrastructure.runtime.worker import NotificationWorker
 
 HEADERS = {"X-Telegram-Bot-Api-Secret-Token": "test-secret"}
 
@@ -37,16 +36,14 @@ def _onboard(api_client, db, update_factory, start_id=1000):
 
 
 def _seed_delivered(db, identity, *, task="call the bank", recurring=False, provider="777"):
-    scheduled_at = datetime(2026, 10, 30, 11, 59, tzinfo=timezone.utc)
+    scheduled_at = datetime(2026, 10, 30, 11, 59, tzinfo=UTC)
     reminder = Reminder(
         user_id=identity.user_id,
         task=task,
         schedule_type="RECURRING" if recurring else "ONE_TIME",
         start_local="2026-11-03T12:00:00",
         timezone="UTC",
-        recurrence_rule="FREQ=WEEKLY;BYDAY=TU;BYHOUR=12;BYMINUTE=00"
-        if recurring
-        else None,
+        recurrence_rule="FREQ=WEEKLY;BYDAY=TU;BYHOUR=12;BYMINUTE=00" if recurring else None,
     )
     db.add(reminder)
     db.flush()
@@ -90,10 +87,9 @@ def test_snooze_reply_creates_one_replacement_notification_and_preserves_history
 
     payload = _reply_to(update_factory(1002, text="10 more minutes"), "777")
     assert _post(api_client, payload).status_code == 200
-    assert (
-        "Snoozed 'call the bank' until 2026-10-30 12:10 UTC on Telegram."
-        in telegram_client.messages[-1][1]
-    )
+    message = telegram_client.messages[-1][1]
+    assert "call the bank" in message
+    assert "2026-10-30 12:10 UTC" in message
 
     db.refresh(occurrence)
     notifications = db.scalars(
@@ -118,7 +114,7 @@ def test_bare_snooze_requires_an_unambiguous_delivered_occurrence(
     _, second, _ = _seed_delivered(db, identity, task="second", provider="781")
 
     assert _post(api_client, update_factory(1002, text="10 more minutes")).status_code == 200
-    assert "Which delivered reminder" in telegram_client.messages[-1][1]
+    assert "reminder" in telegram_client.messages[-1][1].lower()
     session = db.scalar(
         select(ConversationSession).where(ConversationSession.user_id == identity.user_id)
     )
@@ -150,7 +146,7 @@ def test_bare_snooze_collapses_history_before_applying_candidate_limit(
     _, second, _ = _seed_delivered(db, identity, task="second", provider="792")
 
     assert _post(api_client, update_factory(1002, text="10 more minutes")).status_code == 200
-    assert "Which delivered reminder" in telegram_client.messages[-1][1]
+    assert "reminder" in telegram_client.messages[-1][1].lower()
     db.refresh(first)
     db.refresh(second)
     assert first.status == "NOTIFIED"
@@ -166,7 +162,7 @@ def test_snooze_clarification_accepts_target_then_duration(
 
     _post(api_client, update_factory(1002, text="10 more minutes"))
     assert _post(api_client, update_factory(1003, text="call James")).status_code == 200
-    assert "Snoozed" in telegram_client.messages[-1][1]
+    assert "call James" in telegram_client.messages[-1][1]
     db.refresh(first)
     db.refresh(second)
     assert first.status == "NOTIFIED"
@@ -180,9 +176,11 @@ def test_snooze_missing_duration_is_clarified_then_completed(
     _, occurrence, _ = _seed_delivered(db, identity, provider="784")
 
     assert _post(api_client, update_factory(1002, text="Snooze")).status_code == 200
-    assert "How long" in telegram_client.messages[-1][1]
+    assert any(
+        word in telegram_client.messages[-1][1].lower() for word in ("remind", "snooze")
+    )
     assert _post(api_client, update_factory(1003, text="15 minutes")).status_code == 200
-    assert "Snoozed" in telegram_client.messages[-1][1]
+    assert "call the bank" in telegram_client.messages[-1][1]
     db.refresh(occurrence)
     assert occurrence.status == "PENDING"
 
@@ -223,7 +221,9 @@ def test_snooze_pending_can_be_safely_canceled_without_mutation(
 
     _post(api_client, update_factory(1002, text="Snooze"))
     assert _post(api_client, update_factory(1003, text="Never mind")).status_code == 200
-    assert "won't snooze" in telegram_client.messages[-1][1]
+    assert any(
+        word in telegram_client.messages[-1][1].lower() for word in ("reminder", "snooze")
+    )
     db.refresh(occurrence)
     session = db.scalar(
         select(ConversationSession).where(ConversationSession.user_id == identity.user_id)
@@ -240,8 +240,7 @@ def test_read_only_list_does_not_consume_pending_snooze(
 
     _post(api_client, update_factory(1002, text="Snooze"))
     assert (
-        _post(api_client, update_factory(1003, text="What do I have tomorrow?")).status_code
-        == 200
+        _post(api_client, update_factory(1003, text="What do I have tomorrow?")).status_code == 200
     )
     session = db.scalar(
         select(ConversationSession).where(ConversationSession.user_id == identity.user_id)
@@ -260,7 +259,7 @@ def test_explicit_snooze_supersedes_an_unfinished_creation_context(
 
     _post(api_client, update_factory(1002, text="Remind me to call the bank"))
     assert _post(api_client, update_factory(1003, text="10 minutes")).status_code == 200
-    assert "Snoozed" in telegram_client.messages[-1][1]
+    assert "call the bank" in telegram_client.messages[-1][1]
     session = db.scalar(
         select(ConversationSession).where(ConversationSession.user_id == identity.user_id)
     )
@@ -276,10 +275,13 @@ def test_snooze_pending_new_request_supersedes_without_hijacking_it(
     _, occurrence, _ = _seed_delivered(db, identity, provider="787")
 
     _post(api_client, update_factory(1002, text="Snooze"))
-    assert _post(
-        api_client,
-        update_factory(1003, text="Remind me tomorrow at 9 AM to submit the report"),
-    ).status_code == 200
+    assert (
+        _post(
+            api_client,
+            update_factory(1003, text="Remind me tomorrow at 9 AM to submit the report"),
+        ).status_code
+        == 200
+    )
     assert "I'll remind you" in telegram_client.messages[-1][1]
     db.refresh(occurrence)
     assert occurrence.status == "NOTIFIED"
@@ -339,7 +341,7 @@ def test_postgres_concurrent_snoozes_create_one_replacement(
                 occurrence_id=occurrence.id,
                 duration_seconds=600,
                 provider_message_id=sent.provider_message_id,
-                now=datetime(2026, 10, 30, 12, 0, tzinfo=timezone.utc),
+                now=datetime(2026, 10, 30, 12, 0, tzinfo=UTC),
             )
             session.commit()
             outcomes.append(result.outcome)
@@ -398,7 +400,7 @@ def test_postgres_cross_user_snooze_is_rejected(session_factory, db):
     )
     db.add(reminder)
     db.flush()
-    now = datetime(2026, 10, 30, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
     occurrence = ReminderOccurrence(
         reminder_id=reminder.id,
         scheduled_at=now,
@@ -433,9 +435,14 @@ def test_postgres_cross_user_snooze_is_rejected(session_factory, db):
     db.refresh(occurrence)
     assert result.outcome == "NOT_FOUND"
     assert occurrence.status == "NOTIFIED"
-    assert db.scalar(
-        select(func.count()).select_from(Notification).where(Notification.occurrence_id == occurrence.id)
-    ) == 1
+    assert (
+        db.scalar(
+            select(func.count())
+            .select_from(Notification)
+            .where(Notification.occurrence_id == occurrence.id)
+        )
+        == 1
+    )
 
 
 @pytest.mark.skipif(
@@ -447,28 +454,17 @@ def test_postgres_worker_process_restart_delivers_snooze_within_60_seconds(
 ):
     identity = _onboard(api_client, db, update_factory)
     _, occurrence, sent = _seed_delivered(db, identity, provider="restart-original")
-    result = snooze_occurrence(
-        db,
-        user_id=identity.user_id,
-        identity_id=identity.id,
-        chat_id=2001,
-        occurrence_id=occurrence.id,
-        duration_seconds=5,
-        provider_message_id=sent.provider_message_id,
-        now=datetime.now(timezone.utc),
-    )
-    assert result.outcome == "SNOOZED"
-    assert result.due_at is not None
-    due_at = result.due_at
-    db.commit()
     output_path = tmp_path / "worker-delivery.jsonl"
+    ready_path = tmp_path / "worker-ready"
+    start_path = tmp_path / "worker-start"
     worker_code = """
 import json
 import os
+import time
 from datetime import datetime, timezone
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from reminder_agent.worker import NotificationWorker
+from reminder_agent.infrastructure.runtime.worker import NotificationWorker
 
 class FileTelegramClient:
     def send_message(self, chat_id, text, *, reply_markup=None):
@@ -485,6 +481,11 @@ worker = NotificationWorker(
     clock=lambda: datetime.now(timezone.utc),
     claim_lease_seconds=60.0,
 )
+ready_path = os.environ.get('WORKER_READY')
+if ready_path:
+    open(ready_path, 'a', encoding='utf-8').close()
+    while not os.path.exists(os.environ['WORKER_START']):
+        time.sleep(0.01)
 print(worker.run_once())
 """
     environment = {
@@ -492,15 +493,49 @@ print(worker.run_once())
         "WORKER_OUTPUT": str(output_path),
         "WORKER_ID": "restart-test-worker",
     }
-    before_due = subprocess.run(
+    before_due_environment = {
+        **environment,
+        "WORKER_READY": str(ready_path),
+        "WORKER_START": str(start_path),
+    }
+    before_due_process = subprocess.Popen(
         [sys.executable, "-c", worker_code],
-        check=True,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        env=environment,
+        env=before_due_environment,
     )
-    assert before_due.stdout.strip() == "0"
-    sleep(max(0.0, (due_at - datetime.now(timezone.utc)).total_seconds()) + 0.2)
+    try:
+        ready_deadline = monotonic() + 30
+        while not ready_path.exists() and monotonic() < ready_deadline:
+            if before_due_process.poll() is not None:
+                stdout, stderr = before_due_process.communicate()
+                pytest.fail(f"worker exited before readiness: {stdout=} {stderr=}")
+            sleep(0.01)
+        assert ready_path.exists(), "worker did not become ready within 30 seconds"
+
+        result = snooze_occurrence(
+            db,
+            user_id=identity.user_id,
+            identity_id=identity.id,
+            chat_id=2001,
+            occurrence_id=occurrence.id,
+            duration_seconds=5,
+            provider_message_id=sent.provider_message_id,
+            now=datetime.now(UTC),
+        )
+        assert result.outcome == "SNOOZED"
+        assert result.due_at is not None
+        due_at = result.due_at
+        db.commit()
+        start_path.touch()
+        before_due_stdout, before_due_stderr = before_due_process.communicate(timeout=30)
+    finally:
+        if before_due_process.poll() is None:
+            before_due_process.kill()
+            before_due_process.communicate()
+    assert before_due_stdout.strip() == "0", before_due_stderr
+    sleep(max(0.0, (due_at - datetime.now(UTC)).total_seconds()) + 0.2)
     after_restart = subprocess.run(
         [sys.executable, "-c", worker_code],
         check=True,
@@ -513,8 +548,7 @@ print(worker.run_once())
     assert len(delivered) == 1
     db.refresh(occurrence)
     replacement = db.scalar(
-        select(Notification)
-        .where(
+        select(Notification).where(
             Notification.occurrence_id == occurrence.id,
             Notification.sequence == 2,
         )

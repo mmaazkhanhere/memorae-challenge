@@ -1,11 +1,11 @@
 """Focused regression tests for the deterministic-first pipeline boundary."""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
-from reminder_agent.conversation_router import ConversationRoute
-from reminder_agent.intent import (
+from reminder_agent.application.conversation_coordinator import _route_and_interpret
+from reminder_agent.features.intent import (
     CreateOneTimeReminderIntent,
     IntentRoute,
     IntentRouteSuggestion,
@@ -14,12 +14,11 @@ from reminder_agent.intent import (
     PendingReminder,
     ReminderIntentInterpreter,
 )
-from reminder_agent.reminders import _route_and_interpret
-from reminder_agent.memories import MemoryIntentEvidence, SaveMemoryFact
-from reminder_agent.request_policy import OUT_OF_SCOPE_RESPONSE
+from reminder_agent.features.intent.deterministic.routing import ConversationRoute
+from reminder_agent.features.intent.policy import OUT_OF_SCOPE_RESPONSE
+from reminder_agent.shared.memory_contracts import MemoryIntentEvidence, SaveMemoryFact
 
-
-NOW = datetime(2026, 10, 30, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
 
 
 def test_explicit_simple_request_stays_on_deterministic_route_without_classifier() -> None:
@@ -76,6 +75,36 @@ def test_unmatched_route_uses_classifier_and_uncertainty_stops_before_extraction
     assert classifier.called is True
     assert route is ConversationRoute.UNRELATED
     assert "not sure" in (result.response_text or "").lower()
+    assert result.fallback_allowed is False
+
+
+def test_classifier_can_route_an_implicit_reschedule_without_pending_context() -> None:
+    class RescheduleClassifier:
+        called = False
+
+        def classify(self, text, **kwargs):
+            self.called = True
+            assert text == "Actually move it to 9 PM today"
+            assert kwargs["pending"] is None
+            return IntentRouteSuggestion(operation=IntentRoute.RESCHEDULE_REQUEST)
+
+    class FailingInterpreter:
+        def interpret(self, *args, **kwargs):  # pragma: no cover - route must bypass extraction
+            raise AssertionError("reschedule routing must bypass the generic reminder extractor")
+
+    classifier = RescheduleClassifier()
+    route, result = _route_and_interpret(
+        FailingInterpreter(),
+        "Actually move it to 9 PM today",
+        timezone_name="UTC",
+        now=NOW,
+        pending=None,
+        user_name="Ada",
+        intent_router=classifier,
+    )
+
+    assert classifier.called is True
+    assert route is ConversationRoute.RESCHEDULE_REQUEST
     assert result.fallback_allowed is False
 
 

@@ -6,9 +6,10 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from reminder_agent.db.models import ChannelIdentity, IdempotencyRecord, User
-from reminder_agent.onboarding import handle_update
-from reminder_agent.telegram import TelegramUpdate
+from reminder_agent.channels.telegram.provider import TelegramUpdate
+from reminder_agent.features.onboarding.message_templates import ONBOARDING_MESSAGES
+from reminder_agent.features.onboarding.workflow import handle_update
+from reminder_agent.infrastructure.database.models import ChannelIdentity, IdempotencyRecord, User
 
 
 def post_update(client, update: dict):
@@ -78,7 +79,10 @@ def test_timezone_completion_offers_native_contact_keyboard(
     assert markup is not None
     assert markup["keyboard"][0][0]["request_contact"] is True
     assert markup["keyboard"][1][0]["text"] == "Skip for now"
-    assert "voice-call access" in telegram_client.messages[-1][1]
+    assert telegram_client.messages[-1][1] in {
+        template.format(name="Ada", timezone_name="Asia/Karachi")
+        for template in ONBOARDING_MESSAGES["onboarding_complete"]
+    }
 
 
 def test_phone_region_without_country_code_explains_required_format(
@@ -90,7 +94,7 @@ def test_phone_region_without_country_code_explains_required_format(
 
     assert response.status_code == 200
     assert "/phone_region PK" in telegram_client.messages[-1][1]
-    assert "already onboarded" not in telegram_client.messages[-1][1]
+    assert telegram_client.messages[-1][1] in set(ONBOARDING_MESSAGES["phone_region_missing"])
 
 
 def test_valid_self_contact_links_normalized_phone(
@@ -100,7 +104,7 @@ def test_valid_self_contact_links_normalized_phone(
     response = post_update(api_client, contact_update(update_factory, 102))
 
     assert response.status_code == 200
-    assert "now linked" in telegram_client.messages[-1][1]
+    assert telegram_client.messages[-1][1] in set(ONBOARDING_MESSAGES["phone_linked"])
     identity = db.scalar(select(ChannelIdentity).where(ChannelIdentity.channel_type == "PHONE"))
     assert identity is not None
     assert identity.external_id == "+442083661177"
@@ -119,7 +123,7 @@ def test_contact_from_another_user_is_rejected_without_persistence(
     )
 
     assert response.status_code == 200
-    assert "own phone" in telegram_client.messages[-1][1]
+    assert telegram_client.messages[-1][1] in set(ONBOARDING_MESSAGES["phone_ownership_rejected"])
     assert (
         db.scalar(
             select(func.count())
@@ -140,7 +144,7 @@ def test_contact_without_owner_id_is_rejected(
     )
 
     assert response.status_code == 200
-    assert "own phone" in telegram_client.messages[-1][1]
+    assert telegram_client.messages[-1][1] in set(ONBOARDING_MESSAGES["phone_ownership_rejected"])
     assert (
         db.scalar(
             select(func.count())
@@ -161,7 +165,7 @@ def test_invalid_phone_is_rejected_without_persistence(
     )
 
     assert response.status_code == 200
-    assert "couldn't validate" in telegram_client.messages[-1][1]
+    assert telegram_client.messages[-1][1] in set(ONBOARDING_MESSAGES["phone_number_invalid_retry"])
     assert (
         db.scalar(
             select(func.count())
@@ -182,7 +186,7 @@ def test_local_contact_can_use_user_selected_region(
     )
 
     assert response.status_code == 200
-    assert "phone_region" in telegram_client.messages[-1][1]
+    assert telegram_client.messages[-1][1] in set(ONBOARDING_MESSAGES["local_phone_region_required"])
     assert (
         db.scalar(
             select(func.count())
@@ -196,7 +200,7 @@ def test_local_contact_can_use_user_selected_region(
     )
 
     assert post_update(api_client, update_factory(103, text="/phone_region PK")).status_code == 200
-    assert "now linked" in telegram_client.messages[-1][1]
+    assert telegram_client.messages[-1][1] in set(ONBOARDING_MESSAGES["phone_linked"])
 
     identity = db.scalar(
         select(ChannelIdentity).where(
@@ -228,7 +232,7 @@ def test_phone_cannot_be_linked_to_two_active_users(
     )
 
     assert response.status_code == 200
-    assert "already linked to another account" in telegram_client.messages[-1][1]
+    assert telegram_client.messages[-1][1] in set(ONBOARDING_MESSAGES["phone_conflict"])
     assert (
         db.scalar(
             select(func.count())
@@ -302,7 +306,7 @@ def test_skip_keeps_telegram_account_usable_without_phone(
     )
 
     assert response.status_code == 200
-    assert "Telegram will continue to work" in telegram_client.messages[-1][1]
+    assert telegram_client.messages[-1][1] in set(ONBOARDING_MESSAGES["phone_link_skipped"])
     assert (
         db.scalar(
             select(func.count())
@@ -313,7 +317,7 @@ def test_skip_keeps_telegram_account_usable_without_phone(
     )
 
     assert post_update(api_client, update_factory(103, text="/link_phone")).status_code == 200
-    assert "share your own phone" in telegram_client.messages[-1][1]
+    assert telegram_client.messages[-1][1] in set(ONBOARDING_MESSAGES["phone_link_prompt"])
 
 
 def test_relinking_replaces_the_users_previous_phone(
@@ -376,8 +380,8 @@ def test_concurrent_phone_links_allow_only_one_owner(
             )
         )
 
-    assert sum("now linked" in result for result in results) == 1
-    assert sum("already linked to another account" in result for result in results) == 1
+    assert sum(result in ONBOARDING_MESSAGES["phone_linked"] for result in results) == 1
+    assert sum(result in ONBOARDING_MESSAGES["phone_conflict"] for result in results) == 1
     assert (
         db.scalar(
             select(func.count())

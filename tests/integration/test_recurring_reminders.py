@@ -1,5 +1,5 @@
-from datetime import datetime, timezone
 import os
+from datetime import UTC, datetime
 from threading import Thread
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -7,25 +7,31 @@ from zoneinfo import ZoneInfo
 import pytest
 from sqlalchemy import func, select
 
-from reminder_agent.db.models import ChannelIdentity, Notification, Reminder, ReminderOccurrence, User
-from reminder_agent.intent import (
+from reminder_agent.channels.telegram.provider import TelegramAPIError
+from reminder_agent.features.intent import (
     CreateRecurringReminderIntent,
     IntentRoute,
     IntentRouteSuggestion,
     Interpretation,
 )
-from reminder_agent.recurrence_service import (
+from reminder_agent.features.reminders.recurrence_service import (
     materialize_active_recurring_reminders,
     materialize_recurring_reminder,
 )
-from reminder_agent.telegram import TelegramAPIError
-from reminder_agent.worker import NotificationWorker
+from reminder_agent.infrastructure.database.models import (
+    ChannelIdentity,
+    Notification,
+    Reminder,
+    ReminderOccurrence,
+    User,
+)
+from reminder_agent.infrastructure.runtime.worker import NotificationWorker
 
 
 def utc_timestamp(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def post_update(client, update: dict):
@@ -41,10 +47,13 @@ def onboard(api_client, update_factory, *, user_id=1001, chat_id=2001) -> None:
         post_update(api_client, update_factory(1000, user_id=user_id, chat_id=chat_id)).status_code
         == 200
     )
-    assert post_update(
-        api_client,
-        update_factory(1001, user_id=user_id, chat_id=chat_id, text="Asia/Karachi"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(1001, user_id=user_id, chat_id=chat_id, text="Asia/Karachi"),
+        ).status_code
+        == 200
+    )
 
 
 def test_weekly_reminder_materializes_local_wall_clock_and_confirms(
@@ -57,8 +66,8 @@ def test_weekly_reminder_materializes_local_wall_clock_and_confirms(
     )
 
     assert response.status_code == 200
-    assert "every Mon at 08:00 Asia/Karachi via Telegram" in telegram_client.messages[-1][1]
-    assert "Next: 2026-11-02 08:00 PKT" in telegram_client.messages[-1][1]
+    assert "every Monday at 8:00 AM PKT on Telegram" in telegram_client.messages[-1][1]
+    assert "Monday, November 2, at 8:00 AM PKT" in telegram_client.messages[-1][1]
 
     reminder = db.scalar(select(Reminder))
     assert reminder is not None
@@ -71,9 +80,7 @@ def test_weekly_reminder_materializes_local_wall_clock_and_confirms(
     assert len({occurrence.recurrence_instance_key for occurrence in occurrences}) == len(
         occurrences
     )
-    assert utc_timestamp(occurrences[0].scheduled_at) == datetime(
-        2026, 11, 2, 3, 0, tzinfo=timezone.utc
-    )
+    assert utc_timestamp(occurrences[0].scheduled_at) == datetime(2026, 11, 2, 3, 0, tzinfo=UTC)
     assert db.scalar(select(func.count()).select_from(Notification)) == len(occurrences)
 
 
@@ -144,14 +151,22 @@ def test_monthly_and_yearly_reminders_persist_calendar_rules(
     api_client, telegram_client, db, update_factory
 ) -> None:
     onboard(api_client, update_factory)
-    assert post_update(
-        api_client,
-        update_factory(309, text="Remind me every month on the 15th at 8 AM to pay rent."),
-    ).status_code == 200
-    assert post_update(
-        api_client,
-        update_factory(310, text="Remind me every year on March 10 at 9 AM to renew insurance."),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(309, text="Remind me every month on the 15th at 8 AM to pay rent."),
+        ).status_code
+        == 200
+    )
+    assert (
+        post_update(
+            api_client,
+            update_factory(
+                310, text="Remind me every year on March 10 at 9 AM to renew insurance."
+            ),
+        ).status_code
+        == 200
+    )
 
     reminders = db.scalars(select(Reminder).order_by(Reminder.created_at)).all()
     assert [reminder.recurrence_rule for reminder in reminders] == [
@@ -201,22 +216,25 @@ def test_worker_restart_and_repeated_materialization_do_not_duplicate_instances(
     api_client, db, update_factory, session_factory
 ) -> None:
     onboard(api_client, update_factory)
-    assert post_update(
-        api_client,
-        update_factory(302, text="Remind me every Monday at 8 AM to review the report."),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(302, text="Remind me every Monday at 8 AM to review the report."),
+        ).status_code
+        == 200
+    )
     before = db.scalar(select(func.count()).select_from(ReminderOccurrence))
 
     worker = NotificationWorker(
         session_factory,
         telegram_client=None,  # materialization happens before delivery
-        clock=lambda: datetime(2026, 10, 30, 12, tzinfo=timezone.utc),
+        clock=lambda: datetime(2026, 10, 30, 12, tzinfo=UTC),
     )
     worker.run_once()
     NotificationWorker(
         session_factory,
         telegram_client=None,
-        clock=lambda: datetime(2026, 10, 30, 12, tzinfo=timezone.utc),
+        clock=lambda: datetime(2026, 10, 30, 12, tzinfo=UTC),
     ).run_once()
 
     assert db.scalar(select(func.count()).select_from(ReminderOccurrence)) == before
@@ -253,7 +271,7 @@ def test_materialization_pages_past_the_first_batch(
 
     materialize_active_recurring_reminders(
         session_factory,
-        now=datetime(2026, 10, 30, 12, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 30, 12, tzinfo=UTC),
         horizon_days=35,
         batch_size=1,
     )
@@ -274,10 +292,13 @@ def test_failed_delivery_keeps_recurring_series_active(
     api_client, db, update_factory, session_factory
 ) -> None:
     onboard(api_client, update_factory)
-    assert post_update(
-        api_client,
-        update_factory(303, text="Remind me every Monday at 8 AM to check the report."),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(303, text="Remind me every Monday at 8 AM to check the report."),
+        ).status_code
+        == 200
+    )
 
     class PermanentFailureTelegramClient:
         def send_message(self, chat_id: int, text: str, *, reply_markup=None):
@@ -286,7 +307,7 @@ def test_failed_delivery_keeps_recurring_series_active(
     worker = NotificationWorker(
         session_factory,
         PermanentFailureTelegramClient(),
-        clock=lambda: datetime(2026, 11, 2, 3, 0, 1, tzinfo=timezone.utc),
+        clock=lambda: datetime(2026, 11, 2, 3, 0, 1, tzinfo=UTC),
     )
     assert worker.run_once() == 1
 
@@ -332,10 +353,13 @@ def test_postgres_concurrent_materializers_do_not_duplicate_instances(
     api_client, db, update_factory, session_factory
 ) -> None:
     onboard(api_client, update_factory)
-    assert post_update(
-        api_client,
-        update_factory(305, text="Remind me every Monday at 8 AM to check concurrency."),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(305, text="Remind me every Monday at 8 AM to check concurrency."),
+        ).status_code
+        == 200
+    )
     before = db.scalar(select(func.count()).select_from(ReminderOccurrence))
     errors: list[Exception] = []
 
@@ -343,7 +367,7 @@ def test_postgres_concurrent_materializers_do_not_duplicate_instances(
         try:
             materialize_active_recurring_reminders(
                 session_factory,
-                now=datetime(2026, 10, 30, 12, tzinfo=timezone.utc),
+                now=datetime(2026, 10, 30, 12, tzinfo=UTC),
                 horizon_days=35,
                 batch_size=1,
             )
@@ -394,7 +418,7 @@ def test_postgres_restart_replay_and_dst_preserve_recurrence(
         materialize_recurring_reminder(
             session,
             reminder,
-            now=datetime(2027, 3, 1, 12, tzinfo=timezone.utc),
+            now=datetime(2027, 3, 1, 12, tzinfo=UTC),
             horizon_days=21,
         )
 
@@ -404,7 +428,7 @@ def test_postgres_restart_replay_and_dst_preserve_recurrence(
         materialize_recurring_reminder(
             session,
             reminder,
-            now=datetime(2027, 3, 1, 12, tzinfo=timezone.utc),
+            now=datetime(2027, 3, 1, 12, tzinfo=UTC),
             horizon_days=21,
         )
 
@@ -415,7 +439,6 @@ def test_postgres_restart_replay_and_dst_preserve_recurrence(
         assert len(occurrences) == 3
         assert len({occurrence.recurrence_instance_key for occurrence in occurrences}) == 3
         assert all(
-            occurrence.scheduled_at.astimezone(ZoneInfo("America/New_York")).hour
-            == 8
+            occurrence.scheduled_at.astimezone(ZoneInfo("America/New_York")).hour == 8
             for occurrence in occurrences
         )

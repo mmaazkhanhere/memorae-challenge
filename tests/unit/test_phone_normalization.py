@@ -1,6 +1,6 @@
 import pytest
 
-from reminder_agent.onboarding import (
+from reminder_agent.features.onboarding.onboarding_validation import (
     InvalidPhoneNumber,
     InvalidPhoneRegion,
     normalize_phone_number,

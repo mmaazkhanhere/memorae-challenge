@@ -1,12 +1,33 @@
-from datetime import date, datetime, timedelta, timezone
 import hashlib
 import os
+from datetime import UTC, date, datetime, timedelta
 from threading import Barrier, Thread
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session
 
-from reminder_agent.db.models import (
+from reminder_agent.application import conversation_workflow as reminder_service
+from reminder_agent.application.conversation_coordinator import (
+    handle_reminder_text,
+    list_owned_reminders,
+)
+from reminder_agent.application.main import create_app
+from reminder_agent.channels.telegram.provider import TelegramUpdate
+from reminder_agent.features.intent import (
+    CreateOneTimeReminderIntent,
+    IntentRoute,
+    IntentRouteSuggestion,
+    Interpretation,
+    NeedsClarification,
+    PendingReminder,
+    PendingReminderBatch,
+    PendingReminderFieldUpdate,
+)
+from reminder_agent.features.intent.policy import OUT_OF_SCOPE_RESPONSE
+from reminder_agent.infrastructure.config.settings import Settings
+from reminder_agent.infrastructure.database.models import (
     ChannelIdentity,
     ConversationSession,
     IdempotencyRecord,
@@ -15,21 +36,6 @@ from reminder_agent.db.models import (
     ReminderOccurrence,
     User,
 )
-from reminder_agent.intent import (
-    CreateOneTimeReminderIntent,
-    IntentRoute,
-    IntentRouteSuggestion,
-    Interpretation,
-    NeedsClarification,
-    PendingReminderFieldUpdate,
-)
-from reminder_agent.main import create_app
-from reminder_agent import reminders as reminder_service
-from reminder_agent.reminders import handle_reminder_text, list_owned_reminders
-from reminder_agent.request_policy import OUT_OF_SCOPE_RESPONSE
-from reminder_agent.settings import Settings
-from reminder_agent.telegram import TelegramUpdate
-
 
 HEADERS = {"X-Telegram-Bot-Api-Secret-Token": "test-secret"}
 
@@ -37,8 +43,8 @@ HEADERS = {"X-Telegram-Bot-Api-Secret-Token": "test-secret"}
 def utc_timestamp(value: datetime) -> datetime:
     """Normalize SQLite-naive and PostgreSQL-aware timestamps for assertions."""
     if value.tzinfo is None or value.utcoffset() is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def post_update(client, update: dict):
@@ -76,7 +82,7 @@ def test_one_time_relative_reminder_persists_all_rows_and_confirms_local_time(
     response = post_update(api_client, update)
 
     assert response.status_code == 200
-    assert "2026-10-30 17:05" in telegram_client.messages[-1][1]
+    assert "today at 5:05 PM PKT" in telegram_client.messages[-1][1]
     assert "Telegram" in telegram_client.messages[-1][1]
     reminder = db.scalar(select(Reminder))
     occurrence = db.scalar(select(ReminderOccurrence))
@@ -89,14 +95,10 @@ def test_one_time_relative_reminder_persists_all_rows_and_confirms_local_time(
     assert reminder.schedule_type == "ONE_TIME"
     assert reminder.status == "ACTIVE"
     assert occurrence is not None and occurrence.reminder_id == reminder.id
-    assert utc_timestamp(occurrence.scheduled_at) == datetime(
-        2026, 10, 30, 12, 5, tzinfo=timezone.utc
-    )
+    assert utc_timestamp(occurrence.scheduled_at) == datetime(2026, 10, 30, 12, 5, tzinfo=UTC)
     assert notification is not None and notification.occurrence_id == occurrence.id
     assert notification.status == "PENDING"
-    assert utc_timestamp(notification.due_at) == datetime(
-        2026, 10, 30, 12, 5, tzinfo=timezone.utc
-    )
+    assert utc_timestamp(notification.due_at) == datetime(2026, 10, 30, 12, 5, tzinfo=UTC)
 
 
 def test_incomplete_supported_request_asks_for_details_without_creating_reminder(
@@ -176,9 +178,7 @@ def test_prompt_injection_cannot_reach_interpreter_or_create_reminder(
     assert db.scalar(select(func.count()).select_from(IdempotencyRecord)) == 2
 
 
-def test_reminder_read_is_scoped_to_the_canonical_owner(
-    session_factory, fixed_now
-) -> None:
+def test_reminder_read_is_scoped_to_the_canonical_owner(session_factory, fixed_now) -> None:
     with session_factory.begin() as db:
         first = User(name="Ada", timezone="UTC", onboarding_status="ACTIVE")
         second = User(name="Bob", timezone="UTC", onboarding_status="ACTIVE")
@@ -224,19 +224,18 @@ def test_tomorrow_schedule_is_stored_as_utc_and_displayed_in_local_time(
     )
 
     assert response.status_code == 200
-    assert "2026-10-31 09:00" in telegram_client.messages[-1][1]
+    assert "tomorrow, October 31, at 9:00 AM PKT" in telegram_client.messages[-1][1]
     occurrence = db.scalar(select(ReminderOccurrence))
     assert occurrence is not None
-    assert utc_timestamp(occurrence.scheduled_at) == datetime(
-        2026, 10, 31, 4, 0, tzinfo=timezone.utc
-    )
+    assert utc_timestamp(occurrence.scheduled_at) == datetime(2026, 10, 31, 4, 0, tzinfo=UTC)
 
 
 def test_transient_confirmation_failure_retries_and_records_sent(
     session_factory, fixed_now, update_factory
 ) -> None:
     from fastapi.testclient import TestClient
-    from reminder_agent.telegram import TelegramAPIError
+
+    from reminder_agent.channels.telegram.provider import TelegramAPIError
 
     class FailOnceTelegramClient:
         def __init__(self) -> None:
@@ -246,9 +245,7 @@ def test_transient_confirmation_failure_retries_and_records_sent(
         def send_message(self, chat_id: int, text: str, *, reply_markup=None) -> None:
             self.attempts += 1
             if self.attempts == 3:
-                raise TelegramAPIError(
-                    "rate limited", status_code=429, failure_kind="http_error"
-                )
+                raise TelegramAPIError("rate limited", status_code=429, failure_kind="http_error")
             self.messages.append((chat_id, text))
 
     telegram_client = FailOnceTelegramClient()
@@ -273,7 +270,8 @@ def test_transient_confirmation_failure_retries_and_records_sent(
     assert response.status_code == 200
     assert telegram_client.attempts == 4
     assert len(telegram_client.messages) == 3
-    assert "I'll remind you" in telegram_client.messages[-1][1]
+    assert "call the bank" in telegram_client.messages[-1][1]
+    assert "Telegram" in telegram_client.messages[-1][1]
     with session_factory() as db:
         delivery = db.scalar(
             select(IdempotencyRecord).where(
@@ -291,7 +289,8 @@ def test_confirmation_failure_after_reminder_commit_keeps_the_reminder_and_block
     """An ambiguous Telegram failure must not roll back or duplicate committed work."""
 
     from fastapi.testclient import TestClient
-    from reminder_agent.telegram import TelegramAPIError
+
+    from reminder_agent.channels.telegram.provider import TelegramAPIError
 
     class FailingTelegramClient:
         def __init__(self) -> None:
@@ -353,10 +352,13 @@ def test_postgres_racing_clarification_replies_create_only_one_reminder(
     """Two distinct replies may race, but only the row-lock winner completes the draft."""
 
     onboard(api_client, update_factory)
-    assert post_update(
-        api_client,
-        update_factory(147, text="Remind me Friday to call the bank"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(147, text="Remind me Friday to call the bank"),
+        ).status_code
+        == 200
+    )
     user = db.scalar(select(User).where(User.name == "Ada"))
     identity = db.scalar(select(ChannelIdentity).where(ChannelIdentity.external_id == "1001"))
     assert user is not None and identity is not None
@@ -415,8 +417,132 @@ def test_postgres_racing_clarification_replies_create_only_one_reminder(
     session = db.scalar(select(ConversationSession))
     assert session is not None and session.status == "ENDED"
     assert len(replies) == 2
-    assert sum("I'll remind you" in reply.text for reply in replies) == 1
+    assert sum("call the bank" in reply.text for reply in replies) == 1
     assert sum("clarification expired" in reply.text.lower() for reply in replies) == 1
+    records = db.scalars(
+        select(IdempotencyRecord).where(IdempotencyRecord.operation == "CREATE_REMINDER")
+    ).all()
+    assert {record.idempotency_key for record in records} >= {"147", "148", "149"}
+    assert all(record.user_id == user.id for record in records)
+
+
+@pytest.mark.skipif(
+    not os.getenv("TEST_DATABASE_URL", "").startswith("postgresql"),
+    reason="requires PostgreSQL reminder graph persistence",
+)
+def test_postgres_direct_creation_commits_graph_session_and_response(
+    api_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory)
+    user = db.scalar(select(User).where(User.name == "Ada"))
+    identity = db.scalar(select(ChannelIdentity).where(ChannelIdentity.external_id == "1001"))
+    assert user is not None and identity is not None
+
+    response = post_update(
+        api_client,
+        update_factory(154, text="Remind me in five minutes to call the bank."),
+    )
+
+    assert response.status_code == 200
+    db.expire_all()
+    reminder = db.scalar(select(Reminder))
+    occurrence = db.scalar(select(ReminderOccurrence))
+    notification = db.scalar(select(Notification))
+    record = db.scalar(select(IdempotencyRecord).where(IdempotencyRecord.idempotency_key == "154"))
+    assert reminder is not None and reminder.user_id == user.id
+    assert occurrence is not None and occurrence.reminder_id == reminder.id
+    assert occurrence.status == "PENDING"
+    assert notification is not None and notification.occurrence_id == occurrence.id
+    assert notification.destination_identity_id == identity.id
+    assert record is not None and record.user_id == user.id
+    assert record.operation == "CREATE_REMINDER"
+    assert record.response is not None
+    assert "call the bank" in record.response["text"]
+
+
+@pytest.mark.skipif(
+    not os.getenv("TEST_DATABASE_URL", "").startswith("postgresql"),
+    reason="requires PostgreSQL idempotent reminder creation",
+)
+def test_postgres_direct_creation_duplicate_replays_without_duplicate_graph_or_delivery(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory)
+    update = update_factory(157, text="Remind me in five minutes to stretch.")
+
+    first = post_update(api_client, update)
+    sent_count = len(telegram_client.messages)
+    second = post_update(api_client, update)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert len(telegram_client.messages) == sent_count
+    assert db.scalar(select(func.count()).select_from(Reminder)) == 1
+    assert db.scalar(select(func.count()).select_from(ReminderOccurrence)) == 1
+    assert db.scalar(select(func.count()).select_from(Notification)) == 1
+    assert (
+        db.scalar(
+            select(func.count())
+            .select_from(IdempotencyRecord)
+            .where(IdempotencyRecord.idempotency_key == "157")
+        )
+        == 1
+    )
+
+
+@pytest.mark.skipif(
+    not os.getenv("TEST_DATABASE_URL", "").startswith("postgresql"),
+    reason="requires PostgreSQL transaction rollback and retry behavior",
+)
+def test_postgres_creation_failure_rolls_back_graph_and_retry_commits_once(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory)
+    update = update_factory(160, text="Remind me in five minutes to call the bank.")
+    messages_before = len(telegram_client.messages)
+
+    def fail_creation_commit(session: Session, flush_context, instances) -> None:
+        if any(
+            isinstance(item, Reminder) and item.task == "call the bank"
+            for item in (*session.identity_map.values(), *session.new)
+        ):
+            raise OperationalError("COMMIT", {}, RuntimeError("forced creation commit failure"))
+
+    event.listen(Session, "before_flush", fail_creation_commit)
+    try:
+        failed = post_update(api_client, update)
+    finally:
+        event.remove(Session, "before_flush", fail_creation_commit)
+
+    assert failed.status_code == 500
+    assert len(telegram_client.messages) == messages_before
+    db.expire_all()
+    assert db.scalar(select(func.count()).select_from(Reminder)) == 0
+    assert db.scalar(select(func.count()).select_from(ReminderOccurrence)) == 0
+    assert db.scalar(select(func.count()).select_from(Notification)) == 0
+    assert (
+        db.scalar(
+            select(func.count())
+            .select_from(IdempotencyRecord)
+            .where(IdempotencyRecord.idempotency_key == "160")
+        )
+        == 0
+    )
+
+    retried = post_update(api_client, update)
+    assert retried.status_code == 200
+    assert "call the bank" in telegram_client.messages[-1][1]
+    assert db.scalar(select(func.count()).select_from(Reminder)) == 1
+    assert db.scalar(select(func.count()).select_from(ReminderOccurrence)) == 1
+    assert db.scalar(select(func.count()).select_from(Notification)) == 1
+    assert (
+        db.scalar(
+            select(func.count())
+            .select_from(IdempotencyRecord)
+            .where(IdempotencyRecord.idempotency_key == "160")
+        )
+        == 1
+    )
 
 
 def test_replaying_update_does_not_duplicate_rows_or_confirmation(
@@ -435,11 +561,66 @@ def test_replaying_update_does_not_duplicate_rows_or_confirmation(
     assert len(telegram_client.messages) == 3  # onboarding start, timezone, reminder
 
 
+def test_same_task_and_schedule_reports_existing_reminder_without_mutation(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory)
+    first = post_update(
+        api_client,
+        update_factory(106, text="Remind me tomorrow at 9 AM to call the bank."),
+    )
+    before_counts = tuple(
+        db.scalar(select(func.count()).select_from(model))
+        for model in (Reminder, ReminderOccurrence, Notification)
+    )
+
+    second = post_update(
+        api_client,
+        update_factory(107, text="Remind me tomorrow at 9 AM to call the bank."),
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert "call the bank" in telegram_client.messages[-1][1]
+    assert any(
+        phrase in telegram_client.messages[-1][1]
+        for phrase in ("didn't add another one", "left it as it is", "kept the existing one")
+    )
+    after_counts = tuple(
+        db.scalar(select(func.count()).select_from(model))
+        for model in (Reminder, ReminderOccurrence, Notification)
+    )
+    assert after_counts == before_counts
+
+
+def test_conflicting_active_reminder_update_returns_409_without_mutation(
+    api_client, telegram_client, db, update_factory
+) -> None:
+    onboard(api_client, update_factory)
+    update = update_factory(105, text="Remind me in five minutes to stretch.")
+
+    assert post_update(api_client, update).status_code == 200
+    before_counts = tuple(
+        db.scalar(select(func.count()).select_from(model))
+        for model in (Reminder, ReminderOccurrence, Notification, IdempotencyRecord)
+    )
+
+    response = post_update(api_client, update_factory(105, text="create a different reminder"))
+
+    assert response.status_code == 409
+    assert len(telegram_client.messages) == 3
+    after_counts = tuple(
+        db.scalar(select(func.count()).select_from(model))
+        for model in (Reminder, ReminderOccurrence, Notification, IdempotencyRecord)
+    )
+    assert after_counts == before_counts
+
+
 def test_idempotency_unique_race_recovery_returns_duplicate(
     session_factory, fixed_now, update_factory
 ) -> None:
     """A loser of the unique-key race reloads the committed winner."""
-    from reminder_agent.reminders import _recover_from_idempotency_race
+    from reminder_agent.application.conversation_coordinator import _recover_from_idempotency_race
 
     update = TelegramUpdate.model_validate(
         update_factory(109, text="Remind me in five minutes to call the bank.")
@@ -590,7 +771,7 @@ def test_intent_timezone_mismatch_is_rejected_without_creating_reminder(
 def test_cross_user_identity_cannot_be_used_for_reminder_creation(
     session_factory, fixed_now, update_factory
 ) -> None:
-    from reminder_agent.db.models import ChannelIdentity, User
+    from reminder_agent.infrastructure.database.models import ChannelIdentity, User
 
     with session_factory.begin() as db:
         first = User(name="Ada", timezone="UTC", onboarding_status="ACTIVE")
@@ -662,7 +843,9 @@ def test_database_failure_rolls_back_reminder_graph_without_confirmation(
         def flush(self, *args, **kwargs) -> None:
             raise RuntimeError("database write failed")
 
-    failing_factory = lambda: FailingSession(bind=session_factory.kw["bind"])
+    def failing_factory() -> FailingSession:
+        return FailingSession(bind=session_factory.kw["bind"])
+
     app = create_app(
         Settings(database_url="sqlite://", telegram_webhook_secret="test-secret"),
         telegram_client=telegram_client,
@@ -708,15 +891,18 @@ def test_clarification_follow_up_creates_one_reminder_and_ends_session(
     api_client, telegram_client, db, update_factory
 ) -> None:
     onboard(api_client, update_factory)
-    assert post_update(
-        api_client,
-        update_factory(121, text="Remind me to call the bank at 7"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(121, text="Remind me to call the bank at 7"),
+        ).status_code
+        == 200
+    )
 
     response = post_update(api_client, update_factory(122, text="7 PM"))
 
     assert response.status_code == 200
-    assert "2026-10-30 19:00" in telegram_client.messages[-1][1]
+    assert "today at 7:00 PM PKT" in telegram_client.messages[-1][1]
     assert db.scalar(select(func.count()).select_from(Reminder)) == 1
     assert db.scalar(select(func.count()).select_from(ReminderOccurrence)) == 1
     assert db.scalar(select(func.count()).select_from(Notification)) == 1
@@ -730,10 +916,13 @@ def test_standalone_meridiem_completes_dentist_reminder(
     api_client, db, fixed_now, update_factory
 ) -> None:
     onboard(api_client, update_factory)
-    assert post_update(
-        api_client,
-        update_factory(160, text="Remind me tomorrow at 8 to visit the dentist"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(160, text="Remind me tomorrow at 8 to visit the dentist"),
+        ).status_code
+        == 200
+    )
 
     user = db.scalar(select(User).where(User.name == "Ada"))
     identity = db.scalar(select(ChannelIdentity).where(ChannelIdentity.external_id == "1001"))
@@ -764,7 +953,7 @@ def test_standalone_meridiem_completes_dentist_reminder(
     session = db.scalar(select(ConversationSession))
     assert reminder is not None and occurrence is not None and session is not None
     assert reminder.task == "visit the dentist"
-    assert utc_timestamp(occurrence.scheduled_at) == datetime(2026, 10, 31, 15, 0, tzinfo=timezone.utc)
+    assert utc_timestamp(occurrence.scheduled_at) == datetime(2026, 10, 31, 15, 0, tzinfo=UTC)
     assert session.status == "ENDED"
     assert session.pending_clarification is None
 
@@ -780,10 +969,13 @@ def test_classifier_selected_task_update_replaces_pending_task_without_phrase_ma
     api_client, db, fixed_now, monkeypatch, update_factory, correction_text, replacement_task
 ) -> None:
     onboard(api_client, update_factory)
-    assert post_update(
-        api_client,
-        update_factory(162, text="Remind me tomorrow to email Nadia"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(162, text="Remind me tomorrow to email Nadia"),
+        ).status_code
+        == 200
+    )
 
     user = db.scalar(select(User).where(User.name == "Ada"))
     identity = db.scalar(select(ChannelIdentity).where(ChannelIdentity.external_id == "1001"))
@@ -815,9 +1007,7 @@ def test_classifier_selected_task_update_replaces_pending_task_without_phrase_ma
                     )
                 )
             return Interpretation(
-                field_updates=PendingReminderFieldUpdate(
-                    hour=8, minute=0, meridiem="PM"
-                )
+                field_updates=PendingReminderFieldUpdate(hour=8, minute=0, meridiem="PM")
             )
 
     handle_reminder_text(
@@ -854,7 +1044,7 @@ def test_classifier_selected_task_update_replaces_pending_task_without_phrase_ma
     session = db.scalar(select(ConversationSession))
     assert reminder is not None and occurrence is not None and session is not None
     assert reminder.task == replacement_task
-    assert utc_timestamp(occurrence.scheduled_at) == datetime(2026, 10, 31, 15, 0, tzinfo=timezone.utc)
+    assert utc_timestamp(occurrence.scheduled_at) == datetime(2026, 10, 31, 15, 0, tzinfo=UTC)
     assert session.status == "ENDED"
     assert session.pending_clarification is None
 
@@ -864,10 +1054,13 @@ def test_classifier_selected_clear_date_typo_completes_pending_reminder(
     api_client, db, fixed_now, update_factory, typo
 ) -> None:
     onboard(api_client, update_factory)
-    assert post_update(
-        api_client,
-        update_factory(165, text="Remind me to call Ayesha"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(165, text="Remind me to call Ayesha"),
+        ).status_code
+        == 200
+    )
 
     user = db.scalar(select(User).where(User.name == "Ada"))
     identity = db.scalar(select(ChannelIdentity).where(ChannelIdentity.external_id == "1001"))
@@ -918,7 +1111,7 @@ def test_classifier_selected_clear_date_typo_completes_pending_reminder(
     session = db.scalar(select(ConversationSession))
     assert reminder is not None and occurrence is not None and session is not None
     assert reminder.task == "call Ayesha"
-    assert utc_timestamp(occurrence.scheduled_at) == datetime(2026, 10, 31, 15, 0, tzinfo=timezone.utc)
+    assert utc_timestamp(occurrence.scheduled_at) == datetime(2026, 10, 31, 15, 0, tzinfo=UTC)
     assert session.status == "ENDED"
     assert session.pending_clarification is None
 
@@ -927,10 +1120,13 @@ def test_provider_field_update_is_merged_with_the_locked_pending_session(
     api_client, db, fixed_now, update_factory
 ) -> None:
     onboard(api_client, update_factory)
-    assert post_update(
-        api_client,
-        update_factory(141, text="Remind me tomorrow to call the bank"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(141, text="Remind me tomorrow to call the bank"),
+        ).status_code
+        == 200
+    )
     pending_session = db.scalar(select(ConversationSession))
     assert pending_session is not None
     assert pending_session.pending_clarification["task"] == "call the bank"
@@ -972,9 +1168,7 @@ def test_provider_field_update_is_merged_with_the_locked_pending_session(
     assert reminder.task == "call the bank"
     occurrence = db.scalar(select(ReminderOccurrence))
     assert occurrence is not None
-    assert utc_timestamp(occurrence.scheduled_at) == datetime(
-        2026, 10, 31, 3, 0, tzinfo=timezone.utc
-    )
+    assert utc_timestamp(occurrence.scheduled_at) == datetime(2026, 10, 31, 3, 0, tzinfo=UTC)
     assert db.scalar(select(ConversationSession)).pending_clarification is None
 
 
@@ -1134,10 +1328,13 @@ def test_task_follow_up_completes_a_reminder_with_an_existing_schedule(
 ) -> None:
     onboard(api_client, update_factory)
 
-    assert post_update(
-        api_client,
-        update_factory(145, text="Remind me tomorrow at 8 AM."),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(145, text="Remind me tomorrow at 8 AM."),
+        ).status_code
+        == 200
+    )
     session = db.scalar(select(ConversationSession))
     assert session is not None
     assert session.pending_clarification["task"] is None
@@ -1145,18 +1342,19 @@ def test_task_follow_up_completes_a_reminder_with_an_existing_schedule(
     assert session.pending_clarification["hour"] == 8
     assert session.pending_clarification["minute"] == 0
 
-    assert post_update(
-        api_client,
-        update_factory(146, text="Submit my assignment."),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(146, text="Submit my assignment."),
+        ).status_code
+        == 200
+    )
 
     reminder = db.scalar(select(Reminder))
     occurrence = db.scalar(select(ReminderOccurrence))
     assert reminder is not None and occurrence is not None
     assert reminder.task == "Submit my assignment"
-    assert utc_timestamp(occurrence.scheduled_at) == datetime(
-        2026, 10, 31, 3, 0, tzinfo=timezone.utc
-    )
+    assert utc_timestamp(occurrence.scheduled_at) == datetime(2026, 10, 31, 3, 0, tzinfo=UTC)
     db.refresh(session)
     assert session.status == "ENDED"
     assert session.pending_clarification is None
@@ -1176,7 +1374,7 @@ def test_multiple_people_in_one_task_create_one_reminder(
     assert "call Alice and Bob" in telegram_client.messages[-1][1]
 
 
-def test_multiple_tasks_with_one_schedule_create_one_reminder(
+def test_multiple_tasks_with_one_schedule_require_clarification(
     api_client, telegram_client, db, update_factory
 ) -> None:
     onboard(api_client, update_factory)
@@ -1185,8 +1383,8 @@ def test_multiple_tasks_with_one_schedule_create_one_reminder(
         update_factory(132, text="Remind me to call Alice and email Bob tomorrow at 9 AM"),
     )
 
-    assert db.scalar(select(func.count()).select_from(Reminder)) == 1
-    assert "call Alice and email Bob" in telegram_client.messages[-1][1]
+    assert db.scalar(select(func.count()).select_from(Reminder)) == 0
+    assert "more than one reminder task" in telegram_client.messages[-1][1].lower()
 
 
 def test_explicit_multiple_reminder_requests_create_two_reminders(
@@ -1211,22 +1409,112 @@ def test_explicit_multiple_reminder_requests_create_two_reminders(
     assert db.scalar(select(func.count()).select_from(Notification)) == 2
     assert "call Alice" in telegram_client.messages[-1][1]
     assert "email Bob" in telegram_client.messages[-1][1]
-    assert "2026-10-31 09:00" in telegram_client.messages[-1][1]
-    assert "2026-10-31 10:00" in telegram_client.messages[-1][1]
+    assert "tomorrow, October 31, at 9:00 AM PKT" in telegram_client.messages[-1][1]
+    assert "tomorrow, October 31, at 10:00 AM PKT" in telegram_client.messages[-1][1]
 
-    assert post_update(
-        api_client,
-        update_factory(
-            136,
-            text=(
-                "Remind me to call Alice tomorrow at 9 AM and remind me to email Bob "
-                "tomorrow at 10 AM"
+    assert (
+        post_update(
+            api_client,
+            update_factory(
+                136,
+                text=(
+                    "Remind me to call Alice tomorrow at 9 AM and remind me to email Bob "
+                    "tomorrow at 10 AM"
+                ),
             ),
-        ),
-    ).status_code == 200
+        ).status_code
+        == 200
+    )
     assert db.scalar(select(func.count()).select_from(Reminder)) == 2
     assert db.scalar(select(func.count()).select_from(ReminderOccurrence)) == 2
     assert db.scalar(select(func.count()).select_from(Notification)) == 2
+
+
+def test_multiple_reminder_clarification_keeps_all_drafts_until_follow_up(
+    api_client, telegram_client, db, update_factory, fixed_now
+) -> None:
+    onboard(api_client, update_factory)
+    user = db.scalar(select(User).where(User.name == "Ada"))
+    identity = db.scalar(select(ChannelIdentity).where(ChannelIdentity.external_id == "1001"))
+    assert user is not None and identity is not None
+
+    class BatchClarificationInterpreter:
+        def interpret(self, text, *, selected_route=None, timezone_name, now, context=None, recent_messages=()):
+            if selected_route is IntentRoute.NEW_REQUEST:
+                return Interpretation(
+                    clarification=NeedsClarification(
+                        pending=PendingReminderBatch(
+                            reminders=(
+                                PendingReminder(
+                                    task="call John",
+                                    date_local=date(2026, 10, 31),
+                                    hour=10,
+                                    minute=0,
+                                    meridiem="am",
+                                    date_explicit=True,
+                                    timezone_name=timezone_name,
+                                ),
+                                PendingReminder(
+                                    task="pay my electricity bill",
+                                    date_local=date(2026, 11, 6),
+                                    hour=6,
+                                    minute=0,
+                                    date_explicit=True,
+                                    timezone_name=timezone_name,
+                                ),
+                            ),
+                            clarification_index=1,
+                        ),
+                        question="Should 6 be AM or PM for the electricity bill?",
+                    )
+                )
+            assert selected_route is IntentRoute.UPDATE_PENDING
+            assert context is not None
+            assert context.task == "pay my electricity bill"
+            return Interpretation(
+                field_updates=PendingReminderFieldUpdate(
+                    hour=6,
+                    minute=0,
+                    meridiem="pm",
+                    certainty="CLEAR",
+                    evidence={"meridiem": "6 pm"},
+                )
+            )
+
+    first = handle_reminder_text(
+        db,
+        TelegramUpdate.model_validate(
+            update_factory(
+                137,
+                text="Remind me to call John tomorrow at 10, and pay my electricity bill on Friday at 6.",
+            )
+        ),
+        user_id=user.id,
+        identity_id=identity.id,
+        telegram_user_id=1001,
+        interpreter=BatchClarificationInterpreter(),
+        now=fixed_now,
+    )
+    assert "electricity bill" in first.text
+    session = db.scalar(select(ConversationSession))
+    assert session is not None
+    assert session.pending_clarification["operation"] == "CREATE_ONE_TIME_REMINDERS"
+    assert len(session.pending_clarification["reminders"]) == 2
+
+    second = handle_reminder_text(
+        db,
+        TelegramUpdate.model_validate(update_factory(138, text="6 pm")),
+        user_id=user.id,
+        identity_id=identity.id,
+        telegram_user_id=1001,
+        interpreter=BatchClarificationInterpreter(),
+        now=fixed_now,
+    )
+    assert db.scalar(select(func.count()).select_from(Reminder)) == 2
+    assert db.scalar(select(func.count()).select_from(ReminderOccurrence)) == 2
+    assert db.scalar(select(ConversationSession)).pending_clarification is None
+    assert "call John" in second.text
+    assert "electricity bill" in second.text
 
 
 def test_follow_up_with_minutes_and_day_completes_pending_reminder(
@@ -1238,7 +1526,7 @@ def test_follow_up_with_minutes_and_day_completes_pending_reminder(
     response = post_update(api_client, update_factory(134, text="6:55 pm today"))
 
     assert response.status_code == 200
-    assert "2026-10-30 18:55" in telegram_client.messages[-1][1]
+    assert "today at 6:55 PM PKT" in telegram_client.messages[-1][1]
     assert db.scalar(select(func.count()).select_from(Reminder)) == 1
 
 
@@ -1250,7 +1538,9 @@ def test_bare_time_is_not_treated_as_a_new_clarification_command(
     response = post_update(api_client, update_factory(135, text="7 pm"))
 
     assert response.status_code == 200
-    assert "didn't find a reminder request" in telegram_client.messages[-1][1]
+    from reminder_agent.features.intent.messages import GENERAL_MESSAGES
+
+    assert telegram_client.messages[-1][1] in GENERAL_MESSAGES["unrelated"]
     assert db.scalar(select(func.count()).select_from(Reminder)) == 0
     assert db.scalar(select(func.count()).select_from(ConversationSession)) == 0
 

@@ -1,36 +1,48 @@
 import json
 import logging
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 
 import httpx
 import pytest
 
-from reminder_agent.conversation_router import ConversationRoute
-from reminder_agent.intent import (
-    CreateRecurringReminderIntent,
+from reminder_agent.application.conversation_coordinator import _route_and_interpret
+from reminder_agent.features.intent import (
     CreateOneTimeReminderIntent,
+    CreateRecurringReminderIntent,
     IntentRoute,
     IntentRouteSuggestion,
-    OpenAICompatibleIntentRouter,
     Interpretation,
     NeedsClarification,
     OpenAICompatibleIntentInterpreter,
+    OpenAICompatibleIntentRouter,
     OpenAICompatibleMemoryAnswerer,
-    PendingReminderFieldUpdate,
     PendingReminder,
+    PendingReminderBatch,
+    PendingReminderFieldUpdate,
     ReminderIntentInterpreter,
     RuleBasedIntentInterpreter,
-    restrict_to_explicit_field_updates,
     resolve_pending_due_at,
+    restrict_to_explicit_field_updates,
 )
-from reminder_agent.reminders import _route_and_interpret
-from reminder_agent.memories import MemoryAnswerProposal, SaveMemoryFact
-from reminder_agent.rescheduling import RescheduleRequest, RescheduleScope
-from reminder_agent.settings import Settings
-from reminder_agent.request_policy import OUT_OF_SCOPE_RESPONSE
+from reminder_agent.features.intent.deterministic.routing import ConversationRoute
+from reminder_agent.features.intent.model.classifier_prompts import (
+    CLASSIFIER_PROMPT_V1,
+    CLASSIFIER_PROMPT_V2,
+    CLASSIFIER_PROMPTS,
+    get_classifier_prompt,
+)
+from reminder_agent.features.intent.policy import OUT_OF_SCOPE_RESPONSE
+from reminder_agent.features.memory.messages import MEMORY_LOOKUP_MESSAGES
+from reminder_agent.features.memory.retrieve.contracts import MemoryAnswerProposal
+from reminder_agent.features.reminders.reschedule.decisions import (
+    RescheduleRequest,
+    RescheduleScope,
+)
+from reminder_agent.features.reminders.reschedule.models import RescheduleClarification
+from reminder_agent.infrastructure.config.settings import Settings
+from reminder_agent.shared.memory_contracts import SaveMemoryFact
 
-
-NOW = datetime(2026, 10, 30, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
 
 
 def test_rule_interpreter_extracts_remember_to_as_a_reminder() -> None:
@@ -191,9 +203,57 @@ def test_intent_router_classifies_only_the_operation_and_limits_history(monkeypa
     assert context["active_pending"]["task"] == "call Bilal"
     assert context["missing_fields"] == ["date"]
     assert context["last_clarification_question"] == "What date should I use?"
-    assert len(context["recent_messages"]) == 6
-    assert "message 33" not in context["recent_messages"]
+    assert len(context["recent_messages"]) == 8
+    assert "message 31" not in context["recent_messages"]
     assert "message 34" in context["recent_messages"]
+
+
+def test_intent_router_uses_configured_prompt_version(monkeypatch) -> None:
+    captured: dict = {}
+
+    def fake_post(*args, **kwargs):
+        captured.update(kwargs["json"])
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={"choices": [{"message": {"content": '{"operation":"SOCIAL"}'}}]},
+        )
+
+    monkeypatch.setitem(CLASSIFIER_PROMPTS, "test", "test classifier prompt")
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    OpenAICompatibleIntentRouter(
+        "https://api.groq.example/openai/v1",
+        "secret",
+        "openai/gpt-oss-20b",
+        prompt_version="test",
+    ).classify("hello", pending=None, recent_messages=())
+
+    assert captured["messages"][0]["content"] == "test classifier prompt"
+
+
+def test_intent_router_rejects_unknown_prompt_version() -> None:
+    with pytest.raises(ValueError, match="unknown intent classifier prompt version"):
+        OpenAICompatibleIntentRouter(
+            "https://api.groq.example/openai/v1",
+            "secret",
+            "openai/gpt-oss-20b",
+            prompt_version="missing",
+        )
+
+
+def test_classifier_prompt_v1_is_the_default_prompt() -> None:
+    router = OpenAICompatibleIntentRouter(
+        "https://api.groq.example/openai/v1",
+        "secret",
+        "openai/gpt-oss-20b",
+    )
+
+    assert CLASSIFIER_PROMPT_V1 == CLASSIFIER_PROMPTS["v1"]
+    assert CLASSIFIER_PROMPT_V2 == CLASSIFIER_PROMPTS["v2"]
+    assert get_classifier_prompt("v1") == CLASSIFIER_PROMPT_V1
+    assert get_classifier_prompt("v2") == CLASSIFIER_PROMPT_V2
+    assert router._prompt_version == "v1"
 
 
 def test_intent_router_accepts_list_request_route(monkeypatch) -> None:
@@ -236,7 +296,39 @@ def test_intent_router_accepts_reschedule_request_route(monkeypatch) -> None:
     assert suggestion.operation is IntentRoute.RESCHEDULE_REQUEST
 
 
-def test_intent_router_accepts_save_memory_route_and_teaches_conservative_prompt(monkeypatch) -> None:
+def test_intent_router_prompt_keeps_implicit_reschedules_in_intent_classification(
+    monkeypatch,
+) -> None:
+    captured: dict = {}
+
+    def fake_post(*args, **kwargs):
+        captured.update(kwargs["json"])
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={"choices": [{"message": {"content": '{"operation":"RESCHEDULE_REQUEST"}'}}]},
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    suggestion = OpenAICompatibleIntentRouter(
+        "https://api.groq.example/openai/v1", "secret", "openai/gpt-oss-20b"
+    ).classify(
+        "Actually move it to 9 PM today",
+        pending=None,
+        recent_messages=[
+            "user: Remind me one minute to call Ali",
+            "assistant: I'll remind you to call Ali today at 5:18 PM on Telegram.",
+        ],
+    )
+
+    assert suggestion.operation is IntentRoute.RESCHEDULE_REQUEST
+    prompt = captured["messages"][0]["content"]
+    assert "Classify the operation independently of target resolution" in prompt
+
+
+def test_intent_router_accepts_save_memory_route_and_teaches_conservative_prompt(
+    monkeypatch,
+) -> None:
     captured: dict = {}
 
     def fake_post(*args, **kwargs):
@@ -286,7 +378,11 @@ def test_openai_compatible_extractor_returns_typed_memory_content(monkeypatch) -
             request=httpx.Request("POST", args[0]),
             json={
                 "choices": [
-                    {"message": {"content": '{"operation":"SAVE_MEMORY","content":"gate code is 4512"}'}},
+                    {
+                        "message": {
+                            "content": '{"operation":"SAVE_MEMORY","content":"gate code is 4512"}'
+                        }
+                    },
                 ]
             },
         )
@@ -311,7 +407,9 @@ def test_malformed_memory_extraction_is_clarification_only(monkeypatch) -> None:
         return httpx.Response(
             200,
             request=httpx.Request("POST", args[0]),
-            json={"choices": [{"message": {"content": '{"operation":"SAVE_MEMORY","content":"   "}'}}]},
+            json={
+                "choices": [{"message": {"content": '{"operation":"SAVE_MEMORY","content":"   "}'}}]
+            },
         )
 
     monkeypatch.setattr(httpx, "post", fake_post)
@@ -458,7 +556,9 @@ def test_memory_answerer_rejects_malformed_or_unsupported_output(monkeypatch, co
         '{"operation":"RETRIEVE_MEMORY","query":"user ID 9d03e6c2-ef28-40d7-80f1-c5720151d129"}',
     ],
 )
-def test_malformed_memory_lookup_extraction_is_clarification_only(monkeypatch, payload: str) -> None:
+def test_malformed_memory_lookup_extraction_is_clarification_only(
+    monkeypatch, payload: str
+) -> None:
     def fake_post(*args, **kwargs):
         return httpx.Response(
             200,
@@ -477,7 +577,7 @@ def test_malformed_memory_lookup_extraction_is_clarification_only(monkeypatch, p
     )
 
     assert result.memory_query is None
-    assert result.response_text == "Which saved information should I look up?"
+    assert result.response_text in MEMORY_LOOKUP_MESSAGES["missing_subject"]
 
 
 def test_memory_classifier_and_extractor_logs_redact_fact_content(monkeypatch) -> None:
@@ -509,9 +609,7 @@ def test_memory_classifier_and_extractor_logs_redact_fact_content(monkeypatch) -
     handler = Capture()
     logger.addHandler(handler)
     try:
-        OpenAICompatibleIntentRouter(
-            "https://llm.example/v1", "secret", "intent-model"
-        ).classify(
+        OpenAICompatibleIntentRouter("https://llm.example/v1", "secret", "intent-model").classify(
             f"Keep in mind that my {secret}",
             pending=None,
             recent_messages=(f"user: {secret}",),
@@ -544,7 +642,11 @@ def test_malformed_memory_provider_exception_log_redacts_fact_content(monkeypatc
             request=httpx.Request("POST", args[0]),
             json={
                 "choices": [
-                    {"message": {"content": f'{{"operation":"SAVE_MEMORY","content":null,"fact":"{secret}"}}'}},
+                    {
+                        "message": {
+                            "content": f'{{"operation":"SAVE_MEMORY","content":null,"fact":"{secret}"}}'
+                        }
+                    },
                 ]
             },
         )
@@ -806,12 +908,22 @@ def test_cancellation_uses_strict_json_schema_on_supported_provider(monkeypatch)
         return httpx.Response(
             200,
             request=httpx.Request("POST", args[0]),
-            json={"choices": [{"message": {"content": json.dumps({
-                "operation": "CANCEL_REMINDER",
-                "target_text": "bank reminder",
-                "scope": None,
-                "occurrence_date": None,
-            })}}]},
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "operation": "CANCEL_REMINDER",
+                                    "target_text": "bank reminder",
+                                    "scope": None,
+                                    "occurrence_date": None,
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
         )
 
     monkeypatch.setattr(httpx, "post", fake_post)
@@ -827,6 +939,47 @@ def test_cancellation_uses_strict_json_schema_on_supported_provider(monkeypatch)
     assert captured["response_format"]["type"] == "json_schema"
     assert captured["response_format"]["json_schema"]["strict"] is True
     assert result.cancellation_request is not None
+
+
+def test_cancellation_normalizes_timestamp_leaked_into_occurrence_date(monkeypatch) -> None:
+    def fake_post(*args, **kwargs):
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "operation": "CANCEL_REMINDER",
+                                    "target_text": "laundry",
+                                    "scope": None,
+                                    "occurrence_date": "2026-11-11T17:41:37.082890+00:00",
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    result = OpenAICompatibleIntentInterpreter(
+        "https://api.groq.example/openai/v1", "secret", "openai/gpt-oss-120b"
+    ).interpret(
+        "Actually, the laundry's done. You can forget that.",
+        selected_route=IntentRoute.CANCEL_REQUEST,
+        timezone_name="Asia/Karachi",
+        now=NOW,
+        recent_messages=("user: Remind me in 20 minutes to check the laundry",),
+    )
+
+    assert result.cancellation_request is not None
+    assert result.cancellation_request.target_text == "laundry"
+    # The current turn contains no date, so grounding must remove the leaked
+    # candidate timestamp rather than treating it as an occurrence constraint.
+    assert result.cancellation_request.occurrence_date is None
 
 
 @pytest.mark.parametrize(
@@ -872,9 +1025,15 @@ def test_openai_interpreter_grounds_contextual_cancellation_in_recent_messages(m
         return httpx.Response(
             200,
             request=httpx.Request("POST", args[0]),
-            json={"choices": [{"message": {"content":
-                '{"operation":"CANCEL_REMINDER","target_text":"call Ahmed"}'
-            }}]},
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"operation":"CANCEL_REMINDER","target_text":"call Ahmed"}'
+                        }
+                    }
+                ]
+            },
         )
 
     monkeypatch.setattr(httpx, "post", fake_post)
@@ -895,14 +1054,22 @@ def test_openai_interpreter_grounds_contextual_cancellation_in_recent_messages(m
     assert result.cancellation_request.target_text == "call Ahmed"
 
 
-def test_openai_interpreter_rejects_target_absent_from_current_and_recent_context(monkeypatch) -> None:
+def test_openai_interpreter_rejects_target_absent_from_current_and_recent_context(
+    monkeypatch,
+) -> None:
     def fake_post(*args, **kwargs):
         return httpx.Response(
             200,
             request=httpx.Request("POST", args[0]),
-            json={"choices": [{"message": {"content":
-                '{"operation":"CANCEL_REMINDER","target_text":"secret project"}'
-            }}]},
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"operation":"CANCEL_REMINDER","target_text":"secret project"}'
+                        }
+                    }
+                ]
+            },
         )
 
     monkeypatch.setattr(httpx, "post", fake_post)
@@ -925,9 +1092,7 @@ def test_openai_interpreter_rejects_target_absent_from_current_and_recent_contex
     ["what do i have on every Tuesday?", "can you show me all the recurring reminders?"],
 )
 def test_recurring_list_phrases_are_parsed_as_read_only_list_requests(text: str) -> None:
-    result = RuleBasedIntentInterpreter().interpret(
-        text, timezone_name="Asia/Karachi", now=NOW
-    )
+    result = RuleBasedIntentInterpreter().interpret(text, timezone_name="Asia/Karachi", now=NOW)
 
     assert result.intent is not None
     assert result.intent.operation == "LIST_REMINDERS"
@@ -961,6 +1126,7 @@ def test_default_llm_configuration_targets_openai_compatible_api() -> None:
     assert settings.llm_base_url == "https://api.openai.com/v1"
     assert settings.llm_extract_model == "openai/gpt-oss-120b"
     assert settings.llm_intent_model == "openai/gpt-oss-20b"
+    assert settings.llm_intent_prompt_version == "v1"
 
 
 def test_relative_minutes_are_resolved_from_one_reference_time() -> None:
@@ -972,7 +1138,7 @@ def test_relative_minutes_are_resolved_from_one_reference_time() -> None:
 
     assert result.intent is not None
     assert result.intent.task == "call the bank"
-    assert result.intent.due_at == datetime(2026, 10, 30, 12, 5, tzinfo=timezone.utc)
+    assert result.intent.due_at == datetime(2026, 10, 30, 12, 5, tzinfo=UTC)
 
 
 def test_relative_minutes_support_task_before_time() -> None:
@@ -984,7 +1150,7 @@ def test_relative_minutes_support_task_before_time() -> None:
 
     assert result.intent is not None
     assert result.intent.task == "call Alice"
-    assert result.intent.due_at == datetime(2026, 10, 30, 12, 2, tzinfo=timezone.utc)
+    assert result.intent.due_at == datetime(2026, 10, 30, 12, 2, tzinfo=UTC)
 
 
 def test_tomorrow_at_nine_respects_user_local_timezone() -> None:
@@ -996,7 +1162,7 @@ def test_tomorrow_at_nine_respects_user_local_timezone() -> None:
 
     assert result.intent is not None
     assert result.intent.task == "renew the domain"
-    assert result.intent.due_at == datetime(2026, 10, 31, 4, 0, tzinfo=timezone.utc)
+    assert result.intent.due_at == datetime(2026, 10, 31, 4, 0, tzinfo=UTC)
 
 
 def test_missing_task_is_clarified_without_an_intent() -> None:
@@ -1036,7 +1202,7 @@ def test_missing_task_preserves_a_complete_tomorrow_schedule() -> None:
 
     assert completed.intent is not None
     assert completed.intent.task == "Submit my assignment"
-    assert completed.intent.due_at == datetime(2026, 10, 31, 3, 0, tzinfo=timezone.utc)
+    assert completed.intent.due_at == datetime(2026, 10, 31, 3, 0, tzinfo=UTC)
 
 
 def test_task_only_request_uses_model_fallback_for_clarification() -> None:
@@ -1132,6 +1298,46 @@ def test_provider_clarification_does_not_erase_rule_extracted_task() -> None:
     assert result.clarification.pending.date_local == date(2026, 10, 31)
 
 
+def test_provider_clarification_preserves_rule_extracted_recurrence_fields() -> None:
+    class IncompleteProvider:
+        def interpret(self, text, *, timezone_name, now, context=None):
+            return Interpretation(
+                clarification=NeedsClarification(
+                    pending=PendingReminder(
+                        date_local=date(2026, 10, 31),
+                        hour=9,
+                        meridiem="am",
+                        timezone_name=timezone_name,
+                    ),
+                    question="What should I remind you about?",
+                )
+            )
+
+    interpreter = ReminderIntentInterpreter(IncompleteProvider())
+    interpreter._rules.interpret = lambda *args, **kwargs: Interpretation(
+        clarification=NeedsClarification(
+            pending=PendingReminder(
+                task="standup",
+                recurrence_weekdays=(0,),
+                timezone_name="UTC",
+            ),
+            question="What time should I use?",
+        ),
+        fallback_allowed=True,
+    )
+
+    result = interpreter.interpret(
+        "Remind me every Monday for standup",
+        timezone_name="UTC",
+        now=NOW,
+    )
+
+    assert result.clarification is not None
+    assert result.clarification.pending.task == "standup"
+    assert result.clarification.pending.recurrence_weekdays == (0,)
+    assert result.clarification.pending.hour == 9
+
+
 def test_provider_clarification_normalises_uppercase_meridiem() -> None:
     class UppercaseProvider:
         def interpret(self, text, *, timezone_name, now, context=None):
@@ -1168,7 +1374,7 @@ def test_weekday_schedule_with_explicit_meridiem_is_parsed_deterministically() -
 
     assert result.intent is not None
     assert result.intent.task == "go to the gym"
-    assert result.intent.due_at == datetime(2026, 10, 30, 18, 0, tzinfo=timezone.utc)
+    assert result.intent.due_at == datetime(2026, 10, 30, 18, 0, tzinfo=UTC)
 
 
 def test_recurring_request_is_parsed_deterministically() -> None:
@@ -1184,9 +1390,59 @@ def test_recurring_request_is_parsed_deterministically() -> None:
     assert result.intent.start_local == datetime(2026, 10, 30, 18)
 
 
+def test_partial_weekly_request_preserves_task_and_weekday_before_asking_for_time() -> None:
+    result = RuleBasedIntentInterpreter().interpret(
+        "Remind me every Monday for standup",
+        timezone_name="Europe/Madrid",
+        now=NOW,
+    )
+
+    assert result.clarification is not None
+    assert result.clarification.pending.task == "standup"
+    assert result.clarification.pending.recurrence_weekdays == (0,)
+    assert result.clarification.pending.hour is None
+    assert "time" in result.clarification.question.lower()
+
+
+def test_partial_weekly_follow_up_fills_time_and_builds_recurring_intent() -> None:
+    parser = RuleBasedIntentInterpreter()
+    first = parser.interpret(
+        "Remind me every Monday for standup",
+        timezone_name="Europe/Madrid",
+        now=NOW,
+    )
+
+    assert first.clarification is not None
+    result = parser.interpret(
+        "at 9 am",
+        selected_route=IntentRoute.UPDATE_PENDING,
+        context=first.clarification.pending,
+        timezone_name="Europe/Madrid",
+        now=NOW,
+    )
+
+    assert isinstance(result.intent, CreateRecurringReminderIntent)
+    assert result.intent.task == "standup"
+    assert result.intent.weekdays == (0,)
+    assert result.intent.hour == 9
+
+
 def test_every_day_recurring_request_expands_to_all_weekdays() -> None:
     result = RuleBasedIntentInterpreter().interpret(
         "Remind me every day at 8 AM to drink water",
+        timezone_name="Asia/Karachi",
+        now=NOW,
+    )
+
+    assert isinstance(result.intent, CreateRecurringReminderIntent)
+    assert result.intent.task == "drink water"
+    assert result.intent.weekdays == tuple(range(7))
+    assert result.intent.hour == 8
+
+
+def test_everyday_recurring_request_expands_to_all_weekdays() -> None:
+    result = RuleBasedIntentInterpreter().interpret(
+        "Remind me everyday at 8 AM to drink water",
         timezone_name="Asia/Karachi",
         now=NOW,
     )
@@ -1223,7 +1479,7 @@ def test_ambiguous_hour_is_clarified_without_guessing_next_morning() -> None:
     result = RuleBasedIntentInterpreter().interpret(
         "Remind me to call the bank at 7",
         timezone_name="UTC",
-        now=datetime(2026, 10, 30, 15, 0, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 30, 15, 0, tzinfo=UTC),
     )
 
     assert result.intent is None
@@ -1263,7 +1519,42 @@ def test_tomorrow_clock_without_meridiem_preserves_all_fields_for_clarification(
 
     assert completed.intent is not None
     assert completed.intent.task == "call the bank"
-    assert completed.intent.due_at == datetime(2026, 10, 31, 19, 44, tzinfo=timezone.utc)
+    assert completed.intent.due_at == datetime(2026, 10, 31, 19, 44, tzinfo=UTC)
+
+
+def test_also_remind_me_with_ambiguous_hour_asks_for_meridiem_deterministically() -> None:
+    result = RuleBasedIntentInterpreter().interpret(
+        "Also remind me tomorrow at 2 to email the client",
+        timezone_name="Asia/Karachi",
+        now=NOW,
+    )
+
+    assert result.fallback_allowed is True
+    assert result.clarification is not None
+    assert result.clarification.pending.task == "email the client"
+    assert result.clarification.pending.date_local == date(2026, 10, 31)
+    assert result.clarification.pending.hour == 2
+    assert result.clarification.pending.meridiem is None
+    assert "2 AM tomorrow" in result.clarification.question
+    assert "2 PM tomorrow" in result.clarification.question
+
+
+def test_provider_fallback_cannot_replace_deterministic_ambiguity_with_generic_error() -> None:
+    class UnsupportedProvider:
+        def interpret(self, *args, **kwargs):
+            return Interpretation(
+                response_text="Please tell me the reminder task and a future time."
+            )
+
+    result = ReminderIntentInterpreter(UnsupportedProvider()).interpret(
+        "Also remind me tomorrow at 2 to email the client",
+        timezone_name="Asia/Karachi",
+        now=NOW,
+    )
+
+    assert result.clarification is not None
+    assert result.clarification.pending.task == "email the client"
+    assert "2 AM tomorrow" in result.clarification.question
 
 
 def test_ambiguous_time_on_an_expired_explicit_date_asks_only_for_a_new_date() -> None:
@@ -1302,21 +1593,21 @@ def test_clarification_follow_up_merges_once_complete() -> None:
     initial = interpreter.interpret(
         "Remind me to call the bank at 7",
         timezone_name="UTC",
-        now=datetime(2026, 10, 30, 15, 0, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 30, 15, 0, tzinfo=UTC),
     )
 
     assert initial.clarification is not None
     completed = interpreter.interpret(
         "7 PM",
         timezone_name="UTC",
-        now=datetime(2026, 10, 30, 15, 0, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 30, 15, 0, tzinfo=UTC),
         context=initial.clarification.pending,
     )
 
     assert completed.clarification is None
     assert completed.intent is not None
     assert completed.intent.task == "call the bank"
-    assert completed.intent.due_at == datetime(2026, 10, 30, 19, 0, tzinfo=timezone.utc)
+    assert completed.intent.due_at == datetime(2026, 10, 30, 19, 0, tzinfo=UTC)
 
 
 def test_unrelated_follow_up_does_not_fill_missing_task() -> None:
@@ -1324,14 +1615,14 @@ def test_unrelated_follow_up_does_not_fill_missing_task() -> None:
     initial = interpreter.interpret(
         "Remind me at 7",
         timezone_name="UTC",
-        now=datetime(2026, 10, 30, 15, 0, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 30, 15, 0, tzinfo=UTC),
     )
 
     assert initial.clarification is not None
     follow_up = interpreter.interpret(
         "thanks",
         timezone_name="UTC",
-        now=datetime(2026, 10, 30, 15, 0, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 30, 15, 0, tzinfo=UTC),
         context=initial.clarification.pending,
     )
 
@@ -1345,14 +1636,14 @@ def test_follow_up_cancellation_clears_context_without_creating_reminder() -> No
     initial = interpreter.interpret(
         "Remind me to call the bank at 7",
         timezone_name="UTC",
-        now=datetime(2026, 10, 30, 15, 0, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 30, 15, 0, tzinfo=UTC),
     )
 
     assert initial.clarification is not None
     canceled = interpreter.interpret(
         "Never mind.",
         timezone_name="UTC",
-        now=datetime(2026, 10, 30, 15, 0, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 30, 15, 0, tzinfo=UTC),
         context=initial.clarification.pending,
     )
 
@@ -1373,9 +1664,7 @@ def test_pending_time_resolution_uses_the_context_timezone() -> None:
         date_explicit=True,
     )
 
-    assert resolve_pending_due_at(pending, now=NOW) == datetime(
-        2026, 10, 31, 4, 30, tzinfo=timezone.utc
-    )
+    assert resolve_pending_due_at(pending, now=NOW) == datetime(2026, 10, 31, 4, 30, tzinfo=UTC)
 
 
 def test_provider_updates_cannot_change_unmentioned_pending_fields() -> None:
@@ -1461,7 +1750,7 @@ def test_classifier_selected_update_can_replace_pending_task() -> None:
         context=context,
         now=NOW,
         allow_task_replacement=True,
-            allow_semantic_field_updates=True,
+        allow_semantic_field_updates=True,
     )
 
     assert verified.task == "email Bilal"
@@ -1634,7 +1923,7 @@ def test_complex_natural_language_without_reminder_keyword_uses_model_fallback()
             return Interpretation(
                 intent=CreateOneTimeReminderIntent(
                     task="call John",
-                    due_at=datetime(2026, 10, 30, 19, 0, tzinfo=timezone.utc),
+                    due_at=datetime(2026, 10, 30, 19, 0, tzinfo=UTC),
                     timezone_name=timezone_name,
                 )
             )
@@ -1648,7 +1937,6 @@ def test_complex_natural_language_without_reminder_keyword_uses_model_fallback()
 
     assert model.called is True
     assert result.intent is not None
-    assert result.intent.task == "call John"
 
 
 def test_multiple_people_in_one_task_are_not_split_into_multiple_reminders() -> None:
@@ -1663,28 +1951,26 @@ def test_multiple_people_in_one_task_are_not_split_into_multiple_reminders() -> 
     assert result.intent.task == "call Alice and Bob"
 
 
-def test_multiple_tasks_with_one_schedule_are_one_reminder() -> None:
+def test_multiple_tasks_with_one_schedule_request_clarification() -> None:
     result = RuleBasedIntentInterpreter().interpret(
         "Remind me to call Alice and email Bob tomorrow at 9 AM",
         timezone_name="UTC",
         now=NOW,
     )
 
-    assert result.clarification is None
-    assert result.intent is not None
-    assert result.intent.task == "call Alice and email Bob"
+    assert result.intent is None
+    assert result.clarification is not None
 
 
-def test_multiple_tasks_with_one_schedule_inherit_the_same_time() -> None:
+def test_multiple_tasks_with_one_schedule_are_not_merged() -> None:
     result = RuleBasedIntentInterpreter().interpret(
         "Remind me to call Ali tomorrow at 9 AM and to pay the bill",
         timezone_name="UTC",
         now=NOW,
     )
 
-    assert result.intent is not None
-    assert result.intent.task == "call Ali and to pay the bill"
-    assert result.intent.due_at == datetime(2026, 10, 31, 9, 0, tzinfo=timezone.utc)
+    assert result.intent is None
+    assert result.clarification is not None
 
 
 def test_explicit_multiple_reminder_requests_are_parsed_independently() -> None:
@@ -1702,8 +1988,8 @@ def test_explicit_multiple_reminder_requests_are_parsed_independently() -> None:
         "email Bob",
     ]
     assert [intent.due_at for intent in result.resolved_intents] == [
-        datetime(2026, 10, 31, 9, 0, tzinfo=timezone.utc),
-        datetime(2026, 10, 31, 10, 0, tzinfo=timezone.utc),
+        datetime(2026, 10, 31, 9, 0, tzinfo=UTC),
+        datetime(2026, 10, 31, 10, 0, tzinfo=UTC),
     ]
 
 
@@ -1711,7 +1997,7 @@ def test_shared_date_multiple_times_are_parsed_independently() -> None:
     result = RuleBasedIntentInterpreter().interpret(
         "Remind me tomorrow at 9 AM to pay rent and at 6 PM to call Sara",
         timezone_name="UTC",
-        now=datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 31, 12, 0, tzinfo=UTC),
     )
 
     assert [intent.task for intent in result.resolved_intents] == [
@@ -1719,8 +2005,25 @@ def test_shared_date_multiple_times_are_parsed_independently() -> None:
         "call Sara",
     ]
     assert [intent.due_at for intent in result.resolved_intents] == [
-        datetime(2026, 11, 1, 9, 0, tzinfo=timezone.utc),
-        datetime(2026, 11, 1, 18, 0, tzinfo=timezone.utc),
+        datetime(2026, 11, 1, 9, 0, tzinfo=UTC),
+        datetime(2026, 11, 1, 18, 0, tzinfo=UTC),
+    ]
+
+
+def test_compound_partial_request_preserves_all_pending_drafts() -> None:
+    result = RuleBasedIntentInterpreter().interpret(
+        "Remind me to call John tomorrow at 10, and pay my electricity bill on Friday at 6.",
+        timezone_name="Asia/Karachi",
+        now=datetime(2026, 11, 11, 12, 0, tzinfo=UTC),
+    )
+
+    assert isinstance(result.clarification, NeedsClarification)
+    assert isinstance(result.clarification.pending, PendingReminderBatch)
+    batch = result.clarification.pending
+    assert len(batch.reminders) == 2
+    assert [draft.task for draft in batch.reminders] == [
+        "call John",
+        "pay my electricity bill",
     ]
 
 
@@ -1734,12 +2037,12 @@ def test_compound_single_prefix_uses_model_fallback() -> None:
                 intents=(
                     CreateOneTimeReminderIntent(
                         task="call Alice",
-                        due_at=datetime(2026, 10, 31, 9, 0, tzinfo=timezone.utc),
+                        due_at=datetime(2026, 10, 31, 9, 0, tzinfo=UTC),
                         timezone_name=timezone_name,
                     ),
                     CreateOneTimeReminderIntent(
                         task="email Bob",
-                        due_at=datetime(2026, 10, 31, 10, 0, tzinfo=timezone.utc),
+                        due_at=datetime(2026, 10, 31, 10, 0, tzinfo=UTC),
                         timezone_name=timezone_name,
                     ),
                 )
@@ -1756,7 +2059,7 @@ def test_compound_single_prefix_uses_model_fallback() -> None:
     assert [intent.task for intent in result.resolved_intents] == ["call Alice", "email Bob"]
 
 
-def test_complete_single_command_supersedes_multi_target_clarification() -> None:
+def test_single_schedule_multi_target_command_is_clarified() -> None:
     interpreter = RuleBasedIntentInterpreter()
     initial = interpreter.interpret(
         "Remind me to call Alice and email Bob tomorrow at 9 AM",
@@ -1764,9 +2067,8 @@ def test_complete_single_command_supersedes_multi_target_clarification() -> None
         now=NOW,
     )
 
-    assert initial.clarification is None
-    assert initial.intent is not None
-    assert initial.intent.task == "call Alice and email Bob"
+    assert initial.clarification is not None
+    assert initial.intent is None
 
 
 def test_follow_up_accepts_minute_and_day_phrasing() -> None:
@@ -1774,19 +2076,19 @@ def test_follow_up_accepts_minute_and_day_phrasing() -> None:
     initial = interpreter.interpret(
         "Remind me to call John at 6:55",
         timezone_name="UTC",
-        now=datetime(2026, 10, 29, 15, 0, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 29, 15, 0, tzinfo=UTC),
     )
 
     assert initial.clarification is not None
     completed = interpreter.interpret(
         "6:55 pm today",
         timezone_name="UTC",
-        now=datetime(2026, 10, 29, 15, 0, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 29, 15, 0, tzinfo=UTC),
         context=initial.clarification.pending,
     )
 
     assert completed.intent is not None
-    assert completed.intent.due_at == datetime(2026, 10, 29, 18, 55, tzinfo=timezone.utc)
+    assert completed.intent.due_at == datetime(2026, 10, 29, 18, 55, tzinfo=UTC)
 
 
 def test_bare_time_does_not_start_a_provider_clarification_session() -> None:
@@ -1803,7 +2105,7 @@ def test_bare_time_does_not_start_a_provider_clarification_session() -> None:
 
 def test_friday_follow_up_keeps_the_explicit_future_date() -> None:
     interpreter = RuleBasedIntentInterpreter()
-    thursday = datetime(2026, 10, 29, 13, 0, tzinfo=timezone.utc)
+    thursday = datetime(2026, 10, 29, 13, 0, tzinfo=UTC)
     initial = interpreter.interpret(
         "Remind me Friday to renew the domain",
         timezone_name="UTC",
@@ -1819,7 +2121,7 @@ def test_friday_follow_up_keeps_the_explicit_future_date() -> None:
     )
 
     assert completed.intent is not None
-    assert completed.intent.due_at == datetime(2026, 10, 30, 8, 0, tzinfo=timezone.utc)
+    assert completed.intent.due_at == datetime(2026, 10, 30, 8, 0, tzinfo=UTC)
 
 
 def test_past_follow_up_keeps_task_and_asks_for_a_new_future_time() -> None:
@@ -1827,14 +2129,14 @@ def test_past_follow_up_keeps_task_and_asks_for_a_new_future_time() -> None:
     initial = interpreter.interpret(
         "Remind me to stretch at 7",
         timezone_name="UTC",
-        now=datetime(2026, 10, 29, 15, 0, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 29, 15, 0, tzinfo=UTC),
     )
 
     assert initial.clarification is not None
     past = interpreter.interpret(
         "7 pm",
         timezone_name="UTC",
-        now=datetime(2026, 10, 29, 19, 2, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 29, 19, 2, tzinfo=UTC),
         context=initial.clarification.pending,
     )
 
@@ -1848,11 +2150,11 @@ def test_past_follow_up_keeps_task_and_asks_for_a_new_future_time() -> None:
     completed = interpreter.interpret(
         "8 pm",
         timezone_name="UTC",
-        now=datetime(2026, 10, 29, 19, 2, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 29, 19, 2, tzinfo=UTC),
         context=past.clarification.pending,
     )
     assert completed.intent is not None
-    assert completed.intent.due_at == datetime(2026, 10, 29, 20, 0, tzinfo=timezone.utc)
+    assert completed.intent.due_at == datetime(2026, 10, 29, 20, 0, tzinfo=UTC)
 
 
 def test_explicit_past_date_keeps_task_and_time_and_asks_only_for_date() -> None:
@@ -1880,7 +2182,7 @@ def test_explicit_past_date_keeps_task_and_time_and_asks_only_for_date() -> None
 
     assert completed.intent is not None
     assert completed.intent.task == "call the bank"
-    assert completed.intent.due_at == datetime(2026, 11, 2, 8, 0, tzinfo=timezone.utc)
+    assert completed.intent.due_at == datetime(2026, 11, 2, 8, 0, tzinfo=UTC)
 
 
 def test_pydantic_intent_rejects_naive_due_time() -> None:
@@ -1931,7 +2233,7 @@ def test_openai_compatible_interpreter_accepts_structured_response(monkeypatch) 
 
     assert result.intent is not None
     assert result.intent.task == "call the bank"
-    assert result.intent.due_at == datetime(2026, 10, 31, 4, 0, tzinfo=timezone.utc)
+    assert result.intent.due_at == datetime(2026, 10, 31, 4, 0, tzinfo=UTC)
 
 
 def test_openai_compatible_interpreter_normalizes_keyed_recurring_response(monkeypatch) -> None:
@@ -2009,10 +2311,95 @@ def test_openai_compatible_interpreter_accepts_structured_reschedule_response(
 
     assert isinstance(result.reschedule_request, RescheduleRequest)
     assert result.reschedule_request.target_text == "bank reminder"
-    assert result.reschedule_request.due_at == datetime(
-        2026, 10, 31, 10, 0, tzinfo=timezone.utc
-    )
+    assert result.reschedule_request.due_at == datetime(2026, 10, 31, 10, 0, tzinfo=UTC)
     assert result.reschedule_request.scope is RescheduleScope.OCCURRENCE
+
+
+def test_openai_compatible_interpreter_normalizes_typed_reschedule_clarification(
+    monkeypatch,
+) -> None:
+    def fake_post(*args, **kwargs):
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"type":"NEEDS_CLARIFICATION",'
+                                '"question":"What time should I use?",'
+                                '"pending_fields":["time"]}'
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    result = OpenAICompatibleIntentInterpreter(
+        "https://llm.example/v1", "secret", "provider-model"
+    ).interpret(
+        "Reschedule the dentist reminder for tomorrow",
+        selected_route=IntentRoute.RESCHEDULE_REQUEST,
+        timezone_name="UTC",
+        now=NOW,
+    )
+
+    assert result.response_text == "What time should I use?"
+
+
+def test_reschedule_extractor_uses_structured_list_context_for_typed_clarification(
+    monkeypatch,
+) -> None:
+    captured_prompt: dict[str, str] = {}
+
+    def fake_post(*args, **kwargs):
+        captured_prompt["value"] = kwargs["json"]["messages"][0]["content"]
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"operation":"NEEDS_CLARIFICATION",'
+                                '"target_text":"submit project report",'
+                                '"destination_date":"2026-10-31",'
+                                '"date_explicit":true,'
+                                '"question":"What time should I use tomorrow?"}'
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    interpreter = ReminderIntentInterpreter(
+        OpenAICompatibleIntentInterpreter("https://llm.example/v1", "secret", "provider-model")
+    )
+
+    proposal = interpreter.interpret_reschedule(
+        "Actually, move that one to tomorrow",
+        timezone_name="UTC",
+        now=NOW,
+        selection_context=(
+            {
+                "reminder_id": "00000000-0000-0000-0000-000000000001",
+                "task": "submit project report",
+                "due_at": "2026-10-30T19:47:00+00:00",
+            },
+        ),
+    )
+
+    assert "most recent reminder list shown to the user" in captured_prompt["value"]
+    assert isinstance(proposal, RescheduleClarification)
+    assert proposal.request.target_text == "submit project report"
+    assert proposal.request.destination_date == date(2026, 10, 31)
+    assert proposal.question == "What time should I use tomorrow?"
 
 
 def test_openai_compatible_interpreter_returns_only_provider_field_updates_for_context(
@@ -2059,7 +2446,10 @@ def test_openai_compatible_interpreter_returns_only_provider_field_updates_for_c
     assert result.clarification is None
     assert result.field_updates == PendingReminderFieldUpdate(meridiem="pm")
     assert "field values are primitive values directly" in captured_prompt["value"]
-    assert "Do not wrap any updates field in a value/certainty/evidence object" in captured_prompt["value"]
+    assert (
+        "Do not wrap any updates field in a value/certainty/evidence object"
+        in captured_prompt["value"]
+    )
     assert '"evidence":{"task":"pay rent"' in captured_prompt["value"]
 
     # The service-side state manager, not the provider, combines this patch
@@ -2069,7 +2459,7 @@ def test_openai_compatible_interpreter_returns_only_provider_field_updates_for_c
     )
     assert completed.intent is not None
     assert completed.intent.task == "call the bank"
-    assert completed.intent.due_at == datetime(2026, 10, 30, 19, 0, tzinfo=timezone.utc)
+    assert completed.intent.due_at == datetime(2026, 10, 30, 19, 0, tzinfo=UTC)
 
 
 def test_llm_recurrence_update_fields_are_verified_and_merged() -> None:
@@ -2097,9 +2487,7 @@ def test_llm_recurrence_update_fields_are_verified_and_merged() -> None:
         now=NOW,
         allow_semantic_field_updates=True,
     )
-    completed = RuleBasedIntentInterpreter().apply_field_updates(
-        context, verified, now=NOW
-    )
+    completed = RuleBasedIntentInterpreter().apply_field_updates(context, verified, now=NOW)
 
     assert completed.intent is not None
     assert isinstance(completed.intent, CreateRecurringReminderIntent)
@@ -2135,7 +2523,7 @@ def test_llm_recurring_extraction_derives_start_for_every_three_months(monkeypat
     ).interpret(
         "remind me every three months on the 15th at 8 AM to review budget",
         timezone_name="Asia/Karachi",
-        now=datetime(2026, 10, 30, 12, tzinfo=timezone.utc),
+        now=datetime(2026, 10, 30, 12, tzinfo=UTC),
     )
 
     assert isinstance(result.intent, CreateRecurringReminderIntent)

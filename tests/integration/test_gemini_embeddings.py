@@ -4,14 +4,15 @@ import os
 import httpx
 import pytest
 
-from reminder_agent.embeddings import (
+from reminder_agent.features.intent import OpenAICompatibleMemoryAnswerer
+from reminder_agent.features.memory.persistence import save_memory_fact
+from reminder_agent.features.memory.retrieve.persistence import lookup_memory_fact
+from reminder_agent.infrastructure.database.models import User
+from reminder_agent.infrastructure.providers.embeddings import (
     EmbeddingProviderError,
     GeminiEmbeddingProvider,
 )
-from reminder_agent.db.models import User
-from reminder_agent.intent import OpenAICompatibleMemoryAnswerer
-from reminder_agent.memories import lookup_memory_fact, save_memory_fact
-from reminder_agent.settings import Settings
+from reminder_agent.infrastructure.config.settings import Settings
 
 
 def _configured_gemini_key() -> str:
@@ -25,9 +26,7 @@ def _configured_gemini_key() -> str:
 
 def _configured_llm_key() -> str:
     return (
-        os.getenv("LLM_API_KEY")
-        or os.getenv("GROQ_API_KEY")
-        or (Settings().llm_api_key or "")
+        os.getenv("LLM_API_KEY") or os.getenv("GROQ_API_KEY") or (Settings().llm_api_key or "")
     ).strip()
 
 
@@ -55,7 +54,7 @@ def test_fake_gemini_response_uses_document_and_query_tasks(monkeypatch) -> None
         # normalization after truncating the MRL prefix to 1536 dimensions.
         return _FakeResponse({"embedding": {"values": [3.0] * 3072}})
 
-    monkeypatch.setattr("reminder_agent.embeddings.httpx.post", fake_post)
+    monkeypatch.setattr("reminder_agent.infrastructure.providers.embeddings.httpx.post", fake_post)
     provider = GeminiEmbeddingProvider(
         base_url="https://generativelanguage.googleapis.com/v1beta",
         api_key="test-key",
@@ -70,17 +69,14 @@ def test_fake_gemini_response_uses_document_and_query_tasks(monkeypatch) -> None
     assert calls[0]["headers"] == {"x-goog-api-key": "test-key"}
     assert calls[0]["json"]["embedContentConfig"]["taskType"] == "RETRIEVAL_DOCUMENT"
     assert calls[1]["json"]["embedContentConfig"]["taskType"] == "RETRIEVAL_QUERY"
-    assert all(
-        call["json"]["embedContentConfig"]["outputDimensionality"] == 1536
-        for call in calls
-    )
+    assert all(call["json"]["embedContentConfig"]["outputDimensionality"] == 1536 for call in calls)
     assert all(call["json"]["model"] == "models/gemini-embedding-001" for call in calls)
     assert query == document
 
 
 def test_fake_gemini_malformed_response_is_sanitized(monkeypatch) -> None:
     monkeypatch.setattr(
-        "reminder_agent.embeddings.httpx.post",
+        "reminder_agent.infrastructure.providers.embeddings.httpx.post",
         lambda *args, **kwargs: _FakeResponse({"unexpected": []}),
     )
     provider = GeminiEmbeddingProvider(

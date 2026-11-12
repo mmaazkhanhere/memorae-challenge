@@ -1,0 +1,1 @@
+"""Vapi channel adapter."""

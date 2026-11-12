@@ -1,30 +1,6 @@
-from collections.abc import Generator
+"""Compatibility alias for infrastructure database sessions."""
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import Session, sessionmaker
+import sys as _sys
+from importlib import import_module as _import_module
 
-from reminder_agent.settings import get_settings
-
-
-def build_engine(database_url: str | None = None):
-    url = database_url or get_settings().database_url
-    connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
-    return create_engine(
-        url,
-        future=True,
-        pool_pre_ping=True,
-        connect_args=connect_args,
-        hide_parameters=True,
-    )
-
-
-engine = build_engine()
-SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False, expire_on_commit=False)
-
-
-def get_db() -> Generator[Session, None, None]:
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+_sys.modules[__name__] = _import_module("reminder_agent.infrastructure.database.session")

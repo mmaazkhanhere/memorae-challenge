@@ -2,12 +2,13 @@ from enum import StrEnum
 
 import pytest
 
-from reminder_agent.request_policy import (
+from reminder_agent.features.intent.policy import (
     OUT_OF_SCOPE_RESPONSE,
     RequestDisposition,
     assess_request,
     is_supported_operation,
 )
+from reminder_agent.features.intent.messages import GENERAL_MESSAGES
 
 
 class OperationAlias(StrEnum):
@@ -35,7 +36,7 @@ def test_prompt_injection_is_rejected_as_untrusted_input() -> None:
 
     assert assessment.disposition is RequestDisposition.OUT_OF_SCOPE
     assert assessment.reason == "prompt_injection"
-    assert OUT_OF_SCOPE_RESPONSE.startswith("I can only help")
+    assert OUT_OF_SCOPE_RESPONSE in GENERAL_MESSAGES["unrelated"]
 
 
 @pytest.mark.parametrize(

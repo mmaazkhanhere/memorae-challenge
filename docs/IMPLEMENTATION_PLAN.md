@@ -1,8 +1,8 @@
 # Memorae — Vertical Slice Implementation Plan
 
-**Project:** Two-week, solo, voice-first reminder and memory agent  
-**Channels required:** Telegram (text, voice notes, reminder delivery) and a live phone voice agent  
-**Selected stack:** Python/FastAPI, Telegram Bot API, Vapi, Groq (Whisper and structured interpretation), SQLAlchemy/Alembic, PostgreSQL (local Docker; hosted Neon), PostgreSQL-backed scheduler worker, Railway.  
+**Project:** Two-week, solo, voice-first reminder and memory agent
+**Channels required:** Telegram (text, voice notes, reminder delivery) and a live phone voice agent
+**Selected stack:** Python/FastAPI, Telegram Bot API, Vapi, Groq (Whisper and structured interpretation), SQLAlchemy/Alembic, PostgreSQL (local Docker; hosted Neon), PostgreSQL-backed scheduler worker, Railway.
 **Principle:** Build and demonstrate user-visible business outcomes from entry point to persistence and response. Grow shared components when first used, not as a separate architecture-building phase.
 
 **Mandatory architecture invariant:** Every slice and channel must preserve the deterministic-first, LLM-fallback pipeline in [Architecture.md](Architecture.md#92-deterministic-first-natural-language-processing). A slice plan and its code review must show: authenticated canonical-user and pending-context handling; deterministic routing and extraction before the existing LLM fallbacks; deterministic validation and authorization before shared-service execution; transactional/idempotent mutation; and clarification or the defined scope-limitation response without mutation when the request cannot safely proceed. Changes to this invariant require explicit project-owner approval before implementation.
@@ -51,9 +51,9 @@ Before marking a slice complete, verify the deterministic-first invariant: simpl
 
 ### VS-01 — Onboard a Telegram user
 
-**Outcome:** `/start` produces an active account with a stable Telegram identity, name, time zone, and delivery chat.  
-**Depends on:** Nothing.  
-**Implementation:** Create a minimal FastAPI `/webhook/telegram` entry point; verify the webhook secret; extract Telegram sender/chat IDs; create or get `users` and `channel_identities` in PostgreSQL using SQLAlchemy/Alembic; ask for/validate IANA time zone; take display name from profile or ask; respond through Telegram. Bring up app, DB and migrations via reproducible local configuration.  
+**Outcome:** `/start` produces an active account with a stable Telegram identity, name, time zone, and delivery chat.
+**Depends on:** Nothing.
+**Implementation:** Create a minimal FastAPI `/webhook/telegram` entry point; verify the webhook secret; extract Telegram sender/chat IDs; create or get `users` and `channel_identities` in PostgreSQL using SQLAlchemy/Alembic; ask for/validate IANA time zone; take display name from profile or ask; respond through Telegram. Bring up app, DB and migrations via reproducible local configuration.
 **Done when:**
 - [ ] A first `/start` yields one usable account and asks for missing time zone.
 - [ ] A second `/start` reuses that account and never duplicates it.
@@ -63,9 +63,9 @@ Before marking a slice complete, verify the deterministic-first invariant: simpl
 
 ### VS-02 — Link and verify caller phone
 
-**Outcome:** A Telegram user can enable live phone access by linking their own number.  
-**Depends on:** VS-01.  
-**Implementation:** Offer Telegram's `request_contact` keyboard in private chat; require `message.contact.user_id == message.from.id` (reject missing/mismatched ownership); normalize to E.164; link as a PHONE channel identity under the same internal user; add DB uniqueness protection for an active normalized number; preserve Telegram functionality if omitted.  
+**Outcome:** A Telegram user can enable live phone access by linking their own number.
+**Depends on:** VS-01.
+**Implementation:** Offer Telegram's `request_contact` keyboard in private chat; require `message.contact.user_id == message.from.id` (reject missing/mismatched ownership); normalize to E.164; link as a PHONE channel identity under the same internal user; add DB uniqueness protection for an active normalized number; preserve Telegram functionality if omitted.
 **Done when:**
 - [ ] Genuine contact is linked and stored normalized.
 - [ ] Another person's contact, missing contact owner ID, or invalid phone is rejected.
@@ -74,9 +74,9 @@ Before marking a slice complete, verify the deterministic-first invariant: simpl
 
 ### VS-03 — Create a one-time reminder from Telegram text
 
-**Outcome:** A natural-language Telegram message creates exactly one durable one-time reminder and confirms its precise time and destination.  
-**Depends on:** VS-01.  
-**Implementation:** Telegram webhook → intent extraction as typed structured data (Groq LLM with conservative validation and rule-based relative-time handling) → user/time-zone/ownership checks → transaction inserting `reminders`, one `reminder_occurrence`, pending `notification`, and an idempotency result keyed to the Telegram update → local-time Telegram confirmation after commit. Use UTC instants plus IANA time-zone context. The LLM proposes commands; the service alone authorizes and writes.  
+**Outcome:** A natural-language Telegram message creates exactly one durable one-time reminder and confirms its precise time and destination.
+**Depends on:** VS-01.
+**Implementation:** Telegram webhook → intent extraction as typed structured data (Groq LLM with conservative validation and rule-based relative-time handling) → user/time-zone/ownership checks → transaction inserting `reminders`, one `reminder_occurrence`, pending `notification`, and an idempotency result keyed to the Telegram update → local-time Telegram confirmation after commit. Use UTC instants plus IANA time-zone context. The LLM proposes commands; the service alone authorizes and writes.
 **Done when:**
 - [ ] “In five minutes” and “tomorrow at 9” persist correct user, task, UTC due time and local display.
 - [ ] Confirmation says exact local time and “Telegram”.
@@ -86,9 +86,9 @@ Before marking a slice complete, verify the deterministic-first invariant: simpl
 
 ### VS-04 — Deliver a due reminder via Telegram
 
-**Outcome:** Due, eligible occurrences trigger Telegram notifications on time despite normal worker restarts.  
-**Depends on:** VS-03.  
-**Implementation:** Run an independent PostgreSQL-backed worker that polls indexed `notifications` due timestamps (e.g., every 5–10 seconds), atomically claims work with `FOR UPDATE SKIP LOCKED` and a claim lease, rechecks parent/occurrence eligibility, sends through Telegram and records attempt, status, timestamp and provider message ID. Use a documented policy for API errors, timeouts and unknown results. Test real Postgres concurrency.  
+**Outcome:** Due, eligible occurrences trigger Telegram notifications on time despite normal worker restarts.
+**Depends on:** VS-03.
+**Implementation:** Run an independent PostgreSQL-backed worker that polls indexed `notifications` due timestamps (e.g., every 5–10 seconds), atomically claims work with `FOR UPDATE SKIP LOCKED` and a claim lease, rechecks parent/occurrence eligibility, sends through Telegram and records attempt, status, timestamp and provider message ID. Use a documented policy for API errors, timeouts and unknown results. Test real Postgres concurrency.
 **Done when:**
 - [ ] A real five-minute test notification arrives no more than 60s after due under healthy conditions.
 - [ ] Restarting API/worker before due does not lose the notification.
@@ -98,9 +98,9 @@ Before marking a slice complete, verify the deterministic-first invariant: simpl
 
 ### VS-05 — Clarify ambiguous commands
 
-**Outcome:** Unclear requests receive a focused question and are completed only after sufficient information exists.  
-**Depends on:** VS-03.  
-**Implementation:** Let intent interpreter return typed `needs_clarification` rather than guessing; save pending action/partial parameters in `conversation_sessions`; on the next user message, merge the response, revalidate and execute the original action exactly once; expire stale pending sessions.  
+**Outcome:** Unclear requests receive a focused question and are completed only after sufficient information exists.
+**Depends on:** VS-03.
+**Implementation:** Let intent interpreter return typed `needs_clarification` rather than guessing; save pending action/partial parameters in `conversation_sessions`; on the next user message, merge the response, revalidate and execute the original action exactly once; expire stale pending sessions.
 **Done when:**
 - [ ] “Remind me at 7” at 15:00 is clarified (not silently mapped to next morning).
 - [ ] “Remind me Friday to renew the domain” requests/proposes an hour and waits for confirmation.
@@ -109,9 +109,9 @@ Before marking a slice complete, verify the deterministic-first invariant: simpl
 
 ### VS-06 — Reject unsupported or unauthorized requests
 
-**Outcome:** The bot stays inside its reminder/memory scope and never treats model-generated arguments as authority.  
-**Depends on:** VS-01 and a first command service (VS-03).  
-**Implementation:** Enumerate supported intents; validate typed parameters, ownership, current state and delivery identity inside application services; return one standard out-of-scope response; ignore prompt-injection attempts in user text; authenticate webhook/tool endpoints.  
+**Outcome:** The bot stays inside its reminder/memory scope and never treats model-generated arguments as authority.
+**Depends on:** VS-01 and a first command service (VS-03).
+**Implementation:** Enumerate supported intents; validate typed parameters, ownership, current state and delivery identity inside application services; return one standard out-of-scope response; ignore prompt-injection attempts in user text; authenticate webhook/tool endpoints.
 **Done when:**
 - [ ] Unknown but potentially supported intent asks for clarification.
 - [ ] Out-of-scope request gets the predefined limitation response and no DB mutation.
@@ -120,9 +120,9 @@ Before marking a slice complete, verify the deterministic-first invariant: simpl
 
 ### VS-07 — Recurring reminders
 
-**Outcome:** “Every Monday at 8” creates a series whose next occurrences respect local wall-clock time.  
-**Depends on:** VS-03, VS-04.  
-**Implementation:** Store a recurrence rule plus intended IANA time zone on the parent; materialize the next occurrence(s) idempotently using a stable recurrence-instance key; each due occurrence goes through the existing notification worker; advance future occurrences without duplicating after restarts. Define DST gap/overlap policy explicitly.  
+**Outcome:** “Every Monday at 8” creates a series whose next occurrences respect local wall-clock time.
+**Depends on:** VS-03, VS-04.
+**Implementation:** Store a recurrence rule plus intended IANA time zone on the parent; materialize the next occurrence(s) idempotently using a stable recurrence-instance key; each due occurrence goes through the existing notification worker; advance future occurrences without duplicating after restarts. Define DST gap/overlap policy explicitly.
 **Done when:**
 - [ ] Weekly recurrence generates one logical occurrence for each intended local date.
 - [ ] Worker restarts/repeated generation never duplicate a recurrence instance.
@@ -131,9 +131,9 @@ Before marking a slice complete, verify the deterministic-first invariant: simpl
 
 ### VS-08 — List reminders in a requested date range
 
-**Outcome:** “What do I have tomorrow?” gives the correct local-time reminders.  
-**Depends on:** VS-03; VS-07 for correct future recurring projection.  
-**Implementation:** Interpret requested local-day or range boundaries using the user's zone; query owned occurrences (and project unmaterialized future recurrence instances if necessary); filter active/pending items and format a short response without modifying state.  
+**Outcome:** “What do I have tomorrow?” gives the correct local-time reminders.
+**Depends on:** VS-03; VS-07 for correct future recurring projection.
+**Implementation:** Interpret requested local-day or range boundaries using the user's zone; query owned occurrences (and project unmaterialized future recurrence instances if necessary); filter active/pending items and format a short response without modifying state.
 **Done when:**
 - [ ] Date-range results include the correct one-time and recurring items at local times.
 - [ ] Empty results are acknowledged without invention.
@@ -142,9 +142,9 @@ Before marking a slice complete, verify the deterministic-first invariant: simpl
 
 ### VS-09 — Reschedule an existing reminder
 
-**Outcome:** “Move the bank one to 10” changes the chosen reminder rather than creating another.  
-**Depends on:** VS-03, VS-05.  
-**Implementation:** Resolve candidate within authorized user scope; ask which one if multiple; determine occurrence-versus-series target; atomically update current due schedule, invalidate obsolete pending notification, preserve audit of sent attempts and increment version; respond with new local time.  
+**Outcome:** “Move the bank one to 10” changes the chosen reminder rather than creating another.
+**Depends on:** VS-03, VS-05.
+**Implementation:** Resolve candidate within authorized user scope; ask which one if multiple; determine occurrence-versus-series target; atomically update current due schedule, invalidate obsolete pending notification, preserve audit of sent attempts and increment version; respond with new local time.
 **Done when:**
 - [ ] One requested target is updated in place; no extra logical reminder exists.
 - [ ] Old pending due time cannot fire; new due time can.
@@ -153,9 +153,9 @@ Before marking a slice complete, verify the deterministic-first invariant: simpl
 
 ### VS-10 — Cancel a reminder or series
 
-**Outcome:** A user can stop a selected reminder or all future instances of a recurring series.  
-**Depends on:** VS-03; VS-07 for series cancellation.  
-**Implementation:** Resolve target with scope; explicitly distinguish occurrence from whole series; transactionally mark appropriate future occurrences/notifications canceled, and mark series canceled when applicable.  
+**Outcome:** A user can stop a selected reminder or all future instances of a recurring series.
+**Depends on:** VS-03; VS-07 for series cancellation.
+**Implementation:** Resolve target with scope; explicitly distinguish occurrence from whole series; transactionally mark appropriate future occurrences/notifications canceled, and mark series canceled when applicable.
 **Done when:**
 - [ ] “Cancel the standup” cancels the series and no future occurrence is sent.
 - [ ] Other reminders and prior delivery history remain intact.
@@ -163,9 +163,9 @@ Before marking a slice complete, verify the deterministic-first invariant: simpl
 
 ### VS-11 — Mark a delivered occurrence done
 
-**Outcome:** “Done” closes the correct occurrence.  
-**Depends on:** VS-04.  
-**Implementation:** Associate inbound Telegram replies with the delivered `provider_message_id` or an inline action containing a validated occurrence reference; use last-delivered context only when unambiguous; change occurrence to completed, not a recurring parent.  
+**Outcome:** “Done” closes the correct occurrence.
+**Depends on:** VS-04.
+**Implementation:** Associate inbound Telegram replies with the delivered `provider_message_id` or an inline action containing a validated occurrence reference; use last-delivered context only when unambiguous; change occurrence to completed, not a recurring parent.
 **Done when:**
 - [ ] “Done” against a known notification completes the right occurrence.
 - [ ] Repeated “Done” is safe and does not generate another event.
@@ -174,9 +174,9 @@ Before marking a slice complete, verify the deterministic-first invariant: simpl
 
 ### VS-12 — Snooze a delivered occurrence
 
-**Outcome:** “10 more minutes” postpones only the selected instance.  
-**Depends on:** VS-04, VS-11 (shared occurrence resolution).  
-**Implementation:** Resolve the delivered occurrence; validate positive duration; keep previously SENT notification as immutable history; transactionally schedule a new pending notification or next due attempt for the *same* logical occurrence without altering recurrence rule.  
+**Outcome:** “10 more minutes” postpones only the selected instance.
+**Depends on:** VS-04, VS-11 (shared occurrence resolution).
+**Implementation:** Resolve the delivered occurrence; validate positive duration; keep previously SENT notification as immutable history; transactionally schedule a new pending notification or next due attempt for the *same* logical occurrence without altering recurrence rule.
 **Done when:**
 - [ ] Snoozing schedules one new due notification at the requested instant.
 - [ ] Prior sent record persists, no second logical occurrence is created.
@@ -185,9 +185,9 @@ Before marking a slice complete, verify the deterministic-first invariant: simpl
 
 ### VS-13 — Save a user-provided memory fact
 
-**Outcome:** “Remember …” stores a fact without creating any reminder.  
-**Depends on:** VS-01; the command-routing path from VS-03 is reusable.  
-**Implementation:** Detect explicit memory intent deterministically first; for clearly intentional indirect requests, use the existing classifier and extractor fallback with typed content, conservative grounding, and no ordinary-statement permission. Validate the fact, then insert into `memory_facts` owned by the canonical user ID through the existing transaction and idempotent response path. Preserve authoritative content and add nullable pgvector embedding plus model, hash, status, attempt, and timestamp metadata. Generate an embedding only after authorization; provider failure leaves the durable fact pending for resumable indexing. Sensitive content is not sent to an external embedding provider by default.  
+**Outcome:** “Remember …” stores a fact without creating any reminder.
+**Depends on:** VS-01; the command-routing path from VS-03 is reusable.
+**Implementation:** Detect explicit memory intent deterministically first; for clearly intentional indirect requests, use the existing classifier and extractor fallback with typed content, conservative grounding, and no ordinary-statement permission. Validate the fact, then insert into `memory_facts` owned by the canonical user ID through the existing transaction and idempotent response path. Preserve authoritative content and add nullable pgvector embedding plus model, hash, status, attempt, and timestamp metadata. Generate an embedding only after authorization; provider failure leaves the durable fact pending for resumable indexing. Sensitive content is not sent to an external embedding provider by default.
 **Done when:**
 - [ ] Explicit fact creates exactly one saved fact under its owner.
 - [ ] No reminder, occurrence or notification row is created.
@@ -198,9 +198,9 @@ Before marking a slice complete, verify the deterministic-first invariant: simpl
 
 ### VS-14 — Retrieve a saved memory fact
 
-**Outcome:** “What's my gate code?” returns a known fact or explicitly says it is unknown.  
-**Depends on:** VS-13.  
-**Implementation:** Identify a deterministic lookup subject first and run a bounded owner-scoped lexical query. When lexical evidence is insufficient, embed the query and run bounded exact cosine search in PostgreSQL, constrained by canonical owner and active model. Configurable relevance and ambiguity thresholds return unknown or the existing typed clarification instead of guessing. The typed extractor may propose only a grounded subject query; it cannot supply an answer, fact ID, user ID, or authorization. Format answers only from authoritative `MemoryFact.content`. Provider/index failure falls back to lexical behavior. Direct read-only replies remain outside `idempotency_records`.  
+**Outcome:** “What's my gate code?” returns a known fact or explicitly says it is unknown.
+**Depends on:** VS-13.
+**Implementation:** Identify a deterministic lookup subject first and run a bounded owner-scoped lexical query. When lexical evidence is insufficient, embed the query and run bounded exact cosine search in PostgreSQL, constrained by canonical owner and active model. Configurable relevance and ambiguity thresholds return unknown or the existing typed clarification instead of guessing. The typed extractor may propose only a grounded subject query; it cannot supply an answer, fact ID, user ID, or authorization. Format answers only from authoritative `MemoryFact.content`. Provider/index failure falls back to lexical behavior. Direct read-only replies remain outside `idempotency_records`.
 **Done when:**
 - [ ] Correct fact is retrieved and quoted accurately.
 - [ ] Missing/ambiguous fact is not hallucinated; clarify when necessary.
@@ -212,9 +212,9 @@ Before marking a slice complete, verify the deterministic-first invariant: simpl
 
 ### VS-15 — Telegram voice notes
 
-**Outcome:** A spoken Telegram note executes the same commands as a typed Telegram message, with text feedback.  
-**Depends on:** VS-03, VS-04; relevant Phase 1 operations for full parity.  
-**Implementation:** Download voice file through Telegram API; validate media type/size; transcribe with Groq Whisper; send resulting text to the existing intent router and user-scoped services; reply by Telegram text; ask for clarification when no hour is spoken.  
+**Outcome:** A spoken Telegram note executes the same commands as a typed Telegram message, with text feedback.
+**Depends on:** VS-03, VS-04; relevant Phase 1 operations for full parity.
+**Implementation:** Download voice file through Telegram API; validate media type/size; transcribe with Groq Whisper; send resulting text to the existing intent router and user-scoped services; reply by Telegram text; ask for clarification when no hour is spoken.
 **Done when:**
 - [ ] Spoken one-time reminder is created, persisted, delivered through Telegram.
 - [ ] Spoken list/move/cancel/done/snooze/memory operations use the existing service implementations.
@@ -223,9 +223,9 @@ Before marking a slice complete, verify the deterministic-first invariant: simpl
 
 ### VS-16 — Authenticate an incoming call
 
-**Outcome:** A real phone number accepts a registered caller and rejects an unknown one before connecting them to the AI assistant.  
-**Depends on:** VS-02.  
-**Implementation:** Provision Vapi inbound number; configure a dynamic `assistant-request` on its server URL; authenticate incoming webhook according to provider controls; normalize the caller number and look up an active linked phone identity; return allowed assistant configuration only after matching; create call-to-user authorization context server-side. Avoid attaching a fixed assistant if it bypasses the pre-call decision. Keep the response within Vapi's fixed ~7.5-second limit. Phone CLI matching is useful for challenge eligibility but not strong proof against caller-ID spoofing for sensitive data.  
+**Outcome:** A real phone number accepts a registered caller and rejects an unknown one before connecting them to the AI assistant.
+**Depends on:** VS-02.
+**Implementation:** Provision Vapi inbound number; configure a dynamic `assistant-request` on its server URL; authenticate incoming webhook according to provider controls; normalize the caller number and look up an active linked phone identity; return allowed assistant configuration only after matching; create call-to-user authorization context server-side. Avoid attaching a fixed assistant if it bypasses the pre-call decision. Keep the response within Vapi's fixed ~7.5-second limit. Phone CLI matching is useful for challenge eligibility but not strong proof against caller-ID spoofing for sensitive data.
 **Done when:**
 - [ ] A registered linked caller reaches the agent via an actual phone number.
 - [ ] Unknown/missing number is rejected before the AI conversation.
@@ -234,9 +234,9 @@ Before marking a slice complete, verify the deterministic-first invariant: simpl
 
 ### VS-17 — Create a reminder on a live call
 
-**Outcome:** A registered caller schedules a reminder, hears exact spoken confirmation, then receives the notification on Telegram.  
-**Depends on:** VS-16, VS-03, VS-04.  
-**Implementation:** Configure Vapi assistant and server function tool for create-reminder; map authenticated call context to canonical user ID; validate typed tool arguments in the same `CreateReminder` service used by Telegram; idempotently handle repeated `tool-calls` using a call/tool invocation key; return exact localized scheduled time and delivery channel in the tool result; speak success **only** from committed result.  
+**Outcome:** A registered caller schedules a reminder, hears exact spoken confirmation, then receives the notification on Telegram.
+**Depends on:** VS-16, VS-03, VS-04.
+**Implementation:** Configure Vapi assistant and server function tool for create-reminder; map authenticated call context to canonical user ID; validate typed tool arguments in the same `CreateReminder` service used by Telegram; idempotently handle repeated `tool-calls` using a call/tool invocation key; return exact localized scheduled time and delivery channel in the tool result; speak success **only** from committed result.
 **Done when:**
 - [ ] A live caller requests a five-minute reminder and hears time + “on Telegram”.
 - [ ] Telegram notification reaches their linked account at the scheduled time.
@@ -245,9 +245,9 @@ Before marking a slice complete, verify the deterministic-first invariant: simpl
 
 ### VS-18 — Save and recall facts across channels
 
-**Outcome:** Save a fact during a call; retrieve it from Telegram using the same canonical user account.  
-**Depends on:** VS-13, VS-14, VS-16, VS-17's working call/tool infrastructure.  
-**Implementation:** Expose save/search-memory as Vapi server tools backed by the same services/tables; associate the verified call context with the user; use Telegram interpreter for retrieval; restrict sensitive disclosures when caller identity is not sufficiently verified.  
+**Outcome:** Save a fact during a call; retrieve it from Telegram using the same canonical user account.
+**Depends on:** VS-13, VS-14, VS-16, VS-17's working call/tool infrastructure.
+**Implementation:** Expose save/search-memory as Vapi server tools backed by the same services/tables; associate the verified call context with the user; use Telegram interpreter for retrieval; restrict sensitive disclosures when caller identity is not sufficiently verified.
 **Done when:**
 - [ ] “Remember the Wi-Fi password is Andorra2026” on a call saves one memory, not a reminder.
 - [ ] “What's my Wi-Fi password?” on Telegram returns `Andorra2026`.
@@ -256,9 +256,9 @@ Before marking a slice complete, verify the deterministic-first invariant: simpl
 
 ### VS-19 — Interrupt and correct during a call
 
-**Outcome:** A spoken correction edits the reminder just referenced, even after interrupting TTS.  
-**Depends on:** VS-17, VS-09.  
-**Implementation:** Configure and manually test Vapi barge-in/interruption behavior; persist an active reminder reference keyed to call/session; when a correction follows a creation, route it to the existing reschedule operation rather than create; revalidate and cancel superseded pending notification. Clear/expire references when the topic changes.  
+**Outcome:** A spoken correction edits the reminder just referenced, even after interrupting TTS.
+**Depends on:** VS-17, VS-09.
+**Implementation:** Configure and manually test Vapi barge-in/interruption behavior; persist an active reminder reference keyed to call/session; when a correction follows a creation, route it to the existing reschedule operation rather than create; revalidate and cancel superseded pending notification. Clear/expire references when the topic changes.
 **Done when:**
 - [ ] The caller can interrupt the agent's response.
 - [ ] “Actually, make it half an hour” changes the same reminder.
@@ -268,9 +268,9 @@ Before marking a slice complete, verify the deterministic-first invariant: simpl
 
 ### VS-20 — Full reminder management by live voice
 
-**Outcome:** Voice caller can list, reschedule, cancel, complete and snooze existing reminders.  
-**Depends on:** VS-08–VS-12, VS-17.  
-**Implementation:** Register Vapi tools for existing read/mutation application services; provide minimal typed tool schemas; pass all calls through authorized user context and consistent idempotency; return concise spoken confirmations.  
+**Outcome:** Voice caller can list, reschedule, cancel, complete and snooze existing reminders.
+**Depends on:** VS-08–VS-12, VS-17.
+**Implementation:** Register Vapi tools for existing read/mutation application services; provide minimal typed tool schemas; pass all calls through authorized user context and consistent idempotency; return concise spoken confirmations.
 **Done when:**
 - [ ] “What do I have tomorrow?” lists the correct items aloud.
 - [ ] “Move the bank one to 10” and “Cancel the standup” operate on existing state.

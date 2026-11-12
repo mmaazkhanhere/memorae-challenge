@@ -3,8 +3,8 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
-from reminder_agent.db.models import Base
-from reminder_agent.settings import get_settings
+from reminder_agent.infrastructure.database.models import Base
+from reminder_agent.infrastructure.config.settings import get_settings
 
 config = context.config
 if config.config_file_name is not None:

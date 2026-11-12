@@ -30,7 +30,7 @@ The local workflow is:
 - `uv sync --extra test` — install the locked project and test dependencies.
 - `docker compose up -d postgres` — start local PostgreSQL.
 - `uv run alembic upgrade head` — apply database migrations.
-- `uv run uvicorn reminder_agent.main:app --reload` — run the FastAPI service locally.
+- `uv run uvicorn reminder_agent.application.main:app --reload` — run the FastAPI service locally.
 - `uv run pytest` — run the automated suite.
 
 Keep commands and configuration documentation current as new slices add workers or provider integrations.

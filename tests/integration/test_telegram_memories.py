@@ -1,26 +1,26 @@
+import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+from threading import Barrier
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
-from reminder_agent.conversation_router import ConversationRoute, route_message
-from reminder_agent.intent import (
+from reminder_agent.application.main import create_app
+from reminder_agent.channels.telegram.provider import TelegramAPIError, TelegramUpdate
+from reminder_agent.features.intent import (
     IntentRoute,
     IntentRouteSuggestion,
     Interpretation,
     ReminderIntentInterpreter,
 )
-from reminder_agent.main import create_app
-from reminder_agent.embeddings import EmbeddingProviderError
-from reminder_agent.memories import (
-    MemoryAnswerProposal,
-    MemoryIntentEvidence,
-    RetrieveMemoryQuery,
-    SaveMemoryFact,
-)
-
-from reminder_agent.db.models import (
+from reminder_agent.features.intent.deterministic.routing import ConversationRoute, route_message
+from reminder_agent.features.memory.messages import MEMORY_LOOKUP_MESSAGES, MEMORY_SAVE_MESSAGES
+from reminder_agent.features.memory.retrieve.contracts import MemoryAnswerProposal
+from reminder_agent.infrastructure.config.settings import Settings
+from reminder_agent.infrastructure.database.models import (
+    ChannelIdentity,
     ConversationSession,
     IdempotencyRecord,
     MemoryFact,
@@ -29,9 +29,22 @@ from reminder_agent.db.models import (
     ReminderOccurrence,
     User,
 )
-
+from reminder_agent.infrastructure.providers.embeddings import EmbeddingProviderError
+from reminder_agent.shared.idempotency import IdempotencyConflict
+from reminder_agent.shared.memory_contracts import (
+    MemoryIntentEvidence,
+    RetrieveMemoryQuery,
+    SaveMemoryFact,
+)
 
 HEADERS = {"X-Telegram-Bot-Api-Secret-Token": "test-secret"}
+
+
+def _fact_found_response(message: str, fact: str) -> bool:
+    return any(
+        message == template.replace("{saved_fact}", fact)
+        for template in MEMORY_LOOKUP_MESSAGES["fact_found"]
+    )
 
 
 def _semantic_vector(axis: int) -> list[float]:
@@ -123,19 +136,25 @@ def post_update(client, update: dict):
 
 
 def onboard(api_client, update_factory, *, user_id: int, chat_id: int, start: int) -> None:
-    assert post_update(
-        api_client,
-        update_factory(start, user_id=user_id, chat_id=chat_id, text="/start"),
-    ).status_code == 200
-    assert post_update(
-        api_client,
-        update_factory(
-            start + 1,
-            user_id=user_id,
-            chat_id=chat_id,
-            text="Asia/Karachi",
-        ),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(start, user_id=user_id, chat_id=chat_id, text="/start"),
+        ).status_code
+        == 200
+    )
+    assert (
+        post_update(
+            api_client,
+            update_factory(
+                start + 1,
+                user_id=user_id,
+                chat_id=chat_id,
+                text="Asia/Karachi",
+            ),
+        ).status_code
+        == 200
+    )
 
 
 def test_explicit_memory_save_creates_one_owned_fact_and_no_reminder_rows(
@@ -149,20 +168,19 @@ def test_explicit_memory_save_creates_one_owned_fact_and_no_reminder_rows(
     )
 
     assert response.status_code == 200
-    assert telegram_client.messages[-1][1] == "I saved that information."
+    assert telegram_client.messages[-1][1] in MEMORY_SAVE_MESSAGES["confirmation"]
     fact = db.scalar(select(MemoryFact))
     assert fact is not None
     assert fact.content == "my gate code is 4512"
     assert db.scalar(select(func.count()).select_from(Reminder)) == 0
     assert db.scalar(select(func.count()).select_from(ReminderOccurrence)) == 0
     assert db.scalar(select(func.count()).select_from(Notification)) == 0
-    record = db.scalar(
-        select(IdempotencyRecord).where(IdempotencyRecord.idempotency_key == "102")
-    )
+    record = db.scalar(select(IdempotencyRecord).where(IdempotencyRecord.idempotency_key == "102"))
     assert record is not None
     assert record.operation == "SAVE_MEMORY"
-    assert record.response is not None
-    assert "request_text" not in record.response
+    assert record.response["chat_id"] == 2001
+    assert record.response["text"] in MEMORY_SAVE_MESSAGES["confirmation"]
+    assert record.response["reply_markup"] is None
 
 
 def test_replayed_memory_update_does_not_duplicate_fact_or_confirmation(
@@ -177,6 +195,155 @@ def test_replayed_memory_update_does_not_duplicate_fact_or_confirmation(
 
     assert len(telegram_client.messages) == sent_count
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
+
+
+def test_conflicting_memory_replay_keeps_the_original_durable_response(
+    api_client, db, fixed_now, session_factory, update_factory
+) -> None:
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=204)
+    original = update_factory(206, text="Remember my gate code is 4512")
+    assert post_update(api_client, original).status_code == 200
+
+    user = db.scalar(select(User).where(User.name == "Ada"))
+    identity = db.scalar(select(ChannelIdentity).where(ChannelIdentity.external_id == "1001"))
+    assert user is not None
+    assert identity is not None
+    conflicting = TelegramUpdate.model_validate(
+        update_factory(206, text="Remember my gate code is 9999")
+    )
+
+    import reminder_agent.application.conversation_coordinator as reminders
+
+    with (
+        session_factory() as concurrent_db,
+        pytest.raises(
+            IdempotencyConflict, match="Telegram update was reused with different content"
+        ),
+    ):
+        reminders.handle_reminder_text(
+            concurrent_db,
+            conflicting,
+            user_id=user.id,
+            identity_id=identity.id,
+            telegram_user_id=1001,
+            interpreter=ReminderIntentInterpreter(),
+            now=fixed_now,
+        )
+
+    db.expire_all()
+    assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
+    record = db.scalar(select(IdempotencyRecord).where(IdempotencyRecord.idempotency_key == "206"))
+    assert record is not None
+    assert record.response["chat_id"] == 2001
+    assert record.response["text"] in MEMORY_SAVE_MESSAGES["confirmation"]
+    assert record.response["reply_markup"] is None
+
+
+def test_memory_delivery_failure_after_commit_preserves_replay_compatibility(
+    session_factory, fixed_now, update_factory
+) -> None:
+    class SwitchableTelegramClient:
+        def __init__(self) -> None:
+            self.fail_delivery = False
+            self.failure_attempts = 0
+            self.messages: list[tuple[int, str]] = []
+
+        def send_message(self, chat_id: int, text: str, *, reply_markup=None) -> None:
+            if self.fail_delivery:
+                self.failure_attempts += 1
+                raise TelegramAPIError("bad gateway", status_code=502, failure_kind="http_error")
+            self.messages.append((chat_id, text))
+
+    telegram_client = SwitchableTelegramClient()
+    app = create_app(
+        Settings(database_url="sqlite://", telegram_webhook_secret="test-secret"),
+        telegram_client=telegram_client,
+        session_factory=session_factory,
+        clock=lambda: fixed_now,
+    )
+    update = update_factory(212, text="Remember my backup code is 4567")
+    with TestClient(app, raise_server_exceptions=False) as client:
+        onboard(client, update_factory, user_id=1001, chat_id=2001, start=210)
+        telegram_client.fail_delivery = True
+        assert post_update(client, update).json() == {"ok": True}
+        assert post_update(client, update).json() == {"ok": True}
+
+    assert telegram_client.failure_attempts == 1
+    with session_factory() as db:
+        assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
+        record = db.scalar(
+            select(IdempotencyRecord).where(
+                IdempotencyRecord.source == "TELEGRAM",
+                IdempotencyRecord.idempotency_key == "212",
+            )
+        )
+        assert record is not None
+        assert record.response["chat_id"] == 2001
+        assert record.response["text"] in MEMORY_SAVE_MESSAGES["confirmation"]
+        assert record.response["reply_markup"] is None
+        assert record.delivery_status == "UNKNOWN"
+
+
+@pytest.mark.skipif(
+    not os.getenv("TEST_DATABASE_URL", "").startswith("postgresql"),
+    reason="requires TEST_DATABASE_URL pointing to PostgreSQL for idempotency concurrency",
+)
+def test_concurrent_memory_replay_commits_one_fact_and_idempotency_response(
+    api_client, db, fixed_now, monkeypatch, session_factory, update_factory
+) -> None:
+    onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=220)
+    user = db.scalar(select(User).where(User.name == "Ada"))
+    assert user is not None
+    identity = db.scalar(
+        select(ChannelIdentity).where(
+            ChannelIdentity.user_id == user.id,
+            ChannelIdentity.channel_type == "TELEGRAM",
+        )
+    )
+    assert identity is not None
+
+    import reminder_agent.application.conversation_coordinator as reminders
+    import reminder_agent.features.memory.saving as memory_operations
+
+    original_save = memory_operations.save_memory_fact
+    barrier = Barrier(2)
+
+    def save_at_same_time(*args, **kwargs):
+        saved = original_save(*args, **kwargs)
+        barrier.wait(timeout=10)
+        return saved
+
+    monkeypatch.setattr(memory_operations, "save_memory_fact", save_at_same_time)
+    update = TelegramUpdate.model_validate(
+        update_factory(222, text="Remember my backup code is 4567")
+    )
+
+    def invoke() -> str:
+        with session_factory() as concurrent_db:
+            return reminders.handle_reminder_text(
+                concurrent_db,
+                update,
+                user_id=user.id,
+                identity_id=identity.id,
+                telegram_user_id=1001,
+                interpreter=ReminderIntentInterpreter(),
+                now=fixed_now,
+            ).text
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = list(executor.map(lambda _: invoke(), range(2)))
+
+    db.expire_all()
+    assert all(response in MEMORY_SAVE_MESSAGES["confirmation"] for response in responses)
+    assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
+    assert (
+        db.scalar(
+            select(func.count())
+            .select_from(IdempotencyRecord)
+            .where(IdempotencyRecord.idempotency_key == "222")
+        )
+        == 1
+    )
 
 
 def test_memory_fact_survives_database_session_and_application_restart(
@@ -208,19 +375,23 @@ def test_memory_fact_survives_database_session_and_application_restart(
     assert len(telegram_client.messages) == sent_count
 
 
-def test_memory_facts_are_owned_separately_between_users(
-    api_client, db, update_factory
-) -> None:
+def test_memory_facts_are_owned_separately_between_users(api_client, db, update_factory) -> None:
     onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=300)
     onboard(api_client, update_factory, user_id=1002, chat_id=2002, start=400)
-    assert post_update(
-        api_client,
-        update_factory(302, user_id=1001, chat_id=2001, text="Remember first user's fact"),
-    ).status_code == 200
-    assert post_update(
-        api_client,
-        update_factory(402, user_id=1002, chat_id=2002, text="Remember second user's fact"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(302, user_id=1001, chat_id=2001, text="Remember first user's fact"),
+        ).status_code
+        == 200
+    )
+    assert (
+        post_update(
+            api_client,
+            update_factory(402, user_id=1002, chat_id=2002, text="Remember second user's fact"),
+        ).status_code
+        == 200
+    )
 
     facts = db.scalars(select(MemoryFact).order_by(MemoryFact.content)).all()
     assert [fact.content for fact in facts] == ["first user's fact", "second user's fact"]
@@ -231,32 +402,41 @@ def test_memory_lookup_returns_exact_fact_without_mutating_memory_or_creating_id
     api_client, telegram_client, db, update_factory
 ) -> None:
     onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=325)
-    assert post_update(
-        api_client,
-        update_factory(327, text="Remember my gate code is 4512"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(327, text="Remember my gate code is 4512"),
+        ).status_code
+        == 200
+    )
     fact = db.scalar(select(MemoryFact))
     assert fact is not None
     original_updated_at = fact.updated_at
     fact_count = db.scalar(select(func.count()).select_from(MemoryFact))
 
-    assert post_update(
-        api_client,
-        update_factory(328, text="What's my gate code?"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(328, text="What's my gate code?"),
+        ).status_code
+        == 200
+    )
 
-    assert telegram_client.messages[-1][1] == 'You told me: "my gate code is 4512"'
+    assert "my gate code is 4512" in telegram_client.messages[-1][1]
     db.expire_all()
     current = db.scalar(select(MemoryFact))
     assert current is not None
     assert current.content == "my gate code is 4512"
     assert current.updated_at == original_updated_at
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == fact_count
-    assert db.scalar(
-        select(func.count()).select_from(IdempotencyRecord).where(
-            IdempotencyRecord.idempotency_key == "328"
+    assert (
+        db.scalar(
+            select(func.count())
+            .select_from(IdempotencyRecord)
+            .where(IdempotencyRecord.idempotency_key == "328")
         )
-    ) == 0
+        == 0
+    )
 
 
 def test_memory_lookup_does_not_cross_user_boundary_or_hallucinate_unknown_fact(
@@ -264,22 +444,31 @@ def test_memory_lookup_does_not_cross_user_boundary_or_hallucinate_unknown_fact(
 ) -> None:
     onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=350)
     onboard(api_client, update_factory, user_id=1002, chat_id=2002, start=360)
-    assert post_update(
-        api_client,
-        update_factory(352, user_id=1001, chat_id=2001, text="Remember my gate code is 4512"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(352, user_id=1001, chat_id=2001, text="Remember my gate code is 4512"),
+        ).status_code
+        == 200
+    )
 
-    assert post_update(
-        api_client,
-        update_factory(362, user_id=1002, chat_id=2002, text="What's my gate code?"),
-    ).status_code == 200
-    assert telegram_client.messages[-1][1] == "I don't know that yet."
+    assert (
+        post_update(
+            api_client,
+            update_factory(362, user_id=1002, chat_id=2002, text="What's my gate code?"),
+        ).status_code
+        == 200
+    )
+    assert telegram_client.messages[-1][1] in MEMORY_LOOKUP_MESSAGES["unknown_fact"]
 
-    assert post_update(
-        api_client,
-        update_factory(363, user_id=1001, chat_id=2001, text="What's my passport number?"),
-    ).status_code == 200
-    assert telegram_client.messages[-1][1] == "I don't know that yet."
+    assert (
+        post_update(
+            api_client,
+            update_factory(363, user_id=1001, chat_id=2001, text="What's my passport number?"),
+        ).status_code
+        == 200
+    )
+    assert telegram_client.messages[-1][1] in MEMORY_LOOKUP_MESSAGES["unknown_fact"]
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
 
 
@@ -287,19 +476,28 @@ def test_ambiguous_memory_lookup_clarifies_then_returns_one_owned_fact(
     api_client, telegram_client, db, update_factory
 ) -> None:
     onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=380)
-    assert post_update(
-        api_client,
-        update_factory(382, text="Remember my gate code is 4512"),
-    ).status_code == 200
-    assert post_update(
-        api_client,
-        update_factory(383, text="Remember my backup gate code is 9921"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(382, text="Remember my gate code is 4512"),
+        ).status_code
+        == 200
+    )
+    assert (
+        post_update(
+            api_client,
+            update_factory(383, text="Remember my backup gate code is 9921"),
+        ).status_code
+        == 200
+    )
 
-    assert post_update(
-        api_client,
-        update_factory(384, text="What's my gate code?"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(384, text="What's my gate code?"),
+        ).status_code
+        == 200
+    )
     assert "more than one" in telegram_client.messages[-1][1].lower()
     db.expire_all()
     session = db.scalar(select(ConversationSession))
@@ -308,11 +506,14 @@ def test_ambiguous_memory_lookup_clarifies_then_returns_one_owned_fact(
     assert "candidate_ids" in session.pending_clarification
     assert "4512" not in str(session.pending_clarification)
 
-    assert post_update(
-        api_client,
-        update_factory(385, text="backup gate code"),
-    ).status_code == 200
-    assert telegram_client.messages[-1][1] == 'You told me: "my backup gate code is 9921"'
+    assert (
+        post_update(
+            api_client,
+            update_factory(385, text="backup gate code"),
+        ).status_code
+        == 200
+    )
+    assert "my backup gate code is 9921" in telegram_client.messages[-1][1]
     db.expire_all()
     assert db.scalar(select(ConversationSession)).pending_clarification is None
 
@@ -321,18 +522,27 @@ def test_pending_memory_lookup_can_be_canceled_without_mutation(
     api_client, telegram_client, db, update_factory
 ) -> None:
     onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=400)
-    assert post_update(
-        api_client,
-        update_factory(402, text="Remember my gate code is 4512"),
-    ).status_code == 200
-    assert post_update(
-        api_client,
-        update_factory(403, text="Remember my backup gate code is 9921"),
-    ).status_code == 200
-    assert post_update(
-        api_client,
-        update_factory(404, text="What's my gate code?"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(402, text="Remember my gate code is 4512"),
+        ).status_code
+        == 200
+    )
+    assert (
+        post_update(
+            api_client,
+            update_factory(403, text="Remember my backup gate code is 9921"),
+        ).status_code
+        == 200
+    )
+    assert (
+        post_update(
+            api_client,
+            update_factory(404, text="What's my gate code?"),
+        ).status_code
+        == 200
+    )
     assert post_update(api_client, update_factory(405, text="Never mind")).status_code == 200
 
     assert telegram_client.messages[-1][1] == "Okay, I won't look that up."
@@ -341,24 +551,28 @@ def test_pending_memory_lookup_can_be_canceled_without_mutation(
     assert db.scalar(select(ConversationSession)).pending_clarification is None
 
 
-def test_clear_memory_lookup_bypasses_classifier(
-    api_client, db, update_factory
-) -> None:
+def test_clear_memory_lookup_bypasses_classifier(api_client, db, update_factory) -> None:
     onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=420)
-    assert post_update(
-        api_client,
-        update_factory(422, text="Remember my emergency contact is Sam"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(422, text="Remember my emergency contact is Sam"),
+        ).status_code
+        == 200
+    )
 
     class FailingRouter:
         def classify(self, *args, **kwargs):
             raise AssertionError("clear memory lookup must not invoke classification")
 
     api_client.app.state.intent_router = FailingRouter()
-    assert post_update(
-        api_client,
-        update_factory(423, text="What is my emergency contact?"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(423, text="What is my emergency contact?"),
+        ).status_code
+        == 200
+    )
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
 
 
@@ -366,10 +580,13 @@ def test_indirect_memory_lookup_uses_existing_typed_extractor_and_owner_scoped_f
     api_client, telegram_client, db, update_factory
 ) -> None:
     onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=430)
-    assert post_update(
-        api_client,
-        update_factory(432, text="Remember my favorite color is blue"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(432, text="Remember my favorite color is blue"),
+        ).status_code
+        == 200
+    )
     calls: list[IntentRoute] = []
 
     class LookupRouter:
@@ -384,13 +601,16 @@ def test_indirect_memory_lookup_uses_existing_typed_extractor_and_owner_scoped_f
 
     api_client.app.state.intent_router = LookupRouter()
     api_client.app.state.reminder_interpreter = LookupExtractor()
-    assert post_update(
-        api_client,
-        update_factory(433, text="Which color do I like?"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(433, text="Which color do I like?"),
+        ).status_code
+        == 200
+    )
 
     assert calls == [IntentRoute.RETRIEVE_MEMORY]
-    assert telegram_client.messages[-1][1] == 'You told me: "my favorite color is blue"'
+    assert "my favorite color is blue" in telegram_client.messages[-1][1]
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
 
 
@@ -398,10 +618,13 @@ def test_ungrounded_model_memory_lookup_query_does_not_disclose_a_fact(
     api_client, telegram_client, db, update_factory
 ) -> None:
     onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=440)
-    assert post_update(
-        api_client,
-        update_factory(442, text="Remember my gate code is 4512"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(442, text="Remember my gate code is 4512"),
+        ).status_code
+        == 200
+    )
 
     class LookupRouter:
         def classify(self, *args, **kwargs):
@@ -413,12 +636,15 @@ def test_ungrounded_model_memory_lookup_query_does_not_disclose_a_fact(
 
     api_client.app.state.intent_router = LookupRouter()
     api_client.app.state.reminder_interpreter = UngroundedLookupExtractor()
-    assert post_update(
-        api_client,
-        update_factory(443, text="Which color do I like?"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(443, text="Which color do I like?"),
+        ).status_code
+        == 200
+    )
 
-    assert telegram_client.messages[-1][1] == "Which saved information should I look up?"
+    assert telegram_client.messages[-1][1] in MEMORY_LOOKUP_MESSAGES["missing_subject"]
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
 
 
@@ -426,14 +652,20 @@ def test_reminder_lookup_collision_prefers_reminder_listing_over_memory_lookup(
     api_client, telegram_client, db, update_factory
 ) -> None:
     onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=450)
-    assert post_update(
-        api_client,
-        update_factory(452, text="Remind me tomorrow at 9 AM to call the bank"),
-    ).status_code == 200
-    assert post_update(
-        api_client,
-        update_factory(453, text="Remember my reminder for tomorrow is a private note"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(452, text="Remind me tomorrow at 9 AM to call the bank"),
+        ).status_code
+        == 200
+    )
+    assert (
+        post_update(
+            api_client,
+            update_factory(453, text="Remember my reminder for tomorrow is a private note"),
+        ).status_code
+        == 200
+    )
 
     for update_id, text in (
         (454, "What's my reminder for tomorrow?"),
@@ -448,27 +680,39 @@ def test_expired_memory_lookup_follow_up_does_not_reuse_stale_candidates(
     api_client, telegram_client, db, update_factory, fixed_now
 ) -> None:
     onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=460)
-    assert post_update(
-        api_client,
-        update_factory(462, text="Remember my gate code is 4512"),
-    ).status_code == 200
-    assert post_update(
-        api_client,
-        update_factory(463, text="Remember my backup gate code is 9921"),
-    ).status_code == 200
-    assert post_update(
-        api_client,
-        update_factory(464, text="What's my gate code?"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(462, text="Remember my gate code is 4512"),
+        ).status_code
+        == 200
+    )
+    assert (
+        post_update(
+            api_client,
+            update_factory(463, text="Remember my backup gate code is 9921"),
+        ).status_code
+        == 200
+    )
+    assert (
+        post_update(
+            api_client,
+            update_factory(464, text="What's my gate code?"),
+        ).status_code
+        == 200
+    )
     session = db.scalar(select(ConversationSession))
     assert session is not None
     session.updated_at = fixed_now - timedelta(seconds=901)
     db.commit()
 
-    assert post_update(
-        api_client,
-        update_factory(465, text="backup gate code"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(465, text="backup gate code"),
+        ).status_code
+        == 200
+    )
     assert telegram_client.messages[-1][1] == (
         "That memory lookup expired. Please ask what you want to look up again."
     )
@@ -489,10 +733,13 @@ def test_incomplete_memory_save_asks_for_fact_without_mutation(
     assert session is not None
     assert session.pending_clarification == {"operation": "SAVE_MEMORY", "content": None}
 
-    assert post_update(
-        api_client,
-        update_factory(503, text="my passport is in the safe"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(503, text="my passport is in the safe"),
+        ).status_code
+        == 200
+    )
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
     db.expire_all()
     assert db.scalar(select(ConversationSession)).pending_clarification is None
@@ -517,16 +764,20 @@ def test_memory_save_database_failure_is_truthful_and_leaves_no_fact(
     onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=700)
 
     from sqlalchemy.exc import OperationalError
-    import reminder_agent.reminders as reminders
+
+    import reminder_agent.features.memory.saving as memory_operations
 
     def fail(*args, **kwargs):
         raise OperationalError("insert", {}, RuntimeError("database down"))
 
-    monkeypatch.setattr(reminders, "save_memory_fact", fail)
-    assert post_update(
-        api_client,
-        update_factory(702, text="Remember a fact that cannot be saved"),
-    ).status_code == 200
+    monkeypatch.setattr(memory_operations, "save_memory_fact", fail)
+    assert (
+        post_update(
+            api_client,
+            update_factory(702, text="Remember a fact that cannot be saved"),
+        ).status_code
+        == 200
+    )
 
     assert telegram_client.messages[-1][1] == "I couldn't save that information. Please try again."
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == 0
@@ -537,27 +788,35 @@ def test_unexpected_memory_save_failure_rolls_back_and_never_confirms(
 ) -> None:
     onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=750)
 
-    import reminder_agent.reminders as reminders
-    from reminder_agent.memories import save_memory_fact as real_save_memory_fact
+    import reminder_agent.features.memory.saving as memory_operations
+    from reminder_agent.features.memory.persistence import save_memory_fact as real_save_memory_fact
 
     def fail_after_flush(db_session, *, user_id, content, now):
         real_save_memory_fact(db_session, user_id=user_id, content=content, now=now)
         raise RuntimeError("unexpected failure containing a secret")
 
-    monkeypatch.setattr(reminders, "save_memory_fact", fail_after_flush)
-    assert post_update(
-        api_client,
-        update_factory(752, text="Remember my vault code is Secret-4512"),
-    ).status_code == 200
+    monkeypatch.setattr(memory_operations, "save_memory_fact", fail_after_flush)
+    assert (
+        post_update(
+            api_client,
+            update_factory(752, text="Remember my vault code is Secret-4512"),
+        ).status_code
+        == 200
+    )
 
     assert telegram_client.messages[-1][1] == "I couldn't save that information. Please try again."
-    assert not any(message[1] == "I saved that information." for message in telegram_client.messages)
+    assert not any(
+        message[1] in MEMORY_SAVE_MESSAGES["confirmation"] for message in telegram_client.messages
+    )
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == 0
-    assert db.scalar(
-        select(func.count()).select_from(IdempotencyRecord).where(
-            IdempotencyRecord.idempotency_key == "752"
+    assert (
+        db.scalar(
+            select(func.count())
+            .select_from(IdempotencyRecord)
+            .where(IdempotencyRecord.idempotency_key == "752")
         )
-    ) == 0
+        == 0
+    )
 
 
 def test_explicit_memory_save_uses_rules_without_calling_classifier(
@@ -570,10 +829,13 @@ def test_explicit_memory_save_uses_rules_without_calling_classifier(
             raise AssertionError("explicit memory save must not invoke classification")
 
     api_client.app.state.intent_router = FailingRouter()
-    assert post_update(
-        api_client,
-        update_factory(802, text="Remember my emergency contact is Sam"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(802, text="Remember my emergency contact is Sam"),
+        ).status_code
+        == 200
+    )
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
 
 
@@ -600,23 +862,30 @@ def test_unambiguous_reminder_and_memory_commands_do_not_cross_write_or_call_llm
     assert reminder is not None and reminder.task == "call Ali"
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == 0
 
-    assert post_update(
-        api_client, update_factory(1603, text="Remember to call Ali")
-    ).status_code == 200
+    assert (
+        post_update(api_client, update_factory(1603, text="Remember to call Ali")).status_code
+        == 200
+    )
     assert db.scalar(select(func.count()).select_from(Reminder)) == 1
     session = db.scalar(select(ConversationSession))
     assert session is not None
     assert session.pending_clarification["task"] == "call Ali"
 
-    assert post_update(
-        api_client, update_factory(1604, text="Remember my gate code is 4512")
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client, update_factory(1604, text="Remember my gate code is 4512")
+        ).status_code
+        == 200
+    )
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
     assert db.scalar(select(func.count()).select_from(Reminder)) == 1
 
-    assert post_update(
-        api_client, update_factory(1605, text="Remember that my birthday is January 10")
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client, update_factory(1605, text="Remember that my birthday is January 10")
+        ).status_code
+        == 200
+    )
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == 2
     assert db.scalar(select(func.count()).select_from(Reminder)) == 1
 
@@ -675,16 +944,19 @@ def test_saved_memory_secret_is_omitted_from_idempotency_and_recent_history(
 ) -> None:
     onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=850)
     secret = "my Wi-Fi password is Secret-4512"
-    assert post_update(
-        api_client,
-        update_factory(852, text=f"Remember {secret}"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(852, text=f"Remember {secret}"),
+        ).status_code
+        == 200
+    )
 
     record = db.scalar(select(IdempotencyRecord).where(IdempotencyRecord.idempotency_key == "852"))
     assert record is not None and record.response is not None
     assert "request_text" not in record.response
 
-    from reminder_agent.reminders import _recent_messages
+    from reminder_agent.application.conversation_coordinator import _recent_messages
 
     user = db.scalar(select(User))
     assert user is not None
@@ -696,10 +968,13 @@ def test_explicit_memory_save_supersedes_pending_reminder_without_creating_one(
 ) -> None:
     onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=900)
     assert post_update(api_client, update_factory(902, text="Remind me")).status_code == 200
-    assert post_update(
-        api_client,
-        update_factory(903, text="Remember my passport is in the safe"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(903, text="Remember my passport is in the safe"),
+        ).status_code
+        == 200
+    )
 
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
     assert db.scalar(select(func.count()).select_from(Reminder)) == 0
@@ -732,10 +1007,13 @@ def test_indirect_intent_uses_classifier_and_existing_typed_extractor(
 
     api_client.app.state.intent_router = MemoryRouter()
     api_client.app.state.reminder_interpreter = MemoryExtractor()
-    assert post_update(
-        api_client,
-        update_factory(1002, text="Keep in mind that my gate code is 4512"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(1002, text="Keep in mind that my gate code is 4512"),
+        ).status_code
+        == 200
+    )
 
     fact = db.scalar(select(MemoryFact))
     assert fact is not None and fact.content == "gate code is 4512"
@@ -779,15 +1057,15 @@ def test_keep_in_mind_completes_model_fallback_memory_sequence_once(
             }
             return Interpretation(memory_fact=fact)
 
-    import reminder_agent.reminders as reminders
+    import reminder_agent.features.memory.saving as memory_operations
 
-    original_save = reminders.save_memory_fact
+    original_save = memory_operations.save_memory_fact
 
     def save_with_trace(*args, **kwargs):
         events.append("authorized_transactional_memory_service")
         return original_save(*args, **kwargs)
 
-    monkeypatch.setattr(reminders, "save_memory_fact", save_with_trace)
+    monkeypatch.setattr(memory_operations, "save_memory_fact", save_with_trace)
     api_client.app.state.intent_router = MemoryRouter()
     api_client.app.state.reminder_interpreter = MemoryExtractor()
 
@@ -798,7 +1076,7 @@ def test_keep_in_mind_completes_model_fallback_memory_sequence_once(
         "memory_extraction",
         "authorized_transactional_memory_service",
     ]
-    assert telegram_client.messages[-1][1] == "I saved that information."
+    assert telegram_client.messages[-1][1] in MEMORY_SAVE_MESSAGES["confirmation"]
 
     fact = db.scalar(select(MemoryFact))
     assert fact is not None
@@ -839,9 +1117,7 @@ def test_model_routed_memory_save_for_dog_name_creates_only_one_fact(
         def interpret(self, latest_text, *, selected_route, **kwargs):
             assert latest_text == text
             assert selected_route is IntentRoute.SAVE_MEMORY
-            return Interpretation(
-                memory_fact=SaveMemoryFact(content="my dog's name is Bruno")
-            )
+            return Interpretation(memory_fact=SaveMemoryFact(content="my dog's name is Bruno"))
 
     api_client.app.state.intent_router = MemoryRouter()
     api_client.app.state.reminder_interpreter = ReminderIntentInterpreter(
@@ -849,7 +1125,7 @@ def test_model_routed_memory_save_for_dog_name_creates_only_one_fact(
     )
 
     assert post_update(api_client, update_factory(1452, text=text)).status_code == 200
-    assert telegram_client.messages[-1][1] == "I saved that information."
+    assert telegram_client.messages[-1][1] in MEMORY_SAVE_MESSAGES["confirmation"]
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == 1
     assert db.scalar(select(func.count()).select_from(Reminder)) == 0
     assert db.scalar(select(func.count()).select_from(ReminderOccurrence)) == 0
@@ -873,10 +1149,13 @@ def test_uncertain_memory_classification_clarifies_without_extraction_or_mutatio
 
     api_client.app.state.intent_router = UncertainRouter()
     api_client.app.state.reminder_interpreter = FailingExtractor()
-    assert post_update(
-        api_client,
-        update_factory(1502, text="Keep in mind that my gate code is 4512"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(1502, text="Keep in mind that my gate code is 4512"),
+        ).status_code
+        == 200
+    )
 
     assert "not sure" in telegram_client.messages[-1][1].lower()
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == 0
@@ -900,10 +1179,13 @@ def test_classifier_cannot_turn_an_ordinary_statement_into_memory_permission(
 
     api_client.app.state.intent_router = OvereagerRouter()
     api_client.app.state.reminder_interpreter = FailingExtractor()
-    assert post_update(
-        api_client,
-        update_factory(1102, text="My gate code is 4512"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(1102, text="My gate code is 4512"),
+        ).status_code
+        == 200
+    )
 
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == 0
     assert "what information" in telegram_client.messages[-1][1].lower()
@@ -931,10 +1213,13 @@ def test_malformed_llm_memory_content_clarifies_without_mutation(
 
     api_client.app.state.intent_router = MemoryRouter()
     api_client.app.state.reminder_interpreter = MalformedExtractor()
-    assert post_update(
-        api_client,
-        update_factory(1202, text="Please keep this in mind"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(1202, text="Please keep this in mind"),
+        ).status_code
+        == 200
+    )
 
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == 0
     assert db.scalar(select(func.count()).select_from(Reminder)) == 0
@@ -958,10 +1243,13 @@ def test_expired_pending_memory_does_not_save_follow_up_as_a_new_fact(
     session.updated_at = fixed_now - timedelta(seconds=901)
     db.commit()
 
-    assert post_update(
-        api_client,
-        update_factory(1303, text="my passport is in the safe"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(1303, text="my passport is in the safe"),
+        ).status_code
+        == 200
+    )
     assert db.scalar(select(func.count()).select_from(MemoryFact)) == 0
     db.expire_all()
     assert db.scalar(select(ConversationSession)).pending_clarification is None
@@ -994,13 +1282,14 @@ def test_required_lexical_and_semantic_memory_phrases(
     next_query_id = 2003
     for save_id, save_text, query_text, expected in cases:
         if save_text is not None:
-            assert post_update(
-                api_client, update_factory(save_id, text=save_text)
-            ).status_code == 200
+            assert (
+                post_update(api_client, update_factory(save_id, text=save_text)).status_code == 200
+            )
             next_query_id = save_id + 1
-        assert post_update(
-            api_client, update_factory(next_query_id, text=query_text)
-        ).status_code == 200
+        assert (
+            post_update(api_client, update_factory(next_query_id, text=query_text)).status_code
+            == 200
+        )
         assert expected in telegram_client.messages[-1][1]
         next_query_id += 1
 
@@ -1018,23 +1307,29 @@ def test_semantic_lookup_emits_privacy_safe_diagnostics_and_uses_deterministic_r
     def capture_event(_logger, _level, event, **context):
         events.append((event, context))
 
-    monkeypatch.setattr("reminder_agent.reminders.log_event", capture_event)
-    monkeypatch.setattr("reminder_agent.memories.log_event", capture_event)
+    monkeypatch.setattr("reminder_agent.application.conversation_coordinator.log_event", capture_event)
+    monkeypatch.setattr("reminder_agent.features.memory.retrieve.persistence.log_event", capture_event)
 
     provider = DeterministicFakeEmbeddings()
     api_client.app.state.embedding_provider = provider
     api_client.app.state.memory_answerer = GroundedFakeAnswerer()
     onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=2020)
-    assert post_update(
-        api_client,
-        update_factory(2022, text="Remember my parking slot is B17"),
-    ).status_code == 200
-    assert post_update(
-        api_client,
-        update_factory(2023, text="Where do I leave my car?"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(2022, text="Remember my parking slot is B17"),
+        ).status_code
+        == 200
+    )
+    assert (
+        post_update(
+            api_client,
+            update_factory(2023, text="Where do I leave my car?"),
+        ).status_code
+        == 200
+    )
 
-    assert telegram_client.messages[-1][1] == 'You told me: "my parking slot is B17"'
+    assert "my parking slot is B17" in telegram_client.messages[-1][1]
     assert provider.calls == ["my parking slot is B17", "Where do I leave my car?"]
 
     route_events = [context for event, context in events if event == "reminder_route_decision"]
@@ -1045,7 +1340,8 @@ def test_semantic_lookup_emits_privacy_safe_diagnostics_and_uses_deterministic_r
         for context in route_events
     )
     extraction = [
-        context for event, context in events
+        context
+        for event, context in events
         if event == "memory_lookup_query_extracted" and context["update_id"] == 2023
     ]
     assert extraction == [
@@ -1069,18 +1365,12 @@ def test_semantic_lookup_emits_privacy_safe_diagnostics_and_uses_deterministic_r
     assert len(sql_events[-1]["candidate_ids"]) == 1
     assert len(sql_events[-1]["similarity_scores"]) == 1
     semantic_started = [
-        context
-        for event, context in events
-        if event == "memory_semantic_lookup_started"
+        context for event, context in events if event == "memory_semantic_lookup_started"
     ]
     assert semantic_started[-1]["query_representation"] == "full_request"
-    assert semantic_started[-1]["semantic_query_length"] == len(
-        "Where do I leave my car?"
-    )
+    assert semantic_started[-1]["semantic_query_length"] == len("Where do I leave my car?")
     result_events = [
-        context
-        for event, context in events
-        if event == "memory_semantic_lookup_result"
+        context for event, context in events if event == "memory_semantic_lookup_result"
     ]
     assert result_events[-1]["status"] == "CANDIDATES"
     assert result_events[-1]["final_decision_deferred"] is True
@@ -1092,15 +1382,23 @@ def test_disabled_embedding_provider_falls_back_to_deterministic_lexical_lookup(
 ) -> None:
     onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=2050)
     api_client.app.state.embedding_provider = None
-    assert post_update(
-        api_client,
-        update_factory(2052, text="Remember my parking slot is B17"),
-    ).status_code == 200
-    assert post_update(
-        api_client,
-        update_factory(2053, text="What's my parking slot?"),
-    ).status_code == 200
-    assert telegram_client.messages[-1][1] == 'You told me: "my parking slot is B17"'
+    assert (
+        post_update(
+            api_client,
+            update_factory(2052, text="Remember my parking slot is B17"),
+        ).status_code
+        == 200
+    )
+    assert (
+        post_update(
+            api_client,
+            update_factory(2053, text="What's my parking slot?"),
+        ).status_code
+        == 200
+    )
+    assert _fact_found_response(
+        telegram_client.messages[-1][1], "my parking slot is B17"
+    )
     fact = db.scalar(select(MemoryFact))
     assert fact is not None and fact.embedding is None
 
@@ -1109,10 +1407,13 @@ def test_exact_lookup_does_not_call_embedding_or_llm(
     api_client, telegram_client, update_factory
 ) -> None:
     onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=2100)
-    assert post_update(
-        api_client,
-        update_factory(2102, text="Remember my favorite food is biryani"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(2102, text="Remember my favorite food is biryani"),
+        ).status_code
+        == 200
+    )
 
     class MustNotRun:
         model = "fake-semantic-v1"
@@ -1133,10 +1434,13 @@ def test_exact_lookup_does_not_call_embedding_or_llm(
     api_client.app.state.embedding_provider = MustNotRun()
     api_client.app.state.intent_router = MustNotClassify()
     api_client.app.state.memory_answerer = MustNotAnswer()
-    assert post_update(
-        api_client,
-        update_factory(2103, text="What's my favorite food?"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(2103, text="What's my favorite food?"),
+        ).status_code
+        == 200
+    )
     assert "biryani" in telegram_client.messages[-1][1]
 
 
@@ -1166,9 +1470,10 @@ def test_semantic_lookup_sends_only_top_three_owned_memories_to_answerer(
     ):
         assert post_update(api_client, update_factory(update_id, text=text)).status_code == 200
 
-    assert post_update(
-        api_client, update_factory(2130, text="Where do I leave my car?")
-    ).status_code == 200
+    assert (
+        post_update(api_client, update_factory(2130, text="Where do I leave my car?")).status_code
+        == 200
+    )
     assert telegram_client.messages[-1][1] == "You leave your car in parking slot B17."
     assert len(answerer.calls) == 1
     question, memories = answerer.calls[0]
@@ -1192,18 +1497,27 @@ def test_multiple_complementary_memories_are_combined_with_exact_values(
     api_client.app.state.embedding_provider = provider
     api_client.app.state.memory_answerer = answerer
     onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=2130)
-    assert post_update(
-        api_client,
-        update_factory(2132, text="Remember my main parking slot is B17"),
-    ).status_code == 200
-    assert post_update(
-        api_client,
-        update_factory(2133, text="Remember my backup parking slot is C22"),
-    ).status_code == 200
-    assert post_update(
-        api_client,
-        update_factory(2134, text="Where do I park?"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(2132, text="Remember my main parking slot is B17"),
+        ).status_code
+        == 200
+    )
+    assert (
+        post_update(
+            api_client,
+            update_factory(2133, text="Remember my backup parking slot is C22"),
+        ).status_code
+        == 200
+    )
+    assert (
+        post_update(
+            api_client,
+            update_factory(2134, text="Where do I park?"),
+        ).status_code
+        == 200
+    )
     assert telegram_client.messages[-1][1] == (
         "Your main parking slot is B17, and your backup slot is C22."
     )
@@ -1226,13 +1540,17 @@ def test_semantic_unknown_uses_answer_contract_without_hallucination(
     api_client.app.state.embedding_provider = provider
     api_client.app.state.memory_answerer = answerer
     onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=2140)
-    assert post_update(
-        api_client, update_factory(2142, text="Remember my favorite food is biryani")
-    ).status_code == 200
-    assert post_update(
-        api_client, update_factory(2143, text="What's my favorite movie?")
-    ).status_code == 200
-    assert telegram_client.messages[-1][1] == "I don't know that yet."
+    assert (
+        post_update(
+            api_client, update_factory(2142, text="Remember my favorite food is biryani")
+        ).status_code
+        == 200
+    )
+    assert (
+        post_update(api_client, update_factory(2143, text="What's my favorite movie?")).status_code
+        == 200
+    )
+    assert telegram_client.messages[-1][1] in MEMORY_LOOKUP_MESSAGES["unknown_fact"]
     assert len(answerer.calls) == 1
 
 
@@ -1251,28 +1569,38 @@ def test_semantic_conflicts_use_model_clarification_and_typed_pending_context(
     api_client.app.state.embedding_provider = provider
     api_client.app.state.memory_answerer = answerer
     onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=2160)
-    assert post_update(
-        api_client, update_factory(2162, text="Remember my office is in Lahore")
-    ).status_code == 200
-    assert post_update(
-        api_client, update_factory(2163, text="Remember my workplace is Karachi")
-    ).status_code == 200
-    assert post_update(
-        api_client, update_factory(2164, text="Where is my office located?")
-    ).status_code == 200
-    assert telegram_client.messages[-1][1] == (
-        "Do you mean the Lahore or Karachi office location?"
+    assert (
+        post_update(
+            api_client, update_factory(2162, text="Remember my office is in Lahore")
+        ).status_code
+        == 200
     )
+    assert (
+        post_update(
+            api_client, update_factory(2163, text="Remember my workplace is Karachi")
+        ).status_code
+        == 200
+    )
+    assert (
+        post_update(
+            api_client, update_factory(2164, text="Where is my office located?")
+        ).status_code
+        == 200
+    )
+    assert telegram_client.messages[-1][1] == ("Do you mean the Lahore or Karachi office location?")
     db.expire_all()
     session = db.scalar(select(ConversationSession))
     assert session is not None
     assert session.pending_clarification["operation"] == "RETRIEVE_MEMORY"
     assert len(session.pending_clarification["candidate_ids"]) == 2
-    assert db.scalar(
-        select(func.count()).select_from(IdempotencyRecord).where(
-            IdempotencyRecord.idempotency_key == "2164"
+    assert (
+        db.scalar(
+            select(func.count())
+            .select_from(IdempotencyRecord)
+            .where(IdempotencyRecord.idempotency_key == "2164")
         )
-    ) == 0
+        == 0
+    )
 
 
 @pytest.mark.parametrize(
@@ -1293,13 +1621,17 @@ def test_invalid_or_unsupported_memory_answer_output_fails_safe(
     api_client.app.state.embedding_provider = DeterministicFakeEmbeddings()
     api_client.app.state.memory_answerer = StaticFakeAnswerer(proposal)
     onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=2180)
-    assert post_update(
-        api_client, update_factory(2182, text="Remember my parking slot is B17")
-    ).status_code == 200
-    assert post_update(
-        api_client, update_factory(2183, text="Where do I leave my car?")
-    ).status_code == 200
-    assert telegram_client.messages[-1][1] == "I don't know that yet."
+    assert (
+        post_update(
+            api_client, update_factory(2182, text="Remember my parking slot is B17")
+        ).status_code
+        == 200
+    )
+    assert (
+        post_update(api_client, update_factory(2183, text="Where do I leave my car?")).status_code
+        == 200
+    )
+    assert telegram_client.messages[-1][1] in MEMORY_LOOKUP_MESSAGES["unknown_fact"]
 
 
 def test_semantic_candidates_and_answer_prompt_remain_cross_user_isolated(
@@ -1311,18 +1643,31 @@ def test_semantic_candidates_and_answer_prompt_remain_cross_user_isolated(
     api_client.app.state.memory_answerer = answerer
     onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=2220)
     onboard(api_client, update_factory, user_id=1002, chat_id=2002, start=2230)
-    assert post_update(
-        api_client,
-        update_factory(2222, user_id=1001, chat_id=2001, text="Remember my parking slot is B17"),
-    ).status_code == 200
-    assert post_update(
-        api_client,
-        update_factory(2232, user_id=1002, chat_id=2002, text="Remember my parking slot is A99"),
-    ).status_code == 200
-    assert post_update(
-        api_client,
-        update_factory(2223, user_id=1001, chat_id=2001, text="Where do I leave my car?"),
-    ).status_code == 200
+    assert (
+        post_update(
+            api_client,
+            update_factory(
+                2222, user_id=1001, chat_id=2001, text="Remember my parking slot is B17"
+            ),
+        ).status_code
+        == 200
+    )
+    assert (
+        post_update(
+            api_client,
+            update_factory(
+                2232, user_id=1002, chat_id=2002, text="Remember my parking slot is A99"
+            ),
+        ).status_code
+        == 200
+    )
+    assert (
+        post_update(
+            api_client,
+            update_factory(2223, user_id=1001, chat_id=2001, text="Where do I leave my car?"),
+        ).status_code
+        == 200
+    )
     assert "B17" in telegram_client.messages[-1][1]
     assert "A99" not in str(answerer.calls)
 
@@ -1341,15 +1686,17 @@ def test_sensitive_memory_never_reaches_memory_answerer(
     api_client.app.state.embedding_provider = provider
     api_client.app.state.memory_answerer = MustNotAnswer()
     onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=2240)
-    assert post_update(
-        api_client, update_factory(2242, text="Remember my Wi-Fi password is Andorra2026")
-    ).status_code == 200
-    assert post_update(
-        api_client, update_factory(2243, text="What's my Wi-Fi password?")
-    ).status_code == 200
-    assert telegram_client.messages[-1][1] == (
-        'You told me: "my Wi-Fi password is Andorra2026"'
+    assert (
+        post_update(
+            api_client, update_factory(2242, text="Remember my Wi-Fi password is Andorra2026")
+        ).status_code
+        == 200
     )
+    assert (
+        post_update(api_client, update_factory(2243, text="What's my Wi-Fi password?")).status_code
+        == 200
+    )
+    assert "my Wi-Fi password is Andorra2026" in telegram_client.messages[-1][1]
     assert provider.calls == []
 
 
@@ -1361,7 +1708,7 @@ def test_embedding_failure_saves_once_and_replay_does_not_repeat_work(
     onboard(api_client, update_factory, user_id=1001, chat_id=2001, start=2200)
     update = update_factory(2202, text="Remember my favorite food is biryani")
     assert post_update(api_client, update).status_code == 200
-    assert telegram_client.messages[-1][1] == "I saved that information."
+    assert telegram_client.messages[-1][1] in MEMORY_SAVE_MESSAGES["confirmation"]
     assert post_update(api_client, update).status_code == 200
 
     fact = db.scalar(select(MemoryFact))
