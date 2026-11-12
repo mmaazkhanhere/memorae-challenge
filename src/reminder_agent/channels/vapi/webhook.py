@@ -245,8 +245,27 @@ def _tool_call_response(
         )
         return {"toolCallId": tool_call.id, "error": "I couldn't complete that request."}
     if outcome.error is not None:
+        log_event(
+            logger,
+            logging.WARNING,
+            "vapi_tool_call_completed",
+            call_id=call_id,
+            tool_call_id=tool_call.id,
+            function_name=tool_call.function.name,
+            outcome="ERROR",
+        )
         return {"toolCallId": tool_call.id, "error": outcome.error}
     assert outcome.response is not None
+    log_event(
+        logger,
+        logging.INFO,
+        "vapi_tool_call_completed",
+        call_id=call_id,
+        tool_call_id=tool_call.id,
+        function_name=tool_call.function.name,
+        outcome="RESULT",
+        response_kind=outcome.response.response_kind,
+    )
     return {"toolCallId": tool_call.id, "result": outcome.response.content}
 
 
@@ -281,6 +300,15 @@ def vapi_webhook(
         log_event(logger, logging.WARNING, "vapi_server_message_invalid")
         raise HTTPException(status_code=400, detail="Malformed Vapi server message") from None
 
+    log_event(
+        logger,
+        logging.INFO,
+        "vapi_server_message_received",
+        message_type=message.type,
+        call_id=message.call.id if message.call is not None else None,
+        tool_call_count=len(message.tool_call_list),
+    )
+
     if message.type == END_OF_CALL_REPORT:
         if message.call is not None:
             ended = end_vapi_call(
@@ -299,6 +327,20 @@ def vapi_webhook(
 
     if message.type == TOOL_CALLS:
         call_id = message.call.id if message.call is not None else None
+        log_event(
+            logger,
+            logging.INFO,
+            "vapi_tool_calls_received",
+            call_id=call_id,
+            tool_call_count=len(message.tool_call_list),
+            tool_calls=[
+                {
+                    "tool_call_id": tool_call.id,
+                    "function_name": tool_call.function.name,
+                }
+                for tool_call in message.tool_call_list
+            ],
+        )
         results = [
             _tool_call_response(
                 request,
