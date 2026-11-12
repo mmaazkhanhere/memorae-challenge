@@ -24,7 +24,6 @@ from reminder_agent.application.response_staging import (
 from reminder_agent.features.memory.persistence import DEFAULT_EMBEDDING_PRIVACY_POLICY
 from reminder_agent.features.memory.retrieve.answering import (
     MemoryAnswerer,
-    memory_answer_preserves_exact_values,
 )
 from reminder_agent.features.memory.retrieve.contracts import (
     DEFAULT_MEMORY_RETRIEVAL_POLICY,
@@ -34,12 +33,12 @@ from reminder_agent.features.memory.retrieve.persistence import lookup_memory_fa
 from reminder_agent.features.memory.retrieve.workflow import run_memory_lookup_workflow
 from reminder_agent.features.memory.saving import run_memory_save_workflow, save_memory_for_request
 from reminder_agent.infrastructure.database.models import ChannelIdentity, User
+from reminder_agent.infrastructure.observability import log_event
 from reminder_agent.infrastructure.providers.embeddings import (
     EmbeddingPrivacyPolicy,
     EmbeddingProvider,
     contains_sensitive_memory,
 )
-from reminder_agent.infrastructure.observability import log_event
 from reminder_agent.shared.memory_contracts import PendingMemory, PendingMemoryLookup
 
 
@@ -143,7 +142,6 @@ def _handle_memory_lookup_text(
         memory_retrieval_policy=memory_retrieval_policy,
         lookup_memory_operation=lookup_memory_fact,
         contains_sensitive_memory_fn=contains_sensitive_memory,
-        answer_preserves_exact_values_fn=memory_answer_preserves_exact_values,
         log_event_fn=log_event,
         event_context={"update_id": update.update_id},
     )

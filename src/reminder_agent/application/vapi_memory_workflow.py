@@ -35,7 +35,6 @@ from reminder_agent.features.intent.model.router import IntentRouter
 from reminder_agent.features.intent.policy import OUT_OF_SCOPE_RESPONSE
 from reminder_agent.features.intent.routing import route_and_interpret
 from reminder_agent.features.memory.messages import lookup_memory_message, save_memory_message
-from reminder_agent.features.memory.retrieve.answering import memory_answer_preserves_exact_values
 from reminder_agent.features.memory.retrieve.contracts import (
     MemoryRetrievalPolicy,
 )
@@ -431,7 +430,6 @@ def _lookup_memory_response(
         embedding_privacy_policy=VAPI_EMBEDDING_PRIVACY_POLICY,
         memory_retrieval_policy=memory_retrieval_policy,
         lookup_memory_operation=lookup_memory_fact,
-        answer_preserves_exact_values_fn=memory_answer_preserves_exact_values,
         allow_sensitive_facts=True,
         event_context={"call_id": request.context.external_session_id},
     )
