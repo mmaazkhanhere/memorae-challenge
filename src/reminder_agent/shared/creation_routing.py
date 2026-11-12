@@ -41,6 +41,10 @@ _MEMORY_FACT_COMMAND = re.compile(
     r")",
     re.IGNORECASE,
 )
+_MEMORY_FACT_SUFFIX_COMMAND = re.compile(
+    r"^\s*(?P<fact>.+?)\s*[.!]\s*(?:please\s+)?save\s+(?:this|that)\s*[.!?]*\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
 _MEMORY_REMINDER_COLLISION = re.compile(
     r"^\s*(?:please\s+)?(?:"
     r"remember\s+to\b.*\b(?:keep|store|save|remember)\b.*\bin\s+mind|"
@@ -59,6 +63,7 @@ _EMBEDDED_REMINDER_REQUEST = re.compile(
 _UNRESOLVED_MEMORY_REFERENCE = re.compile(
     r"^\s*(?:please\s+)?(?:remember|save)\s+this\b"
     r"(?!\s+fact\s*[:,-])|"
+    r"^\s*(?:please\s+)?(?:remember|save)\s+that\s*[.!?]*\s*$|"
     r"^\s*(?:please\s+)?remember\s+that\s+this\b|"
     r"^\s*(?:please\s+)?(?:make|take)\s+(?:a\s+)?note"
     r"(?:\s+(?:that|of|about))?\s+this\b(?!\s+fact\s*[:,-])",
@@ -96,6 +101,13 @@ def explicit_create_route(text: str) -> ExplicitCreateRoute:
         return ExplicitCreateRoute.MODEL_FALLBACK
     if _MEMORY_REMINDER_COLLISION.match(text):
         return ExplicitCreateRoute.MODEL_FALLBACK
+    if _UNRESOLVED_MEMORY_REFERENCE.search(text):
+        return ExplicitCreateRoute.MODEL_FALLBACK
+    # A complete fact may precede a same-message imperative such as
+    # "My parking spot is B17. Save that." Treat only the fact sentence as
+    # memory content; a bare "save that" remains unresolved.
+    if _MEMORY_FACT_SUFFIX_COMMAND.match(text):
+        return ExplicitCreateRoute.SAVE_MEMORY
     if REMINDER_COMMAND_PREFIX.match(text):
         return ExplicitCreateRoute.NEW_REMINDER
     if _MEMORY_FACT_COMMAND.match(text):

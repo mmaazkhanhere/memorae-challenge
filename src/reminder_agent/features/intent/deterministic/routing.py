@@ -136,6 +136,14 @@ _CONTEXTUAL_CANCEL = re.compile(
     r"(?:it|this|that|the\s+above|above|previous|prior)\s*[.!?]*\s*$",
     re.IGNORECASE,
 )
+_CONTEXTUAL_RESCHEDULE = re.compile(
+    r"\b(?:make|move|shift|push|reschedule|change)\s+(?:it|that|the\s+reminder|my\s+reminder)\b"
+    r"|\b(?:make|move|shift|push|reschedule|change)\b.*\b(?:reminder|appointment|bill|presentation|workout|"
+    r"call|report|invoice|gym|grocery|medicine|meeting)\b"
+    r"|\b(?:something\s+came\s+up|i['’]?m\s+busy|i\s+need\s+more\s+time|i\s+won['’]?t|"
+    r"i\s+don['’]?t\s+think)\b.*\b(?:move|shift|push|remind|instead)\b",
+    re.IGNORECASE,
+)
 
 
 def is_completion_command(text: str) -> bool:
@@ -306,6 +314,8 @@ def route_message(
             return RouteDecision(ConversationRoute.MODEL_FALLBACK)
         if is_clear_cancel_command(raw):
             return RouteDecision(ConversationRoute.CANCEL_REQUEST)
+        if _CONTEXTUAL_RESCHEDULE.search(raw):
+            return RouteDecision(ConversationRoute.RESCHEDULE_REQUEST)
         if _BARE_CLOCK.fullmatch(raw):
             return RouteDecision(ConversationRoute.UNRELATED)
         return RouteDecision(ConversationRoute.MODEL_FALLBACK)

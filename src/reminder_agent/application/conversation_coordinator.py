@@ -607,18 +607,12 @@ def handle_reminder_text(
         result = conversation_entry.response
         if result.selection_context:
             remember_selection_context(user_id, tuple(result.selection_context))
-        if result.response_kind != "REMINDER_LIST":
-            return ReminderReply(update.message.chat.id, result.content, response_kind=result.response_kind)
-        with db.begin():
-            return _store_response(
-                db,
-                update=update,
-                user_id=user_id,
-                text=result.content,
-                response_kind=result.response_kind,
-                operation="LIST_REMINDERS",
-                selection_context=tuple(result.selection_context or ()),
-            )
+        return ReminderReply(
+            update.message.chat.id,
+            result.content,
+            response_kind=result.response_kind,
+            selection_context=tuple(result.selection_context or ()),
+        )
     assert conversation_entry.route is not None
     deterministic_route = conversation_entry.route
     log_event(
@@ -1026,7 +1020,14 @@ def handle_reminder_text(
         )
         if completion_reply is not None:
             return completion_reply
-    if session_is_expired:
+    # An expired clarification must not consume an explicit new operation.
+    # The deterministic route has already established that these are complete
+    # commands, so allow them through with no pending context. Plain follow-ups
+    # still stop here and receive the expiry response below.
+    if session_is_expired and deterministic_route not in {
+        ConversationRoute.SAVE_MEMORY_REQUEST,
+        ConversationRoute.NEW_REQUEST,
+    }:
         interpretation = None
     else:
         route, interpretation = _route_and_interpret(
@@ -1098,16 +1099,30 @@ def handle_reminder_text(
                 target_text=interpretation.completion_target_text,
             )
         elif route is ConversationRoute.RETRIEVE_MEMORY_REQUEST:
+            memory_query = (
+                interpretation.memory_query.query
+                if interpretation.memory_query is not None
+                else None
+            )
+            log_event(
+                logger,
+                logging.INFO,
+                "memory_lookup_extraction_observed",
+                update_id=update.update_id,
+                query_present=memory_query is not None,
+                query_length=len(memory_query or ""),
+                query_text=memory_query,
+                clarification_present=interpretation.response_text is not None,
+                clarification_question=interpretation.response_text,
+                clarification_question_length=len(interpretation.response_text or ""),
+            )
             return _handle_memory_lookup_text(
                 db,
                 update,
                 user=user,
                 pending=None,
-                query=(
-                    interpretation.memory_query.query
-                    if interpretation.memory_query is not None
-                    else None
-                ),
+                query=memory_query,
+                clarification_text=interpretation.response_text,
                 from_model=deterministic_route is ConversationRoute.MODEL_FALLBACK,
                 now=now,
                 session_ttl_seconds=session_ttl_seconds,
@@ -1248,7 +1263,15 @@ def handle_reminder_text(
                     text="That clarification expired. Please send the complete reminder again.",
                     response_kind="clarification_expired",
                 )
-            if session_is_expired and locked_session is None:
+            if (
+                session_is_expired
+                and locked_session is None
+                and deterministic_route
+                not in {
+                    ConversationRoute.SAVE_MEMORY_REQUEST,
+                    ConversationRoute.NEW_REQUEST,
+                }
+            ):
                 return _store_response(
                     db,
                     update=update,

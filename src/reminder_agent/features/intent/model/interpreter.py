@@ -272,6 +272,11 @@ class OpenAICompatibleIntentInterpreter:
                     response_text=lookup_memory_message("missing_subject"),
                     fallback_allowed=False,
                 )
+            if route is IntentRoute.RESCHEDULE_REQUEST:
+                # Let the reschedule service retain its deterministic decision
+                # and grounded candidate context when the provider is down.
+                # A generic creation error is misleading for a move request.
+                return Interpretation(fallback_allowed=False)
             return Interpretation(
                 response_text=(
                     "I couldn't understand that reminder. Please provide the task and future time."
@@ -296,6 +301,8 @@ class OpenAICompatibleIntentInterpreter:
                     response_text=lookup_memory_message("missing_subject"),
                     fallback_allowed=False,
                 )
+            if route is IntentRoute.RESCHEDULE_REQUEST:
+                return Interpretation(fallback_allowed=False)
             return Interpretation(
                 response_text=(
                     "I couldn't understand that reminder. Please provide the task and future time."

@@ -222,6 +222,7 @@ class ReminderIntentInterpreter:
             provider_result.resolved_intents
             or provider_result.clarification is not None
             or provider_result.clear_context
+            or provider_result.response_text is not None
             or provider_result.memory_fact is not None
             or provider_result.memory_query is not None
         ):

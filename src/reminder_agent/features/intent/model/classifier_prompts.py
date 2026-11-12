@@ -49,7 +49,7 @@ CLASSIFIER_PROMPT_V1 = """
     For SAVE_MEMORY, provide `memory_intent_evidence` with `kind: "EXPLICIT_SAVE_REQUEST"`, `confidence: "CLEAR"`, and an exact source span
     in `evidence_text`. For every other operation, set it to null.
 
-    Return JSON only:
+    Return one valid json object only:
 
     {
     "operation": "<SUPPORTED_OPERATION>",
@@ -91,7 +91,7 @@ CLASSIFIER_PROMPT_V2 = """
     7. For SAVE_MEMORY only, provide memory_intent_evidence with kind="EXPLICIT_SAVE_REQUEST", confidence="CLEAR", and an exact user-message span in evidence_text. Otherwise use null.
     8. Set target_text only when a specific reminder task is explicitly referenced; otherwise null.
 
-    Return only JSON:
+    Return only one valid json object:
     {
     "operation": "<SUPPORTED_OPERATION>",
     "target_text": null,
