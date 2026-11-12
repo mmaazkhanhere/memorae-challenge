@@ -20,12 +20,12 @@ from reminder_agent.features.memory.messages import lookup_memory_message
 from reminder_agent.features.memory.retrieve.answering import (
     MemoryAnswerer,
     MemoryAnswerProposal,
-    memory_answer_preserves_exact_values,
 )
 from reminder_agent.features.memory.retrieve.contracts import (
     MemoryLookupResult,
     MemoryRetrievalPolicy,
     is_memory_lookup_query_grounded,
+    select_memory_fact_clause,
 )
 from reminder_agent.features.memory.retrieve.persistence import (
     lookup_memory_fact,
@@ -75,7 +75,6 @@ def run_memory_lookup_workflow[ResponseT_co](
     memory_retrieval_policy: MemoryRetrievalPolicy = DEFAULT_MEMORY_RETRIEVAL_POLICY,
     lookup_memory_operation: Callable[..., MemoryLookupResult] = lookup_memory_fact,
     contains_sensitive_memory_fn: Callable[[str], bool] = contains_sensitive_memory,
-    answer_preserves_exact_values_fn: Callable[..., bool] = memory_answer_preserves_exact_values,
     allow_fact_disclosure_fn: Callable[[object], bool] | None = None,
     allow_sensitive_facts: bool = False,
     log_event_fn: Callable[..., object] = log_event,
@@ -219,13 +218,6 @@ def run_memory_lookup_workflow[ResponseT_co](
                         rejection_reason = "candidate_revalidation_failed"
                     elif any(fact.user_id != locked_user.id for fact in selected):
                         rejection_reason = "candidate_ownership_failed"
-                    elif proposal.answer is None:
-                        rejection_reason = "missing_answer"
-                    elif not answer_preserves_exact_values_fn(
-                        proposal.answer,
-                        tuple(fact.content for fact in selected),
-                    ):
-                        rejection_reason = "exact_value_preservation_failed"
                     if rejection_reason is not None:
                         log_event_fn(
                             logger,
@@ -237,8 +229,27 @@ def run_memory_lookup_workflow[ResponseT_co](
                         )
                         result = MemoryLookupResult(status="UNKNOWN")
                     else:
-                        answer_text = proposal.answer
-                        result = MemoryLookupResult(status="FOUND", fact=selected[0])
+                        clauses = tuple(
+                            select_memory_fact_clause(fact.content, query) for fact in selected
+                        )
+                        if any(clause is None for clause in clauses):
+                            log_event_fn(
+                                logger,
+                                logging.INFO,
+                                "memory_answer_selection_requires_clarification",
+                                **event_context,
+                                selected_candidate_count=len(selected),
+                            )
+                            result = MemoryLookupResult(
+                                status="AMBIGUOUS",
+                                candidate_ids=tuple(fact.id for fact in selected),
+                            )
+                        else:
+                            answer_text = lookup_memory_message(
+                                "fact_found",
+                                fact="; ".join(clause for clause in clauses if clause is not None),
+                            )
+                            result = MemoryLookupResult(status="FOUND", fact=selected[0])
                 elif proposal.decision == "AMBIGUOUS":
                     proposed_selected = tuple(
                         safe_candidates[index] for index in proposal.candidate_indices
@@ -269,9 +280,39 @@ def run_memory_lookup_workflow[ResponseT_co](
                             status="AMBIGUOUS",
                             candidate_ids=tuple(fact.id for fact in selected),
                         )
-                        answer_text = proposal.clarification_question
                 else:
                     result = MemoryLookupResult(status="UNKNOWN")
+            if result.status == "FOUND" and result.fact is not None:
+                selected = revalidate_owned_memory_candidates(
+                    db,
+                    user_id=locked_user.id,
+                    candidates=(result.fact,),
+                )
+                if len(selected) != 1 or selected[0].user_id != locked_user.id:
+                    log_event_fn(
+                        logger,
+                        logging.ERROR,
+                        "memory_answer_validation_failed",
+                        **event_context,
+                        reason=(
+                            "candidate_revalidation_failed"
+                            if not selected
+                            else "candidate_ownership_failed"
+                        ),
+                        selected_candidate_count=len(selected),
+                    )
+                    result = MemoryLookupResult(status="UNKNOWN")
+                else:
+                    result = MemoryLookupResult(status="FOUND", fact=selected[0])
+                    if answer_text is None:
+                        clause = select_memory_fact_clause(selected[0].content, query)
+                        if clause is None:
+                            result = MemoryLookupResult(
+                                status="AMBIGUOUS",
+                                candidate_ids=(selected[0].id,),
+                            )
+                        else:
+                            answer_text = lookup_memory_message("fact_found", fact=clause)
             if result.status == "FOUND" and result.fact is not None:
                 if allow_fact_disclosure_fn is not None and not allow_fact_disclosure_fn(
                     result.fact
