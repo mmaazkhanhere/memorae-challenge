@@ -78,7 +78,8 @@ def is_phone_link_request(text: str) -> bool:
     """Recognize explicit natural-language requests to open phone linking."""
 
     normalized = " ".join(text.strip().split())
-    if normalized.casefold() in {
+    normalized_key = normalized.rstrip(".!?").casefold()
+    if normalized_key in {
         "share my number",
         "share my phone number",
         "send my number",
@@ -90,6 +91,15 @@ def is_phone_link_request(text: str) -> bool:
         "set up phone calls",
         "please enable phone calls",
         "please set up phone calls",
+        "how do i share my phone number",
+        "how can i share my phone number",
+        "please connect my phone",
+        "please connect my phone number",
+        "let's connect my phone",
+        "lets connect my phone",
+        "i want to talk by phone",
+        "i'd like to talk by phone",
+        "can we set up phone calls",
     }:
         return True
     return bool(
