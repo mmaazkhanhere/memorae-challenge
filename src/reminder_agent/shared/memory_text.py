@@ -18,6 +18,16 @@ _MEMORY_FACT_SUFFIX = re.compile(
 _LEADING_FILLER = re.compile(r"^(?:that|this|of|to|for\s+me)\s+", re.IGNORECASE)
 _LOOKUP_PATTERNS = (
     re.compile(
+        r"^\s*where\s+did\s+i\s+leave\s+(?:my|the)\s+"
+        r"(?P<query>.+?)\s*[?!.]*\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^\s*what\s+(?P<query>.+?)\s+did\s+i\s+(?:save|remember)\s*"
+        r"[?!.]*\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
         r"^\s*what\s+was\s+(?:the\s+)?name\s+of\s+(?:my|the)\s+"
         r"(?P<query>.+?)\s*[?!.]*\s*$",
         re.IGNORECASE,
