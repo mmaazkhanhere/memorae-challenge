@@ -66,4 +66,4 @@ pretty = true
 [project.scripts]
 reminder-agent = "reminder_agent.application.main:run"
 reminder-worker = "reminder_agent.infrastructure.runtime.worker:run"
-memory-embedding-backfill = "reminder_agent.features.memory.memory_backfill:run"
+memory-embedding-backfill = "reminder_agent.features.memory.backfill:run"
