@@ -27,6 +27,17 @@ docker compose up -d
 Compose runs migrations once, then supervises the API and `reminder-worker` as separate services
 with independent restart policies. The API is exposed on port 8000; the worker has no public port.
 
+### Development and production databases
+
+Local development uses the Dockerized PostgreSQL database from `.env.example`:
+`postgresql+psycopg://memorae:memorae@localhost:5433/memorae`. Keep that URL in the local
+`.env` file only. Production uses a separate Neon PostgreSQL database through the same
+`DATABASE_URL` setting; use `.env.production.example` as the template and add the resulting
+value to the production secret store, such as Railway variables. Do not put the Neon URL in
+`.env`, commit a `.env.production` file, or run production migrations against the local
+database. Apply migrations from the production environment with `uv run alembic upgrade head`
+before starting the production API and worker.
+
 Copy `.env.example` to `.env` and configure `TELEGRAM_BOT_TOKEN` and
 `TELEGRAM_WEBHOOK_SECRET`. `PHONE_DEFAULT_REGION` is only a deployment-wide
 fallback; in a multi-country deployment, users with local-format contacts can
