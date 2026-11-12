@@ -1,256 +1,389 @@
 # Memorae
 
-## Local development
+Memorae is a Python/FastAPI reminder and memory agent. Users interact through Telegram text,
+Telegram voice notes, or an authenticated Vapi phone call. The application stores reminders and
+user-owned facts in PostgreSQL, delivers reminders through Telegram, and runs delivery in a
+separate worker process.
 
-VS-03 and VS-07 implement Telegram onboarding, verified phone linking, one-time reminders, and
-weekly recurring reminders
-with FastAPI, SQLAlchemy, Alembic, and PostgreSQL.
+## Overview
 
-The full local stack (PostgreSQL, migrations, API, and worker) starts with one command:
+Memorae supports the following workflows:
+
+- Telegram onboarding with IANA time-zone selection and optional verified phone linking.
+- One-time and weekly recurring reminders.
+- Reminder listing, rescheduling, cancellation, completion, snoozing, and progress summaries.
+- User-owned memory save and retrieval, with optional PostgreSQL `pgvector` semantic indexing.
+- Telegram voice notes transcribed through a Groq Whisper-compatible endpoint.
+- Vapi inbound call authorization and voice tools for reminder and memory operations.
+
+Requests use a deterministic-first routing and extraction pipeline. When deterministic handling is
+insufficient, the configured model may classify or propose typed parameters. The application then
+validates intent, ownership, authorization, grounding, time zones, and state transitions before a
+shared service can mutate data. Ambiguous, unsupported, or incomplete requests do not mutate data.
+
+## Technology stack
+
+- Python `>=3.12`
+- FastAPI and Uvicorn
+- SQLAlchemy and Alembic
+- PostgreSQL with the `pgvector` extension
+- Telegram Bot API
+- Vapi inbound voice webhooks
+- OpenAI-compatible LLM and STT endpoints; Groq Whisper is the default STT configuration
+- Optional OpenAI-compatible or Gemini embeddings
+- `uv` for dependency management and command execution
+- pytest, pytest-cov, Ruff, and mypy for development and testing
+
+## Prerequisites
+
+Install the following before starting local development:
+
+- Git
+- Python 3.12 or newer
+- [`uv`](https://docs.astral.sh/uv/)
+- Docker with Docker Compose support
+
+Provider credentials are optional for the deterministic local test suite, but are required for the
+corresponding live Telegram, LLM, STT, Vapi, or embedding integrations.
+
+## Getting started
+
+### Option 1: Run the complete stack with Docker Compose
+
+From the repository root:
 
 ```powershell
+Copy-Item .env.example .env
 docker compose up --build
 ```
 
-`docker compose up` also works after the first build. Compose loads `.env.example` by
-default and optionally overlays a local, untracked `.env`; copying the example is not
-required. The API is exposed on port 8000 and the worker has no public port. The example
-configuration keeps semantic embeddings disabled and does not require provider credentials
-for local startup; configure real Telegram, LLM, and STT credentials before using those
-integrations.
+Compose loads `.env.example` and optionally overlays the untracked `.env`. It starts:
 
-The same startup path is available through `make run`.
+- `postgres`: PostgreSQL with `pgvector`, exposed on host port `5433`.
+- `migrate`: runs `alembic upgrade head`.
+- `api`: the FastAPI service, exposed on `http://localhost:8000`.
+- `worker`: the PostgreSQL-backed Telegram notification and confirmation worker.
 
-Compose runs migrations once, then supervises the API and `reminder-worker` as separate services
-with independent restart policies.
+The sample configuration uses local placeholder values. Configure real provider credentials in
+`.env` before using external integrations.
 
-### Development and production databases
+Stop the stack with:
 
-Local development uses the Dockerized PostgreSQL database from `.env.example`:
-`postgresql+psycopg://memorae:memorae@localhost:5433/memorae`. Keep that URL in the local
-`.env` file only. Production uses a separate Neon PostgreSQL database through the same
-`DATABASE_URL` setting; replace the example value in the production secret store, such as
-Railway variables. Do not put the Neon URL in the local `.env` or run production migrations
-against the local database. Apply migrations from the production environment with
-`uv run alembic upgrade head` before starting the production API and worker.
+```powershell
+docker compose down
+```
 
-For a real Telegram deployment, copy `.env.example` to `.env` and configure
-`TELEGRAM_BOT_TOKEN` and `TELEGRAM_WEBHOOK_SECRET`. `PHONE_DEFAULT_REGION` is only a deployment-wide
-fallback; in a multi-country deployment, users with local-format contacts can
-set their own region with `/phone_region XX`. Set the Telegram webhook to
-`POST /webhook/telegram` with the same secret token.
+The equivalent Make targets are `make run`, `make stop`, and `make logs`.
 
-Telegram voice notes are downloaded only after the sender is authenticated,
-validated as bounded OGG voice media, and transcribed through the configured
-Groq Whisper-compatible `STT_*` endpoint. The transcript then uses the same
-deterministic-first command router and shared reminder/memory services as typed
-text. Audio and transcripts are not retained or written to logs; voice replies
-are Telegram text messages. Failed or inaudible notes never mutate reminders
-or memories.
+### Option 2: Run the API and worker from the host
 
-### VS-16 Vapi inbound authorization
+Use this workflow when PostgreSQL is running in Docker but the Python processes run locally:
 
-Set `VAPI_ENABLED=true`, configure a unique `VAPI_WEBHOOK_BEARER_TOKEN`, and
-run `uv run alembic upgrade head`. In Vapi, attach the HTTPS Server URL
-`POST /webhook/vapi` and the matching saved Bearer credential to the inbound
-phone-number or organization server configuration. Leave the phone number
-without a fixed assistant so the `assistant-request` decision can reject
-unknown callers before a conversation starts. Link the caller's E.164 number
-through Telegram first. The transient assistant exposes server tools for
-reminder creation and full reminder management (list, move, cancel, complete,
-and snooze), plus memory save/lookup. Each tool accepts only the caller's
-complete utterance and uses the shared deterministic-first application
-pipeline; caller-supplied user IDs, fact IDs, reminder IDs, and reminder
-fields are never trusted. Reminder changes made on a call use the linked
-Telegram destination, and committed results are returned to Vapi before the
-assistant speaks. Unknown or ambiguous requests receive clarification without
-mutation.
+```powershell
+Copy-Item .env.example .env
+uv sync --extra test
+docker compose up -d postgres
+uv run alembic upgrade head
+```
 
-Production startup fails fast unless `DATABASE_URL` uses PostgreSQL,
-`TELEGRAM_BOT_TOKEN` is configured, and `TELEGRAM_WEBHOOK_SECRET` is a unique value of at
-least 32 characters. The sample placeholders and local SQLite defaults are intended only for
-injected test applications. `/ready` also verifies that the domain tables exist, so a stale
-`alembic_version` row cannot make an empty database appear healthy. Readiness also requires the
-current migration head (`0017_voice_call_authorizations`) and the worker/confirmation claim
-columns, so a partially migrated database is rejected before webhooks are accepted.
-The additive schema-repair migrations also rebuild missing domain tables when a
-database was reset without resetting its Alembic version row.
+Start the API in one terminal:
 
-Reminder text uses a confidence-first, strict typed boundary. The built-in parser
-only handles short greetings and thanks plus unambiguous one-time reminders such as
-`Remind me in five minutes to call the bank`, `Remind me tomorrow at 9 AM to check my email`,
-`Remind me on Friday at 6 PM to go to the gym`, and `Remind me to pay the bill at 8 PM today`.
-It also accepts weekly schedules such as `Remind me every Monday at 8 AM to call the bank` and
-stores a typed weekly rule rather than trusting a model-generated recurrence string. Anything
-requiring context, a clarification, or conversational interpretation falls back to the configured
-model. By default, intent fallback uses `openai/gpt-oss-20b`, while typed extraction
-and grounded memory answering use `openai/gpt-oss-120b` through the same configured
-OpenAI-compatible client. `LLM_BASE_URL`,
-`LLM_API_KEY`, `LLM_INTENT_MODEL`, and `LLM_EXTRACT_MODEL` can instead target any OpenAI-compatible `/chat/completions`
-endpoint, including a Groq or Gemini-compatible gateway, without coupling reminder business
-rules to a provider. The model can only propose a task and time; the authenticated Telegram
-sender, ownership checks, user-timezone attachment, future time validation, and database
-writes are controlled by the application service. Provider output containing its own UTC
-offset is rejected; the user's validated IANA timezone is applied by the backend.
+```powershell
+uv run uvicorn reminder_agent.application.main:app --reload
+```
 
-Creating a reminder transactionally writes one active reminder, one pending occurrence, one
-pending Telegram notification, and the Telegram update's idempotency result. The confirmation
-is sent only after commit and includes the user's local time and Telegram destination. VS-03
-does not run delivery; the pending notification is consumed by the VS-04 scheduler worker.
+Start the worker in another terminal:
 
-VS-07 recurring reminders store the canonical weekly rule, intended IANA timezone, and a stable
-local recurrence-instance key. The worker materializes a rolling 35-day horizon before claiming
-due notifications and pages through active series so later reminders are not starved by the first
-batch. PostgreSQL uniqueness and `INSERT ... ON CONFLICT` make replayed updates, worker restarts,
-and concurrent materializers idempotent. Recurrence uses local wall-clock time: fall-back overlaps
-choose the earlier instant, while spring-forward gaps shift forward by the DST gap while preserving
-minutes. Delivery still uses the leased PostgreSQL notification worker, so provider timeouts can
-remain `UNKNOWN` and strict exactly-once external delivery is not guaranteed. Ambiguous task,
-weekday, or time input is clarified or rejected; weekly schedules are supported, not arbitrary
-monthly/calendar rules.
+```powershell
+uv run reminder-worker
+```
 
-VS-04 runs `reminder-worker` as an independent PostgreSQL-backed process. It polls due
-notifications every `WORKER_POLL_INTERVAL_SECONDS`, claims rows with PostgreSQL
-`FOR UPDATE SKIP LOCKED` and a lease, rechecks reminder/occurrence/destination eligibility,
-then sends through Telegram. Confirmed successes are stored as `SENT` with Telegram's
-provider message ID and are never retried. DNS/connect failures, connect timeouts, and pool
-timeouts use exponential backoff because the request was not transmitted. Read/write failures
-and Telegram 5xx responses are uncertain and receive at most two delayed retries. HTTP 429
-responses use Telegram's `retry_after` value. Permanent errors become `FAILED`; exhausted
-uncertain attempts become `UNKNOWN` for monitoring or manual recovery. Strict end-to-end
-exactly-once delivery cannot be guaranteed after an ambiguous provider outcome.
+The host configuration in `.env.example` points to PostgreSQL at
+`postgresql+psycopg://memorae:memorae@localhost:5433/memorae`. Do not use that local database
+for PostgreSQL integration-test cleanup; use the separate test database described below.
 
-VS-10 supports Telegram text cancellation. `Cancel the standup` cancels an active recurring
-series and all of its outstanding pending occurrences; `Cancel only Monday's standup` cancels
-just that pending occurrence and leaves the series active. Ambiguous task matches are clarified
-before any state changes. Cancellation locks the owned reminder and pending notifications in
-one transaction, preserves sent delivery history, and refuses to claim success if a notification
-is already `SENDING`. Canceled reminders and occurrences are excluded by the existing worker
-eligibility checks, so no stale pending notification is delivered after a committed cancellation.
-Indirect cancellation language can be routed by the configured intent model; the model may only
-propose target text and scope, while the backend resolves owned candidates and performs the write.
+## Configuration
 
-VS-11 supports marking a delivered occurrence done from Telegram. Reminder notifications include
-a signed `Done` button, and replying `Done` to the original notification uses Telegram's stored
-provider message ID. A bare `Done` is accepted only when exactly one delivered occurrence is
-eligible; otherwise the bot asks which reminder was intended. Completion locks and rechecks the
-owned delivered occurrence, completes the parent only for a one-time reminder, and leaves a
-recurring series active. The occurrence state change and Telegram update idempotency response are
-committed together, so replaying a message or button callback is safe. Callback signatures,
-sender identity, private chat, and notification destination are all validated; callback UI
-acknowledgement is best-effort and does not determine completion success.
+Copy [`.env.example`](.env.example) to `.env` for host-based development. Do not commit `.env`,
+provider credentials, database URLs, or webhook secrets.
 
-Telegram also supports read-only progress questions such as `How many reminders are pending?`,
-`What do I still have to do today?`, `How many tasks have I completed?`, and overdue counts.
-These summaries are computed from the authenticated user's own reminder occurrences; delivered
-but uncompleted reminders remain outstanding, and recurring instances are projected for today's
-view when they have not yet been materialized.
+| Variable | Required when | Purpose |
+| --- | --- | --- |
+| `APP_ENV` | Always | Use `development` locally. Production validation is stricter. |
+| `DATABASE_URL` | API, worker, and migrations | PostgreSQL connection string. Compose overrides it with the `postgres` service URL. |
+| `TELEGRAM_BOT_TOKEN` | Telegram integration and production | Telegram Bot API credential. |
+| `TELEGRAM_WEBHOOK_SECRET` | Telegram webhook and production | Value checked in `X-Telegram-Bot-Api-Secret-Token`; production requires a unique value of at least 32 characters. |
+| `LLM_API_KEY` and `LLM_BASE_URL` | Model fallback and production | OpenAI-compatible classifier, extraction, and memory-answer endpoint. |
+| `LLM_INTENT_MODEL` and `LLM_EXTRACT_MODEL` | Optional | Models used for intent fallback and typed extraction. |
+| `STT_API_KEY`, `STT_BASE_URL`, and `STT_MODEL` | Telegram voice notes and production | Whisper-compatible voice-note transcription. |
+| `VAPI_ENABLED` and `VAPI_WEBHOOK_BEARER_TOKEN` | Vapi calls | Enable and authenticate `POST /webhook/vapi`. |
+| `EMBEDDING_PROVIDER` and `EMBEDDING_API_KEY` | Semantic memory | Leave the provider `disabled` for lexical-only memory, or configure `openai_compatible`/`gemini`. |
+| `TEST_DATABASE_URL` | PostgreSQL integration tests | Dedicated test database, normally on host port `5434`; it must not equal `DATABASE_URL`. |
+| `PHONE_DEFAULT_REGION` | Optional | Deployment-wide fallback for local-format phone numbers. Users can set their own region with `/phone_region XX`. |
+| `LOG_LEVEL`, `LOG_FORMAT`, and `LOG_COLOR` | Optional | Configure text or JSON operational logs. |
 
-The same worker also retries durable Telegram confirmations that failed after the inbound
-command was committed. Confirmation responses are stored with the idempotency record, retried
-after connectivity returns, and marked `SENT` only after Telegram confirms them. This prevents a
-successful reminder from being silently accompanied by a permanently missing confirmation.
+The sample also documents worker polling, notification retry, recurrence materialization, voice
+limits, conversation-session expiry, memory retrieval, and embedding privacy settings. Review
+those values before deployment. In particular, `EMBEDDING_ALLOW_SENSITIVE_EXTERNAL` controls
+whether sensitive facts may be sent to an external embedding provider.
 
-After a user completes timezone onboarding, the bot offers Telegram's native
-`request_contact` button. The backend accepts only a contact whose `user_id`
-matches the Telegram sender, normalizes valid numbers to E.164, and stores the
-phone as a linked channel identity. Active phone numbers are database-unique, so
-concurrent link attempts cannot authorize the same number for two users. Users may
-choose `Skip for now` and continue using Telegram; `/link_phone` reopens the prompt.
-If Telegram supplies a national-format number, the bot asks for a two-letter
-country code such as `/phone_region PK` and then links the verified contact.
+Production startup requires PostgreSQL, a Telegram token and webhook secret, LLM and STT keys,
+and valid values for any enabled optional provider. When Vapi is enabled, its bearer token and
+assistant model and voice settings are also validated.
 
-Run tests with:
+## Usage
+
+### Telegram
+
+Configure a Telegram webhook that sends `POST /webhook/telegram` with the configured secret header.
+After onboarding with `/start`, users can send requests such as:
+
+```text
+Remind me in five minutes to call the bank
+Remind me tomorrow at 9 AM to check my email
+Remind me every Monday at 8 AM to call the bank
+What do I still have to do today?
+Cancel the standup
+```
+
+Users can link a verified phone through the contact-sharing flow, reopen linking with
+`/link_phone`, and provide a country code for a national-format contact with `/phone_region PK`.
+Voice-note responses are returned as Telegram text. Failed or inaudible voice notes do not create
+reminders or memories.
+
+Weekly recurrence is supported. Arbitrary monthly or calendar recurrence rules are not supported
+by the current deterministic parser.
+
+### Vapi phone calls
+
+To enable calls:
+
+1. Link the caller's E.164 phone number through Telegram.
+2. Set `VAPI_ENABLED=true` and configure `VAPI_WEBHOOK_BEARER_TOKEN`.
+3. Apply the current migrations with `uv run alembic upgrade head`.
+4. Configure the Vapi Server URL as `POST /webhook/vapi` with the matching Bearer credential.
+5. Leave the phone number without a fixed assistant so the `assistant-request` authorization can
+   reject unknown callers before a conversation starts.
+
+The Vapi adapter exposes tools for reminder management and memory save/lookup. Tools receive the
+caller's complete utterance; user IDs, reminder IDs, fact IDs, and delivery fields are resolved
+and authorized by the backend.
+
+### Health and readiness
+
+The API exposes:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /health` | Process health check. |
+| `GET /ready` | Database, schema, migration-head, and required-column readiness check. |
+| `POST /webhook/telegram` | Authenticated Telegram update entry point. |
+| `POST /webhook/vapi` | Authenticated Vapi entry point when Vapi is enabled. |
+
+For example:
+
+```powershell
+Invoke-RestMethod http://localhost:8000/health
+Invoke-RestMethod http://localhost:8000/ready
+```
+
+## Project structure
+
+```text
+.
+├── src/reminder_agent/
+│   ├── application/       # Shared workflows, coordination, and application contracts
+│   ├── channels/          # Telegram and Vapi adapters and webhooks
+│   ├── features/          # Intent, reminder, memory, onboarding, and voice features
+│   ├── infrastructure/   # Configuration, database, providers, logging, and runtime
+│   └── shared/            # Cross-feature contracts and idempotency helpers
+├── tests/
+│   ├── unit/              # Fast isolated tests
+│   ├── integration/       # Provider, database, webhook, and worker integration tests
+│   └── e2e/               # End-to-end workflow tests
+├── alembic/               # Database migrations
+├── docs/                  # Architecture, implementation plan, and ADRs
+├── benchmarks/            # Benchmark and evaluation assets
+├── docker-compose.yml     # Local application, worker, and PostgreSQL services
+├── Dockerfile             # Locked production-style image build
+├── pyproject.toml         # Project metadata, scripts, and tool configuration
+├── uv.lock                # Locked Python dependency resolution
+└── .env.example           # Local and deployment configuration template
+```
+
+## Development
+
+Install the locked project and test dependencies with:
+
+```powershell
+uv sync --extra test
+```
+
+Useful commands from the repository root:
+
+```powershell
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy
+uv run alembic upgrade head
+uv run reminder-worker
+uv run memory-embedding-backfill
+```
+
+`memory-embedding-backfill` requires an enabled embedding provider and applies bounded,
+resumable indexing to existing memory facts. It does not replace the durable fact text.
+
+## Testing
+
+Run the default suite:
 
 ```powershell
 uv run pytest
 ```
 
-Semantic memory uses PostgreSQL pgvector with `vector(1536)`, cosine distance,
-and a provider-agnostic embedding boundary. It is disabled by default. Configure
-the `EMBEDDING_*` values in `.env` (set `EMBEDDING_PROVIDER=gemini` and provide
-`EMBEDDING_API_KEY` to use Google's `gemini-embedding-001`), apply migrations, then index one resumable
-batch at a time with:
+Run a specific layer or collect coverage:
 
 ```powershell
-uv run memory-embedding-backfill
+uv run pytest tests/unit
+uv run pytest tests/integration
+uv run pytest tests/e2e
+uv run pytest --cov=src/reminder_agent --cov-report=term-missing
 ```
 
-Telegram's default memory indexing excludes detected passwords, PINs, access
-codes, keys, tokens, and recovery secrets from external embedding unless the
-deployment explicitly approves `EMBEDDING_ALLOW_SENSITIVE_EXTERNAL=true`.
-Authenticated Vapi memory calls are the explicit voice-channel exception: they
-may embed and speak sensitive facts. Original memory text remains the source of
-truth; failed or disabled indexing never deletes a fact and lexical retrieval
-continues to work. Existing rows previously marked `SKIPPED_SENSITIVE` need the
-backfill command run with `EMBEDDING_ALLOW_SENSITIVE_EXTERNAL=true` before
-semantic Vapi lookup can use them.
+Most tests use injected SQLite sessions by default. PostgreSQL-backed tests require the dedicated
+test service and connection string:
 
-Memory retrieval remains deterministic-first. A single exact lexical match is
-returned without Gemini or GPT-OSS. Otherwise Gemini/pgvector ranks at most the
-authenticated user's top three non-sensitive candidates; similarity does not
-reject them before the dedicated 120B answer prompt returns a validated
-`ANSWER`, `AMBIGUOUS`, or `UNKNOWN` decision. Candidate indices and ownership are
-rechecked, and exact values must remain unchanged. Telegram keeps sensitive
-candidate filtering; authenticated Vapi retrieval explicitly allows sensitive
-facts so the committed answer can be spoken to the caller. Provider failure
-falls back to the deterministic unknown or clarification result.
+```powershell
+docker compose --profile test up -d postgres-test
+$env:TEST_DATABASE_URL = "postgresql+psycopg://memorae:memorae@localhost:5434/memorae_test"
+uv run pytest tests/integration
+```
 
-Gemini's free tier is available for eligible projects, but Google does not
-publish one universal embedding RPM/TPM/RPD value: quotas are project- and
-tier-specific and must be checked in AI Studio. The adapter sends
-`RETRIEVAL_DOCUMENT` for saved facts and `RETRIEVAL_QUERY` for questions and
-normalizes the 1,536-dimensional truncated prefix. A Gemini key is not present
-in this checkout, so the live-provider test is skipped; fake-response coverage
-is included.
+The test fixture refuses to clean a database when `TEST_DATABASE_URL` resolves to the application
+database. Live Gemini and memory-retrieval tests are opt-in and require provider credentials and
+the environment flags used by the integration tests.
 
-When running PostgreSQL integration tests, set `TEST_DATABASE_URL` to the dedicated
-`memorae_test` database on port 5434. The test fixture refuses to run destructive cleanup if
-`TEST_DATABASE_URL` is the same database as `DATABASE_URL`; the application database is never a
-test target.
+## Build and deployment
 
-The VS-07 schema change is migration `0013_recurring_occurrence_keys`; run
-`uv run alembic upgrade head` before starting the API or worker. A real Telegram smoke test
-requires a configured bot token, a linked Telegram user, a public webhook endpoint, and a user
-message such as `Remind me every Monday at 8 AM to check the smoke test`; verify the confirmation,
-the recurring rows, and the next Telegram delivery. Do not use a model- or client-supplied user ID
-to choose the destination.
+The [`Dockerfile`](Dockerfile) builds a Python 3.12 image with the locked dependencies and no
+development extras. Docker Compose runs migrations before starting the API and worker.
 
-Smoke-test record (2026-11-01): the configured bot token was present, but both the Python and
-host PowerShell calls to Telegram `getMe` failed during TLS connection establishment. No inbound
-message or outbound smoke notification was claimed as successful; rerun the procedure above from
-a network path that can reach `api.telegram.org`.
+For a deployment using an external PostgreSQL service:
 
-## Structured logs
+1. Provide a PostgreSQL `DATABASE_URL` and the required provider secrets through the deployment
+   secret store.
+2. Run `uv run alembic upgrade head` from the application image or deployment environment.
+3. Run the API and `reminder-worker` as separate processes.
+4. Configure the Telegram and, if enabled, Vapi webhooks to reach the API.
+5. Confirm `GET /ready` reports the current migration head,
+   `0017_voice_call_authorizations`.
 
-The API and worker write concise Colorama-coloured text lines to stdout by default. Set
-`LOG_COLOR=false` for plain text, `LOG_LEVEL=DEBUG` for lower-level diagnostics, or
-`LOG_FORMAT=json` for machine-readable output (JSON never contains ANSI colour codes).
-Set `LOG_INCLUDE_TRACEBACK=true` when a full traceback is needed. Useful events include
-`http_request_completed`,
-`webhook_auth_failed`, `telegram_update_received`, `telegram_api_request_started`,
-`telegram_api_response_received`, `telegram_api_request_failed`, `telegram_delivery_failed`,
-`telegram_response_delivery_attempt`, `telegram_response_delivery_retry`,
-`telegram_update_handled`, `telegram_update_processed`, `reminder_command_started`,
-`reminder_intent_rules_finished`,
-`reminder_intent_interpreted`, `reminder_schedule_rejected`, `reminder_created`,
-`clarification_session_saved`, `reminder_notification_scheduled`,
-`reminder_confirmation_staged`, `reminder_persistence_failed`, `notification_worker_started`,
-`notification_worker_iteration_started`, `notification_claimed`,
-`notification_delivery_attempt_started`, `notification_delivered`, and
-`notification_delivery_failed`, and `notification_delivery_outcome_recorded`. Logs include request IDs, update IDs, notification IDs, status
-codes, due-time lateness, parser/provider path, outcome, exception type, and sanitized network
-cause. Confirmation events include `confirmation_claimed`, `confirmation_delivery_attempt_started`,
-`confirmation_delivery_failed`, `confirmation_delivery_outcome_recorded`, and
-`confirmation_delivered`. VS-10 adds `cancellation_command_started`,
-`cancellation_clarification_saved`, `cancellation_extraction_failed`, `reminder_canceled`, and
-`reminder_cancellation_conflict`. VS-11 adds `completion_target_ambiguous`,
-`reminder_occurrence_completed`, and `telegram_callback_acknowledgement_failed`. Logs never contain tokens, secrets, prompts, reminder text, or personal
-data.
+This repository does not contain a provider-specific deployment manifest or CI/CD workflow.
 
-Telegram webhook updates are idempotent. Each update gets one logical outbound response. A
-Telegram rate-limit response (429) may be retried up to the configured limit; network timeouts,
-connection failures, and 5xx responses are never retried because Telegram may have accepted the
-message before the response was lost. Those ambiguous outcomes are recorded as `UNKNOWN`, and a
-replayed update is acknowledged without sending again. Inspect `telegram_delivery_failed` and
-`telegram_response_delivery_retry` logs for the network/provider cause.
+## Architecture
+
+Channel adapters authenticate the external request and resolve the canonical user. Shared
+application services then process typed commands and enforce ownership, authorization, business
+rules, and legal state transitions. PostgreSQL is the source of truth for reminders, memory facts,
+idempotency records, and durable delivery state.
+
+### C4 context-level diagram
+
+```mermaid
+flowchart LR
+    USER["User"]
+    TELEGRAM["Telegram\nText, voice notes, notifications"]
+    VAPI["Vapi\nInbound phone calls"]
+    MEMORAE["Memorae\nReminder and memory agent"]
+    PROVIDERS["Configured AI providers\nLLM, STT, optional embeddings"]
+
+    USER -->|"Text and voice notes"| TELEGRAM
+    USER -->|"Phone calls"| VAPI
+    TELEGRAM <-->|"Messages, contact details, reminders"| MEMORAE
+    VAPI <-->|"Caller authorization and voice operations"| MEMORAE
+    MEMORAE <-->|"Intent, extraction, transcription, indexing"| PROVIDERS
+
+    classDef actor fill:#f1f5f9,stroke:#64748b,color:#0f172a
+    classDef external fill:#f8fafc,stroke:#94a3b8,color:#0f172a
+    classDef system fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#172554
+
+    class USER actor
+    class TELEGRAM,VAPI,PROVIDERS external
+    class MEMORAE system
+```
+
+### C4 container-level diagram
+
+```mermaid
+flowchart LR
+    USER["User"]
+
+    subgraph EXTERNAL["External systems"]
+        direction TB
+        TELEGRAM["Telegram Bot API"]
+        VAPI["Vapi voice platform"]
+        PROVIDERS["Configured AI providers\nOpenAI-compatible LLM/STT\nOptional embeddings"]
+    end
+
+    subgraph MEMORAE["Memorae"]
+        direction TB
+        API["FastAPI application\nWebhooks, authentication, routing, shared services"]
+        WORKER["reminder-worker\nNotification and confirmation delivery"]
+        DATABASE[("PostgreSQL\nOperational state, idempotency, pgvector")]
+    end
+
+    USER <-->|"Text and voice notes"| TELEGRAM
+    USER <-->|"Phone calls"| VAPI
+    TELEGRAM <-->|"Telegram webhook and Bot API"| API
+    VAPI <-->|"Call authorization and tool calls"| API
+    API <-->|"LLM, STT, embedding requests"| PROVIDERS
+    API <-->|"Users, reminders, memories, sessions"| DATABASE
+    WORKER <-->|"Claims and delivery state"| DATABASE
+    WORKER -->|"Reminder notifications and confirmations"| TELEGRAM
+
+    classDef core fill:#dbeafe,stroke:#2563eb,color:#172554,stroke-width:2px
+    classDef data fill:#dcfce7,stroke:#16a34a,color:#14532d
+    classDef outside fill:#f1f5f9,stroke:#94a3b8,color:#334155
+
+    class API,WORKER core
+    class DATABASE data
+    class USER,TELEGRAM,VAPI,PROVIDERS outside
+```
+
+The worker claims due notifications with PostgreSQL row locks and leases, rechecks eligibility,
+and records provider outcomes. External delivery cannot provide a strict end-to-end exactly-once
+guarantee after an ambiguous provider response; such outcomes are recorded as `UNKNOWN` for
+monitoring or recovery.
+
+See [`docs/Architecture.md`](docs/Architecture.md) for system behavior, domain rules, channel
+flows, reliability constraints, and the implemented architecture. See
+[`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) for vertical-slice scope and
+acceptance criteria. Architecture decisions are recorded in [`docs/adr/`](docs/adr/).
+
+## Troubleshooting
+
+- If `/ready` returns `503`, run `uv run alembic upgrade head` and verify that the API can reach
+  the configured PostgreSQL database. Readiness checks both schema objects and the migration head.
+- If scheduled reminders are not delivered, confirm that `reminder-worker` is running and that
+  `TELEGRAM_BOT_TOKEN` is configured.
+- If Vapi returns `404`, confirm `VAPI_ENABLED=true`. If it returns `401`, verify the Bearer token
+  configured in Vapi matches `VAPI_WEBHOOK_BEARER_TOKEN`.
+- If model or voice-note behavior falls back to clarification, configure `LLM_API_KEY` or
+  `STT_API_KEY` and check the corresponding `*_BASE_URL` and model settings.
+- If PostgreSQL integration tests refuse to start, ensure `TEST_DATABASE_URL` points to the
+  dedicated `postgres-test` database and is different from `DATABASE_URL`.
+
+## Contributing
+
+No separate contributing guide or automated CI workflow is included. For changes, preserve the
+deterministic-first invariant, keep provider-specific parsing at channel boundaries, add tests for
+authorization, idempotency, failure behavior, and cross-user isolation, and update the relevant
+architecture or ADR documentation when behavior changes. Repository-specific development and
+review rules are in [`AGENTS.md`](AGENTS.md).
+
+## License
+
+This project is provided solely for recruitment evaluation. The repository's
+[`LICENSE.md`](LICENSE.md) states that commercial use, redistribution, production deployment,
+and incorporation into other projects require prior written authorization from the copyright
+holder.
