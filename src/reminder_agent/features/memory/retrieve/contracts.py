@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
 from dataclasses import dataclass
 from math import sqrt
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from reminder_agent.shared.memory_contracts import (
     RetrieveMemoryQuery,
@@ -70,14 +69,12 @@ def cosine_similarity(left: list[float], right: list[float]) -> float:
 
 
 class MemoryAnswerProposal(BaseModel):
-    """Strict, non-authoritative answer proposed from supplied candidates."""
+    """Strict, non-authoritative candidate selection from supplied memories."""
 
     model_config = ConfigDict(extra="forbid")
 
     decision: Literal["ANSWER", "AMBIGUOUS", "UNKNOWN"]
-    candidate_indices: list[int] = Field(default_factory=list, max_length=3)
-    answer: str | None = Field(default=None, min_length=1, max_length=1000)
-    clarification_question: str | None = Field(default=None, min_length=1, max_length=500)
+    candidate_indices: list[StrictInt] = Field(default_factory=list, max_length=3)
 
     @field_validator("candidate_indices")
     @classmethod
@@ -88,52 +85,58 @@ class MemoryAnswerProposal(BaseModel):
             raise ValueError("candidate indices must be unique")
         return value
 
-    @field_validator("answer", "clarification_question")
-    @classmethod
-    def optional_text_must_not_be_blank(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        value = " ".join(value.split()).strip()
-        if not value:
-            raise ValueError("response text must not be blank")
-        return value
-
     @model_validator(mode="after")
     def decision_fields_must_be_consistent(self) -> MemoryAnswerProposal:
         if self.decision == "ANSWER":
-            if not self.candidate_indices or self.answer is None:
-                raise ValueError("ANSWER requires supporting candidates and an answer")
-            if self.clarification_question is not None:
-                raise ValueError("ANSWER must not include a clarification question")
+            if not self.candidate_indices:
+                raise ValueError("ANSWER requires supporting candidates")
         elif self.decision == "AMBIGUOUS":
-            if len(self.candidate_indices) < 2 or self.clarification_question is None:
-                raise ValueError("AMBIGUOUS requires conflicting candidates and a question")
-            if self.answer is not None:
-                raise ValueError("AMBIGUOUS must not include an answer")
-        elif self.candidate_indices or self.answer is not None or self.clarification_question is not None:
-            raise ValueError("UNKNOWN must not claim candidates or response text")
+            if len(self.candidate_indices) < 2:
+                raise ValueError("AMBIGUOUS requires conflicting candidates")
+        elif self.candidate_indices:
+            raise ValueError("UNKNOWN must not claim candidates")
         return self
 
     def validates_candidate_count(self, candidate_count: int) -> bool:
         return all(index < candidate_count for index in self.candidate_indices)
 
 
-_EXACT_MEMORY_VALUE = re.compile(
-    r"\b[A-Za-z]+\d[A-Za-z0-9_-]*\b|"
-    r"\b\d+[A-Za-z][A-Za-z0-9_-]*\b|"
-    r"\b\d+(?:\.\d+)?\b|"
-    r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b|"
-    r"(?<!\w)\+?\d[\d ()-]{6,}\d(?!\w)"
+_MEMORY_CLAUSE_SEPARATOR = re.compile(
+    r"\s*(?:[.!?;]+(?=\s|$)|,\s*(?=(?:my|the|a|an)\b)|"
+    r"\s+(?:and|or)\s+(?=(?:my|the|a|an)\b))\s*",
+    re.IGNORECASE,
 )
 
 
-def memory_answer_preserves_exact_values(answer: str, memories: Sequence[str]) -> bool:
-    """Require code-like/contact values to remain byte-for-byte present."""
+def select_memory_fact_clause(content: str, query: str) -> str | None:
+    """Return one safely relevant original clause, or ``None`` if ambiguous.
 
-    exact_values = {
-        match.group(0) for memory in memories for match in _EXACT_MEMORY_VALUE.finditer(memory)
-    }
-    return all(value in answer for value in exact_values)
+    A single-clause memory is already an atomic stored fact and is returned
+    unchanged. Multi-clause memories are narrowed only when the normalized
+    lookup subject matches exactly one clause. This intentionally declines to
+    guess when a semantic query has no deterministic clause evidence.
+    """
+
+    normalized_content = content.strip(" .!?;")
+    if not normalized_content:
+        return None
+    clauses = tuple(
+        clause.strip(" .!?;,")
+        for clause in _MEMORY_CLAUSE_SEPARATOR.split(normalized_content)
+        if clause.strip(" .!?;,")
+    )
+    if len(clauses) <= 1:
+        return normalized_content
+
+    query_forms = _lookup_token_forms(query)
+    if not query_forms:
+        return None
+    matches = tuple(
+        clause
+        for clause in clauses
+        if query_forms.issubset(_lookup_token_forms(clause))
+    )
+    return matches[0] if len(matches) == 1 else None
 
 
 __all__ = [
@@ -143,5 +146,5 @@ __all__ = [
     "MemoryAnswerProposal",
     "cosine_similarity",
     "is_memory_lookup_query_grounded",
-    "memory_answer_preserves_exact_values",
+    "select_memory_fact_clause",
 ]
