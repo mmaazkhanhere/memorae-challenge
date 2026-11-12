@@ -356,9 +356,7 @@ guarantee after an ambiguous provider response; such outcomes are recorded as `U
 monitoring or recovery.
 
 See [`docs/Architecture.md`](docs/Architecture.md) for system behavior, domain rules, channel
-flows, reliability constraints, and the implemented architecture. See
-[`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) for vertical-slice scope and
-acceptance criteria. Architecture decisions are recorded in [`docs/adr/`](docs/adr/).
+flows, reliability constraints, and the implemented architecture.Architecture decisions are recorded in [`docs/adr/`](docs/adr/).
 
 ## Troubleshooting
 
